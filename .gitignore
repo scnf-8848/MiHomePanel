@@ -1,0 +1,19 @@
+# 虚拟环境
+.venv/
+# Python 缓存
+__pycache__/
+*.py[cod]
+# 探测与截图产物（含真实 did、设备名、账号快照，不要提交）
+scripts/out/
+# 可选的 go2rtc 可执行文件（MIT，按需下载，不进仓库）
+tools/go2rtc/
+# 本地运行数据
+*.log
+# 手工调试留下的 go2rtc 配置（含真实 passToken、局域网 IP；pause.log 已由 *.log 覆盖）
+pause.yaml
+# 本地长期记忆（含真实设备名、IP、DID）
+.workbuddy/
+# ruff 缓存
+.ruff_cache/
+# GPL-3.0 参考项目副本（运行时零引用，不属于本项目源码）
+MiHome-Windows-0.5.0/
