@@ -12,10 +12,13 @@
 
 from __future__ import annotations
 
+import queue
+import threading
+import time
 from typing import Any
 
-from PySide6.QtCore import QRect, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QFont, QPainter
+from PySide6.QtCore import QPointF, QRect, Qt, QTimer, Signal
+from PySide6.QtGui import QColor, QFont, QFontMetrics, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
@@ -24,24 +27,43 @@ from PySide6.QtWidgets import (
     QLabel,
     QPushButton,
     QScrollArea,
-    QSlider,
     QVBoxLayout,
     QWidget,
 )
 
-from ..core.camera import CameraError, is_camera
+from ..core import timing
+from ..core.camera import CameraError, is_camera, probe_local
 from ..core.camera import shared as camera_service
 from ..core.catalog import format_value
 from ..core.prefs import HIDDEN_ROOM
 from ..core.spec import PropertySpec
 from ..core.store import DeviceState, Store
 from . import theme, tooltip
-from .camera_view import CameraView
+from .camera_popout import CameraPopoutWindow
+from .camera_view import CameraView, playbacks
+from .card_controls import CardSlider, CardStepper
 from .chrome import TitleBar, WindowFrame, surface_bg, surface_border
 from .combo import Combo
 from .widgets import ElidedLabel, IconProvider, ToggleSwitch, draw_text
 
 PAD = 22
+
+# 【临时探针】画面状态的中文名，只用于 core/timing.py 的日志
+_CAM_STATE_NAMES = {
+    CameraView.IDLE: "空闲",
+    CameraView.LOADING: "加载中",
+    CameraView.PLAYING: "播放中",
+    CameraView.PAUSED: "已暂停",
+    CameraView.RELEASED: "已释放",
+    CameraView.ERROR: "错误",
+    CameraView.STOPPED: "已停止",
+}
+
+
+#: 下拉框的默认占位文案（"还没有值"）。模式行在"无激活项 / 值不在枚举里"时
+#: 会临时换成「无」「其他」，回到正常值时必须还原成这个——否则下次 index 变回
+#: -1 会露出上一轮的旧文案。
+_PLACEHOLDER = "—"
 
 
 class ControlRow(QWidget):
@@ -84,6 +106,9 @@ class ControlRow(QWidget):
             # 下拉框走全局 Combo：箭头、弹出层圆角、禁滚轮都和设置页一致，
             # 样式表也在那一处维护，这里不再各自写一份（曾经常年漏改深色）。
             box = Combo(palette)
+            # 没有值可显示时（未读到 / 客户端"无激活项"）由 placeholder 兜底，
+            # 不往列表里塞假选项：假选项既能被写出去，也会被当成枚举值回读。
+            box.setPlaceholderText(_PLACEHOLDER)
             # 枚举项的 comment 常常是一整句中文（"空场景（灯不在任何情况模式时…）"），
             # 按内容撑宽会顶出卡片，所以固定按 10 个字宽度算，多余部分由控件自己截。
             box.setMinimumContentsLength(10)
@@ -100,7 +125,9 @@ class ControlRow(QWidget):
                 lambda i: self.changed.emit(prop.siid, prop.piid, box.itemData(i))
             )
             self.editor = box
-        elif role in ("slider", "stepper") and prop.value_range:
+        elif role == "stepper" and prop.value_range:
+            self.editor = self._build_stepper(prop, palette, accent, write)
+        elif role == "slider" and prop.value_range:
             self.editor = self._build_slider(prop, palette, accent, write)
         elif role == "readout":
             lab = QLabel("—")
@@ -112,44 +139,73 @@ class ControlRow(QWidget):
         if self.editor is not None:
             row.addWidget(self.editor, 0, Qt.AlignRight)
 
-    def _build_slider(self, prop: PropertySpec, palette: theme.Palette, accent: str, write: bool) -> QWidget:
-        lo, hi, step = prop.value_range or (0, 100, 1)
-        lo, hi = int(lo), int(hi)
-        # 有些属性是 uint32 全域（0..4294967295），QSlider 只吃 int32，直接 setRange 会抛
-        # OverflowError。这里夹到 int32 范围内，滑块仍然可用（只是精度差一点）。
-        hi = min(hi, 2**31 - 1)
-        lo = max(lo, -(2**31))
-        if hi <= lo:
-            hi = lo + 1
-        step = max(1, int(step))
-        wrap = QWidget()
-        lay = QHBoxLayout(wrap)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(10)
-        self.value_label = QLabel("—")
-        self.value_label.setStyleSheet(f"color:{palette.text_soft}; font-size:13px; min-width:52px;")
-        self.value_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+    def _build_stepper(self, prop: PropertySpec, palette: theme.Palette, accent: str, write: bool) -> QWidget:
+        """温度这类精确刻度用卡片 body 同款步进器：``− 数值 +``。
 
-        slider = QSlider(Qt.Horizontal)
-        slider.setRange(lo, hi)
-        slider.setSingleStep(step)
-        slider.setFixedWidth(170)
-        slider.setEnabled(write)
-        slider.setStyleSheet(
-            f"QSlider::groove:horizontal{{height:5px;background:{palette.bg_soft};border-radius:3px;}}"
-            f"QSlider::sub-page:horizontal{{background:{accent};border-radius:3px;}}"
-            f"QSlider::handle:horizontal{{width:16px;height:16px;margin:-6px 0;border-radius:8px;"
-            f"background:#FFFFFF;border:1px solid {palette.border};}}"
-            f"QSlider::sub-page:horizontal:disabled{{background:{palette.text_mute};}}"
-            f"QSlider::handle:horizontal:disabled{{background:{palette.bg_soft};"
-            f"border:1px solid {palette.border};}}"
+        沿用 ``CardStepper`` 的按钮尺寸、行高和字号，不再单独造一套详情页样式。
+        """
+        stepper = CardStepper(prop, palette, accent, centered=True)
+        stepper.setEnabled(write)
+        stepper.committed.connect(
+            lambda v: self.changed.emit(prop.siid, prop.piid, v)
         )
-        slider.valueChanged.connect(lambda v: self.value_label.setText(f"{v}{prop.unit_text if prop.unit == 'percentage' else ''}"))
-        slider.sliderReleased.connect(lambda: self.changed.emit(prop.siid, prop.piid, slider.value()))
+        self.stepper = stepper
+        return stepper
+
+    def _build_slider(self, prop: PropertySpec, palette: theme.Palette, accent: str, write: bool) -> QWidget:
+        """亮度 / 色温用卡片 body 同款自绘滑条：整条轨道，色温整条渐变。
+
+        ``compact=True`` 去掉控件内部的属性名（这一行左侧已经有名字了），
+        轨道从最左边开始；点击任意位置跳值、拖动松手提交，滚轮只滚页面不改值。
+        键盘不参与（方向键 / PageUp/Down / Home/End 都不改值、不发写请求），
+        这些都由 ``CardSlider`` 自己保证。
+        """
+        slider = CardSlider(
+            prop,
+            palette,
+            accent,
+            gradient=prop.unit == "kelvin",
+            compact=True,
+        )
+        slider.setFixedWidth(210)
+        slider.setEnabled(write)
+        slider.committed.connect(
+            lambda v: self.changed.emit(prop.siid, prop.piid, v)
+        )
         self.slider = slider
-        lay.addWidget(self.value_label)
-        lay.addWidget(slider)
-        return wrap
+        return slider
+
+    def select_value(self, value: Any) -> bool:
+        """下拉框按值选中；``value`` 不在列表里返回 ``False``（不改变显示）。
+
+        给"客户端语义值"用：例如挂灯的 scene-mode=0 在 ``mode`` 的枚举里没有
+        对应项，这时不能伪造一个选项，只能让下拉显示占位文案。
+        """
+        ed = self.editor
+        if not isinstance(ed, QComboBox):
+            return False
+        idx = ed.findData(value)
+        if idx < 0:
+            return False
+        ed.blockSignals(True)
+        ed.setCurrentIndex(idx)
+        ed.setPlaceholderText(_PLACEHOLDER)
+        ed.blockSignals(False)
+        return True
+
+    def set_no_selection(self, text: str) -> None:
+        """下拉框显示一段**客户端**占位文案，且不选中任何真实枚举项。
+
+        ``text`` 只是"当前值不属于这个枚举"的说明（如"无"），不能被写出去：
+        下拉停在 ``currentIndex() == -1``，选任何一项仍然是正常写请求。
+        """
+        ed = self.editor
+        if not isinstance(ed, QComboBox):
+            return
+        ed.blockSignals(True)
+        ed.setPlaceholderText(text)
+        ed.setCurrentIndex(-1)
+        ed.blockSignals(False)
 
     def set_enabled(self, online: bool) -> None:
         """离线时控件不可操作；只读读数（QLabel）不受影响。"""
@@ -176,13 +232,36 @@ class ControlRow(QWidget):
             if idx >= 0:
                 ed.blockSignals(True)
                 ed.setCurrentIndex(idx)
+                # 离开「无 / 其他」占位态：不复位的话，下一次 index 变回 -1
+                # 会露出上一轮的旧文案（例如值已经正常了还写着"其他"）。
+                ed.setPlaceholderText(_PLACEHOLDER)
                 ed.blockSignals(False)
+        elif ed is not None and hasattr(self, "stepper"):
+            self.stepper.set_value(value)
         elif ed is not None and hasattr(self, "slider"):
-            self.slider.blockSignals(True)
-            self.slider.setValue(max(self.slider.minimum(),
-                                     min(self.slider.maximum(), int(value))))
-            self.slider.blockSignals(False)
-            self.value_label.setText(format_value(self.prop, value))
+            self.slider.set_value(value)
+
+    def set_unknown(self) -> None:
+        """值没读到（还没读、读取失败、设备不返回）时不要伪装成默认值。
+
+        开关停在"关"、下拉停在第一项、滑条停在最小值，看上去都像读成功了；
+        这里把控件禁用并清空显示，配合分组标题上的读取状态一起说明"还不知道"。
+        """
+        ed = self.editor
+        if ed is None or isinstance(ed, QLabel):
+            return
+        ed.setEnabled(False)
+        if isinstance(ed, ToggleSwitch):
+            ed.blockSignals(True)
+            ed.set_on(False, animate=False)
+            ed.blockSignals(False)
+        elif isinstance(ed, QComboBox):
+            ed.blockSignals(True)
+            ed.setPlaceholderText(_PLACEHOLDER)  # 清掉上一轮可能留下的"无"等客户端文案
+            ed.setCurrentIndex(-1)
+            ed.blockSignals(False)
+        elif hasattr(self, "slider"):
+            self.slider.set_unknown()
 
 
 class DetailDialog(QDialog):
@@ -200,6 +279,10 @@ class DetailDialog(QDialog):
         self._p = palette
         self._accent = theme.category_color(state.card.category)
         self._rows: list[ControlRow] = []
+        #: 挂灯这类机型的"模式"行：激活项看 scene-mode(3,9)，见 ``_sync_mode_row``
+        self._mode_row: ControlRow | None = None
+        #: 用户刚点过模式、设备还没把 scene-mode 改过来的过渡态
+        self._mode_pending = False
         self.setWindowTitle(state.name)
         self.setWindowFlags(Qt.Dialog | Qt.FramelessWindowHint)
         self._frame = WindowFrame(self, resizable=True,
@@ -258,10 +341,46 @@ class DetailDialog(QDialog):
 
         self._col.addWidget(_Header(state, palette, self._accent, icons))
         self._camera: CameraView | None = None
+        self._cam_popout: CameraPopoutWindow | None = None
         self._cam_live = False
+        #: 卡片墙已经把一条正在播的会话交给了本页：不再预热、不再重新 open
+        self._cam_adopted = False
+        # 取流要起 go2rtc 子进程（实测 0.85s），放后台线程做，结果用队列回主线程。
+        # 不用跨线程信号：窗口关掉之后线程还在跑，回调到已销毁的控件会出事。
+        self._cam_url = ""
+        self._cam_wants_play = False
+        #: 当前地址是不是远程中继通道；以及本次打开是否已经自动换过一次通道
+        self._cam_remote = False
+        self._cam_fallback = False
+        #: 最近一次可达性探测的结果 (是否可达, 耗时 ms, 说明)；没探测过是 None
+        self._cam_probe: tuple[bool, float, str] | None = None
+        #: 探测判定不通、于是直接走了远程（只影响日志里的通道名）
+        self._cam_probe_failed = False
+        #: 播放器报错的时刻，用来算"报错→回落"的间隔
+        self._cam_error_at = 0.0
+        # 【临时探针】core/timing.py 的记录号，不参与取流逻辑
+        self._cam_play_token = 0
+        self._cam_prefetch_token = 0
+        self._cam_job_token = 0
+        self._cam_job: threading.Thread | None = None
+        self._cam_results: queue.SimpleQueue[
+            tuple[str, str, str, bool, tuple[bool, float, str] | None]
+        ] = queue.SimpleQueue()
+        self._cam_poll = QTimer(self)
+        self._cam_poll.setInterval(80)
+        self._cam_poll.timeout.connect(self._collect_camera)
+        # 局域网看门狗：实测首帧最慢 6.5–6.7 秒（LoadingMedia 2.5–4.1 s + 等 GOP
+        # 2.6–4.0 s），所以 9 秒还没画面就判定"没报错但卡住"，主动换通道。
+        # 只用来看住不报错的僵死；明确失败由播放器的 errorOccurred 立即处理。
+        self._cam_started = 0.0
+        self._cam_watchdog = QTimer(self)
+        self._cam_watchdog.setInterval(1000)
+        self._cam_watchdog.timeout.connect(self._watch_camera)
         self._build_camera()
         self._build_controls()
         self._build_metrics()
+        self._adv_header: _AdvancedHeader | None = None  # 没有 advanced 的设备不建这一组
+        self._adv_rows: list[ControlRow] = []
         self._build_advanced()
         self._col.addStretch(1)
         self._sync_hide_button()
@@ -274,61 +393,506 @@ class DetailDialog(QDialog):
     def _build_camera(self) -> None:
         """摄像头品类才有的实时画面。
 
-        取流是重活（外部进程 + P2P 打洞 + 首帧 3–6 秒），所以只在详情页打开时连一次，
-        离开就断——同一台摄像头只允许一个 P2P 会话，挂着不放会占住设备。
+        取流是重活（外部进程 + P2P 打洞 + 等一个 GOP），所以**打开页面不取流**：
+        只把 go2rtc 和本机 RTSP 地址在后台准备好（这一步不建立 P2P 会话、不占观看位），
+        画面区停在一个播放键上。用户点播放才真正连 RTSP。
 
-        打开页面只做**预热**：连接建立、首帧到手就冻住，等用户点播放。这样用户不用
-        盯着黑屏等 3–6 秒，点下去是即时的。
-
-        没有 go2rtc 时不假装能播，直接把"缺什么"写在画面上（``CameraError`` 的文案）。
+        没有 go2rtc 时不假装能播，点了播放直接把"缺什么"写在画面上
+        （``CameraError`` 的文案）。
         """
         if not is_camera(self.state.node.model, self.state.card.category):
             return
         lay = self._group("实时画面")
         self._camera = CameraView(self._p, self._accent)
-        # 重试 / 释放后重连都直接播：用户点这一下就是想看到画面，不该再让他点第二次
-        self._camera.retry.connect(self._reconnect_camera)
+        # 点播放 / 重试都只发这一个信号：用户点这一下就是想看到画面
+        self._camera.play_requested.connect(self._start_camera)
         self._camera.state_changed.connect(self._on_camera_state)
+        # 独立窗口只搬控件，不重新取流（见 ui/camera_popout.py）
+        self._camera.popout_requested.connect(self._toggle_camera_popout)
+        # 【临时探针】首帧真正画到控件上时结束一条计时记录
+        self._camera.first_frame_shown.connect(self._on_camera_first_frame)
         # 断流时问一句 go2rtc 日志：观看位被占满和设备掉线在画面上长得一样，
         # 但用户能做的事完全不同（关掉别的查看端 vs 等等）
         self._camera.set_hint_provider(camera_service().stream_hint)
-        # 状态提示都画在画面里（加载 / 就绪 / 错误），外面再加一行说明只会重复，
+        # 状态提示都画在画面里（加载 / 错误），外面再加一行说明只会重复，
         # 而且显隐切换会让下面整块内容上下跳
         lay.addWidget(self._camera)
-        QTimer.singleShot(120, self._open_camera)
+        QTimer.singleShot(0, self._prefetch_camera)
 
-    def _open_camera(self, autoplay: bool = False) -> None:
+    def _cam_begin(self, label: str) -> int:
+        """【临时探针】开一条记录，顺带把摄像头地址和偏好交给「环境」行。"""
+        return timing.begin(
+            label,
+            self.state.did,
+            context={
+                "camera_ip": str(getattr(self.state.node, "localip", "") or ""),
+                "preference": str(self.store.camera_network or ""),
+            },
+        )
+
+    def _prefetch_camera(self) -> None:
+        """页面刚打开：后台把 go2rtc 和本机地址准备好，但不建立会话。
+
+        只是省掉子进程启动那 0.85 秒；摄像头那边没有观看位、没有上行流量，
+        和"自动加载画面"是两回事。失败也先不打扰用户，等点了播放再说。
+
+        远程不预热：relay 握手会真的让摄像头加入会话、占掉一个观看位，那就违背了
+        "点播放才加载"。异地用户点播放时多花一次握手（2–4 秒），比开着页面偷偷
+        占位更合理。
+        """
         if self._camera is None:
             return
-        st = self.store.devices.get(self.state.did, self.state)
-        if not st.online:
-            self._cam_live = False
-            self._camera.show_error("设备离线，无法取流")
+        if self._cam_adopted:
+            # 画面是从卡片墙接过来的：再预热一次会把正在用的通道改走
             return
-        try:
-            url = camera_service().open(self.store.client, st.node)
-        except CameraError as exc:
-            self._cam_live = False
-            self._camera.show_error(str(exc))
+        self._cam_wants_play = False
+        self._cam_prefetch_token = self._cam_begin("后台预热")
+        if self._remote_wanted():
+            timing.mark_on(
+                self._cam_prefetch_token, "预热跳过", "远程模式不预热，避免占观看位"
+            )
+            timing.end_on(self._cam_prefetch_token, "跳过")
+            self._cam_prefetch_token = 0
             return
-        except Exception as exc:  # noqa: BLE001 - 外部进程 + 网络，兜底别让详情页崩掉
-            self._cam_live = False
-            self._camera.show_error(f"取流失败：{exc}")
-            return
-        self._cam_live = True
-        self._camera.preload(url, autoplay=autoplay, did=st.did)
+        timing.set_label("后台预热（局域网）", token=self._cam_prefetch_token)
+        # 预热只探路 + 起 go2rtc，探测不通也不擅自建远程会话（那要占观看位）
+        self._spawn_camera_open(
+            remote=False, token=self._cam_prefetch_token, allow_remote=False
+        )
 
-    def _reconnect_camera(self) -> None:
-        self._open_camera(autoplay=True)
+    def _pref(self) -> str:
+        """取流方式偏好：lan_first / remote_first / remote_only。"""
+        return str(self.store.camera_network or "")
+
+    def _remote_wanted(self) -> bool:
+        """这一次该不该走远程：仅远程、远程优先（未回落后）、已回落过、或没有局域网地址。"""
+        pref = self._pref()
+        if pref == "remote_only":
+            return True
+        if pref == "remote_first":
+            # 远程优先：自动换过一次通道之后就换到局域网
+            return not self._cam_fallback
+        if self._cam_fallback:  # lan_first 回落过一次
+            return True
+        if self._cam_probe_failed:
+            return True
+        st = self.store.devices.get(self.state.did, self.state)
+        return not str(getattr(st.node, "localip", "") or "")
+
+    def _lane_text(self, remote: bool) -> str:
+        """【临时探针】日志里的通道名；只读偏好与本次状态，不参与选择。"""
+        pref = self._pref()
+        if remote:
+            if pref == "remote_only":
+                return "远程中继（仅远程）"
+            if pref == "remote_first" and not self._cam_fallback:
+                return "远程中继（远程优先）"
+            if self._cam_probe_failed:
+                return "远程中继（探测不通）"
+            if self._cam_fallback:
+                return "远程中继（局域网回落）"
+            return "远程中继"
+        if self._cam_fallback:
+            return "局域网直连（远程回落）"
+        return "局域网直连"
+
+    def _probe_text(self) -> str:
+        """【临时探针】把最近一次可达性探测结果写成一句话。"""
+        probe = self._cam_probe
+        if probe is None:
+            return "无结果"
+        ok, ms, detail = probe
+        return f"{'可达' if ok else '不通'} {ms:.0f} ms（{detail}）"
+
+    def _start_camera(self) -> None:
+        """用户点了播放：地址已就绪就直接连，否则后台取完再连。"""
+        if self._camera is None:
+            return
+        # 单路仲裁要在这里就抢：等后台取完址再抢，可能已经把别人的 relay 改道了
+        if not playbacks().claim(
+            self._camera, self.state.did, self._cam_url, self._cam_remote, "detail"
+        ):
+            self._cam_wants_play = False
+            self._camera.show_error("另一路摄像头正在播放，先把它停掉")
+            return
+        if self._cam_play_token:
+            timing.end_on(self._cam_play_token, "被新的播放请求替代")
+        lane = self._lane_text(self._remote_wanted())
+        self._cam_play_token = self._cam_begin(lane)
+        # UI 线程的后续打点（播放器状态 / 首帧）归这条记录
+        timing.bind(self._cam_play_token)
+        self._cam_error_at = 0.0
+        timing.mark("点下播放", f"地址已就绪={bool(self._cam_url)}")
+        if self._cam_probe is not None:
+            probe_text = self._probe_text()
+        elif self._remote_wanted():
+            probe_text = "跳过（本次不走局域网）"
+        else:
+            probe_text = "地址未就绪，取流线程里探测"
+        timing.mark("快速可达性预判", probe_text)
+        if self._cam_url:
+            timing.mark("使用已准备好的地址")
+            timing.mark("实际通道", self._lane_text(self._cam_remote))
+            self._start_playback()
+            return
+        self._cam_wants_play = True
+        if self._cam_job is not None:
+            timing.mark("等待后台取流结果")
+            return
+        self._spawn_camera_open(
+            remote=self._remote_wanted(), token=self._cam_play_token
+        )
+
+    def _start_playback(self) -> None:
+        """把已就绪的地址交给播放器，并告诉它这次失败后要不要本地重连。
+
+        局域网优先的局域网会话：明确失败直接交给外层切远程中继（只切一次），
+        不再对同一个局域网地址 ``setSource`` 重连。
+        """
+        if self._camera is None:
+            return
+        playbacks().set_url(self._camera, self._cam_url, self._cam_remote)
+        self._camera.set_immediate_fallback(
+            self._pref() == "lan_first" and not self._cam_remote
+        )
+        self._cam_live = True
+        self._cam_started = time.monotonic()
+        self._cam_watchdog.start()
+        self._camera.play(self._cam_url)
+
+    def _spawn_camera_open(
+        self, remote: bool | None = None, token: int = 0, allow_remote: bool = True
+    ) -> None:
+        if self._cam_job is not None:
+            return  # 已经在取了；结果回来时会看 _cam_wants_play 决定要不要接画面
+        if remote is None:
+            remote = self._remote_wanted()
+        if token:
+            self._cam_job_token = token
+        st = self.store.devices.get(self.state.did, self.state)
+        self._cam_job = threading.Thread(
+            target=self._camera_open_worker,
+            args=(self.store.client, st.node, st.did, bool(remote), token, allow_remote),
+            daemon=True,
+        )
+        self._cam_job.start()
+        self._cam_poll.start()
+
+    def _camera_open_worker(
+        self,
+        client: Any,
+        node: Any,
+        did: str,
+        remote: bool,
+        token: int = 0,
+        allow_remote: bool = True,
+    ) -> None:
+        """后台线程：起 go2rtc（必要时先建 relay）、拿 RTSP 地址。只碰 core，不碰控件。"""
+        timing.bind(token)
+        timing.mark("后台取流线程开始", f"remote={remote}")
+        probe: tuple[bool, float, str] | None = None
+        if not remote:
+            # 局域网优先，或远程优先失败后换回局域网：都先探一下通不通
+            localip = str(getattr(node, "localip", "") or "")
+            if localip:
+                # 几百毫秒的 UDP 探测，不通就别让用户先等一轮局域网失败
+                probe = probe_local(localip)
+                timing.mark("可达性探测", self._probe_text_of(probe))
+                if not probe[0]:
+                    if not allow_remote:
+                        # 预热阶段探测不通：只汇报，不偷偷建远程会话（那会占观看位）
+                        timing.mark("探测不通：预热到此为止，等点播放再走远程")
+                        self._cam_results.put(
+                            (did, "", "局域网不可达", False, probe)
+                        )
+                        return
+                    remote = True
+                    timing.mark("探测不通：直接走远程中继")
+        try:
+            url = camera_service().open(client, node, remote=remote)
+        except CameraError as exc:
+            timing.mark("后台取流失败", str(exc))
+            camera_service().release(did)  # 取流失败别把远程会话留在后台占位
+            self._cam_results.put((did, "", str(exc), remote, probe))
+        except Exception as exc:  # noqa: BLE001 - 外部进程 + 网络，兜底别让详情页崩掉
+            timing.mark("后台取流异常", str(exc))
+            camera_service().release(did)
+            self._cam_results.put((did, "", f"取流失败：{exc}", remote, probe))
+        else:
+            timing.mark("后台取流完成", url)
+            self._cam_results.put((did, url, "", remote, probe))
+
+    @staticmethod
+    def _probe_text_of(probe: tuple[bool, float, str]) -> str:
+        ok, ms, detail = probe
+        return f"{'可达' if ok else '不通'} {ms:.0f} ms（{detail}）"
+
+    def _collect_camera(self) -> None:
+        """主线程：收后台取流结果，按用户有没有点播放决定接不接画面。"""
+        while True:
+            try:
+                did, url, error, remote, probe = self._cam_results.get_nowait()
+            except queue.Empty:
+                break
+            self._cam_job = None
+            self._cam_poll.stop()
+            job_token = self._cam_job_token
+            self._cam_job_token = 0
+            if job_token:
+                if url:
+                    timing.mark_on(job_token, "取流结果：地址可用")
+                else:
+                    timing.mark_on(job_token, "取流结果：失败", error)
+                if job_token == self._cam_prefetch_token:
+                    timing.end_on(job_token, "预热成功" if url else "预热失败")
+                    self._cam_prefetch_token = 0
+            play = self._cam_wants_play
+            self._cam_wants_play = False
+            if self._camera is None or did != self.state.did:
+                continue
+            self._cam_url = url
+            self._cam_remote = remote
+            if probe is not None:
+                self._cam_probe = probe
+                self._cam_probe_failed = not probe[0]
+            if job_token and url:
+                timing.mark_on(job_token, "实际通道", self._lane_text(bool(remote)))
+            if not url:
+                if play:
+                    self._cam_live = False
+                    # 探测就判了不通：不算播放器报错，直接换远程，不闪一下错误
+                    if (
+                        probe is not None
+                        and not probe[0]
+                        and self._try_channel_switch("可达性探测不通")
+                    ):
+                        continue
+                    self._camera.show_error(error)
+                    # show_error 会同步触发 ERROR，外层可能已经自动换了通道（新任务已起）；
+                    # 那条记录留给新通道，别在这里结束掉
+                    if self._cam_job is None and self._cam_play_token:
+                        timing.end_on(self._cam_play_token, "失败", error)
+                        self._cam_play_token = 0
+                continue
+            if play:
+                timing.mark("开始播放 RTSP")
+                self._start_playback()
 
     def _on_camera_state(self, state: str) -> None:
+        if state != CameraView.LOADING:
+            self._cam_watchdog.stop()
+        timing.mark("画面状态", _CAM_STATE_NAMES.get(state, state))
         if state in (CameraView.RELEASED, CameraView.ERROR, CameraView.STOPPED):
             self._cam_live = False
+            # 画面已经停了/出错了，大窗口没有继续存在的意义；收回详情页看错误与重试
+            if self._cam_popout is not None:
+                self._cam_popout.close()
+        if state == CameraView.RELEASED:
+            # 闲置释放：远程会话要一起放掉，否则观看位还占着。
+            # 由所有者统一收尾，顺带把播放器释放掉；不是所有者时退回原路径。
+            if self._cam_play_token:
+                timing.end_on(self._cam_play_token, "闲置释放")
+                self._cam_play_token = 0
+            if not playbacks().release(self._camera, "闲置释放"):
+                camera_service().release(self.state.did)
+            if self._cam_remote:
+                self._cam_url = ""
+        if state == CameraView.PLAYING:
+            timing.mark("进入播放态（首帧已解码）")
+        if state == CameraView.ERROR:
+            # 下次重试让外层重新确认 go2rtc 和地址（进程还活着时这一步几乎不耗时）
+            self._cam_url = ""
+            self._cam_error_at = time.monotonic()
+            if self._try_channel_switch("播放器报错"):
+                return
+            # 有在途任务时（例如刚切了通道）记录归它，别在这里提前收尾
+            if self._cam_play_token and self._cam_job is None:
+                timing.end_on(self._cam_play_token, "失败", "播放器报错")
+                self._cam_play_token = 0
+            # 已经没有下一次自动重试：把观看位放掉，别让别处一直看到"另一路正在播放"。
+            # 只清所有权，不 stop/release_player——错误界面要留着给用户点重试。
+            did = playbacks().forget(self._camera)
+            if did:
+                camera_service().release(did)
+
+    def _on_camera_first_frame(self) -> None:
+        """【临时探针】首帧真正画到控件上：这条取流记录到这里算成功。"""
+        if self._cam_play_token:
+            timing.end_on(self._cam_play_token, "成功")
+            self._cam_play_token = 0
+
+    def _watch_camera(self) -> None:
+        """没报错却长时间没出帧：兜底换一次通道，而不是干等播放器超时。
+
+        明确失败（errorOccurred / Could not open file / InvalidMedia）不走这里，
+        那条路径在 ``_on_camera_state(ERROR)`` 里立刻换。
+        """
+        if not self._cam_live:
+            self._cam_watchdog.stop()
+            return
+        if time.monotonic() - self._cam_started < 9.0:
+            return
+        self._cam_watchdog.stop()
+        self._try_channel_switch("9 秒看门狗：无报错但没出帧")
+
+    def _try_channel_switch(self, reason: str = "") -> bool:
+        """自动换一次通道：局域网→远程（局域网优先），或远程→局域网（远程优先）。
+
+        只换一次（``_cam_fallback`` 记住），``remote_only`` 从不自动换。
+        换通道是重新取一个地址、再 ``play()``，不会对同一个地址反复 ``setSource``。
+        """
+        if self._cam_fallback or self._cam_job is not None:
+            return False
+        pref = self._pref()
+        if pref == "remote_only":
+            return False
+        st = self.store.devices.get(self.state.did, self.state)
+        if self._cam_remote:
+            if pref != "remote_first":
+                return False
+            if not str(getattr(st.node, "localip", "") or ""):
+                return False
+            target_remote = False
+        else:
+            target_remote = True
+        self._cam_fallback = True
+        if not target_remote:
+            self._cam_probe_failed = False
+        if self._cam_play_token:
+            lane = self._lane_text(target_remote)
+            timing.set_label(lane, token=self._cam_play_token)
+            gap = ""
+            if self._cam_error_at:
+                gap = f"，距报错 {(time.monotonic() - self._cam_error_at) * 1000:.0f} ms"
+                self._cam_error_at = 0.0
+            timing.mark("触发通道切换", f"{reason or '未知原因'}{gap} → {lane}")
+        self._cam_wants_play = True
+        if self._camera is not None:
+            if target_remote:
+                self._camera.show_progress(
+                    "局域网直连不可用", "正在尝试远程中继，可能需要几秒…"
+                )
+            else:
+                self._camera.show_progress("远程中继不可用", "正在尝试局域网直连…")
+        # 换到局域网时如果探测不通，就到此为止：远程刚刚已经试过了，别再兜回去
+        self._spawn_camera_open(
+            remote=target_remote,
+            token=self._cam_play_token,
+            allow_remote=target_remote,
+        )
+        return True
+
+    @property
+    def camera_view(self) -> CameraView | None:
+        """详情页当前承载画面的控件（给卡片墙交接用）。"""
+        return self._camera
+
+    def adopt_playing_camera(self) -> bool:
+        """把卡片墙正在播的那一路接到本页画面上（只搬 player/sink）。
+
+        由 ``MainWindow._on_card_clicked`` 在构造完本页、进入模态前调用。
+        成功后本页不预热、不重新 open，用户直接看到接续的画面。
+        """
+        if self._camera is None:
+            return False
+        owner = playbacks()
+        if owner.active_view is not self._camera:
+            if owner.did != self.state.did:
+                return False
+            if not owner.move(self._camera, "detail"):
+                return False
+        elif owner.did != self.state.did:
+            # 墙上那一路属于别的设备，不能张冠李戴
+            return False
+        else:
+            owner.set_surface(self._camera, "detail")
+        self._cam_adopted = True
+        self._cam_live = True
+        self._cam_wants_play = False
+        self._cam_url = playbacks().url
+        self._cam_remote = playbacks().remote
+        self._cam_started = time.monotonic()
+        self._cam_watchdog.stop()
+        # 预热的计时记录不再有用（如果已经被调度起来，结果是空操作）
+        if self._cam_prefetch_token:
+            timing.end_on(self._cam_prefetch_token, "接续卡片播放，取消预热")
+            self._cam_prefetch_token = 0
+        timing.mark("接续卡片播放", "搬 player/sink，不重新 open")
+        return True
+
+    def _toggle_camera_popout(self) -> None:
+        """详情页 ↔ 独立窗口。只换控件父窗口，不重新 open / 不重建流。"""
+        if self._camera is None:
+            return
+        if self._cam_popout is not None and self._cam_popout.is_staged:
+            self._cam_popout.close()
+            return
+        if self._cam_popout is not None and self._cam_popout.is_standalone:
+            # 已经脱离详情页自己播过一轮并关掉了：不能拿旧窗口再 present
+            self._cam_popout = None
+        if self._cam_popout is None:
+            did = self.state.did
+            store = self.store
+
+            def online() -> bool:
+                # 只闭包 store，不闭包 self：详情页关掉后别被这个回调拖着不放
+                cur = store.devices.get(did)
+                return bool(cur is not None and cur.online)
+
+            self._cam_popout = CameraPopoutWindow(
+                self._camera,
+                self,
+                self._p,
+                self.state.name,
+                did=did,
+                online_provider=online,
+            )
+        self._cam_popout.present()
 
     def _stop_camera(self) -> None:
+        if self._cam_popout is not None and self._cam_popout.is_standalone:
+            # 第一次 _stop_camera 已经把会话交给独立窗口了（closeEvent/done 会
+            # 各调一次），重复调用不能再把窗口关掉。
+            return
+        timing.mark("停止取流/关闭页面")
+        # 独立窗口还在播、且没有在途取流任务：把会话交给窗口，本页只停自己的
+        # 看门狗/轮询。窗口关掉时才真正停播 + 归还观看位。
+        hand_over = (
+            self._cam_popout is not None
+            and self._cam_popout.is_staged
+            and self._camera is not None
+            and self._camera.has_live_playback
+            and self._cam_job is None
+        )
+        if hand_over:
+            hand_over = self._cam_popout is not None and self._cam_popout.detach_from_parent()
+        if not hand_over and self._cam_popout is not None:
+            # 页面内播放（没开独立窗口）或交接失败：按原行为停掉
+            self._cam_popout.close()
+        if self._cam_play_token:
+            timing.end_on(
+                self._cam_play_token,
+                "交独立窗口继续播放" if hand_over else "用户停止",
+            )
+            self._cam_play_token = 0
+        if self._cam_prefetch_token:
+            timing.end_on(self._cam_prefetch_token, "关闭页面")
+            self._cam_prefetch_token = 0
         self._cam_live = False
+        self._cam_wants_play = False
+        self._cam_job_token = 0
+        self._cam_poll.stop()
+        self._cam_watchdog.stop()
+        self._timer.stop()
+        if hand_over:
+            return
         if self._camera is not None:
-            self._camera.stop()
+            # 有所有者登记时统一收尾；没有（例如只是预热过）就退回原路径
+            if not playbacks().release(self._camera, "关闭详情页"):
+                self._camera.stop()
+                camera_service().release(self.state.did)
+        else:
+            camera_service().release(self.state.did)
 
     def closeEvent(self, event) -> None:
         self._stop_camera()
@@ -372,6 +936,8 @@ class DetailDialog(QDialog):
             row.changed.connect(self._on_change)
             self._rows.append(row)
             lay.addWidget(row)
+            if ctl.slot == "mode":
+                self._mode_row = row
 
     def _build_metrics(self) -> None:
         card = self.state.card
@@ -389,17 +955,105 @@ class DetailDialog(QDialog):
         card = self.state.card
         if not card.advanced:
             return
-        lay = self._group(f"更多功能 · {len(card.advanced)} 项")
-        for prop in card.advanced:
+        # 默认收起：这些属性不在轮询里，打开详情页就全读一遍等于白花一次批量读。
+        # 行控件也等第一次展开才建，36 行下拉框的弹出层没必要提前造。
+        self._adv_props: list[PropertySpec] = list(card.advanced)
+        self._adv_rows: list[ControlRow] = []
+        self._adv_open = False
+        self._adv_loading = False
+        self._adv_results: queue.SimpleQueue[tuple[dict[Any, Any], str]] = queue.SimpleQueue()
+
+        lay = self._group("")
+        self._adv_header = _AdvancedHeader(
+            f"更多功能 · {len(self._adv_props)} 项", self._p
+        )
+        self._adv_header.toggled.connect(self._toggle_advanced)
+        lay.addWidget(self._adv_header)
+
+        self._adv_body = QWidget()
+        body_lay = QVBoxLayout(self._adv_body)
+        body_lay.setContentsMargins(0, 4, 0, 0)
+        body_lay.setSpacing(0)
+        lay.addWidget(self._adv_body)
+        self._adv_body.setVisible(False)
+
+    def _toggle_advanced(self) -> None:
+        if self._adv_open:
+            self._adv_open = False
+            self._adv_header.set_open(False)
+            self._adv_body.setVisible(False)
+            return
+        self._adv_open = True
+        self._build_advanced_rows()
+        self._adv_header.set_open(True)
+        self._adv_body.setVisible(True)
+        self._request_advanced()
+
+    def _build_advanced_rows(self) -> None:
+        if self._adv_rows:
+            return
+        st = self.store.devices.get(self.state.did)
+        lay = self._adv_body.layout()
+        for prop in self._adv_props:
             role = "switch" if prop.kind == "bool" else ("select" if prop.kind == "enum" else "slider")
             row = ControlRow(prop, prop.label[:24], self._p, self._accent, role)
             row.changed.connect(self._on_change)
             self._rows.append(row)
+            self._adv_rows.append(row)
             lay.addWidget(row)
+            # 先用已缓存的值（上次展开读到的）；没有就显示"未知"，别停在默认值
+            value = st.values.get((prop.siid, prop.piid)) if st is not None else None
+            if value is None:
+                row.set_unknown()
+            else:
+                row.set_value(value)
+
+    def _request_advanced(self) -> None:
+        st = self.store.devices.get(self.state.did)
+        if st is None:
+            return
+        if not st.online:
+            self._adv_header.set_status("设备离线")
+            return
+        if self._adv_loading:
+            self._adv_header.set_status("读取中…")
+            return
+        self._adv_loading = True
+        self._adv_header.set_status("读取中…")
+        # 走工作线程读，结果放队列回主线程：详情页关掉后回调也不碰控件（同摄像头那条路）。
+        # 这里只捕获队列本身，回调里不再碰 self，窗口销毁后也不会炸。
+        results = self._adv_results
+        self.store.read_props(
+            st.did,
+            self._adv_props,
+            lambda res, error: results.put((res, error)),
+        )
+
+    def _collect_advanced(self) -> None:
+        while True:
+            try:
+                res, error = self._adv_results.get_nowait()
+            except queue.Empty:
+                break
+            self._adv_loading = False
+            if error:
+                self._adv_header.set_status(error)
+                continue
+            ok = sum(1 for rv in res.values() if getattr(rv, "ok", False))
+            total = len(self._adv_props)
+            if ok >= total:
+                self._adv_header.set_status(f"已读取 {ok} 项")
+            elif ok:
+                self._adv_header.set_status(f"{ok}/{total} 项可读")
+            else:
+                self._adv_header.set_status("读取失败，收起再展开可重试")
 
     # -- 数据 ------------------------------------------------------------
     def _on_change(self, siid: int, piid: int, value: object) -> None:
         self.store.set_value(self.state.did, (siid, piid), value)
+        if self._mode_row is not None and (siid, piid) == self._mode_row.prop.key:
+            # 用户刚选了模式：等 device 把 scene-mode 改过来之前，别被"无"擦掉
+            self._mode_pending = True
 
     def _hide_tip(self) -> str:
         """悬停提示的文案（惰性取，隐藏状态变了不用重新注册）。"""
@@ -422,12 +1076,30 @@ class DetailDialog(QDialog):
             return
         self.state = st
         if self._camera is not None and self._cam_live and not st.online:
-            # 设备掉线时 P2P 会先断流再超时，主动收掉比等播放器报错快
+            # 设备掉线时 P2P 会先断流再超时，主动收掉比等播放器报错快。
+            # 先结束会话（含独立窗口），再画错误，避免又触发一次通道切换。
             self._cam_live = False
+            self._cam_wants_play = False
+            self._cam_poll.stop()
+            self._cam_watchdog.stop()
+            if not playbacks().release(self._camera, "设备离线"):
+                self._camera.stop()
+                camera_service().release(self.state.did)
             self._camera.show_error("设备离线，画面已断开")
+        adv = set(self._adv_rows)
         for row in self._rows:
             row.set_enabled(st.online)
-            row.set_value(st.values.get((row.prop.siid, row.prop.piid)))
+            if row is self._mode_row and st.card.mode_active is not None:
+                self._sync_mode_row(st, row)
+                continue
+            value = st.values.get((row.prop.siid, row.prop.piid))
+            if value is None and row in adv:
+                # 「更多功能」的未读数不伪装成默认值；主控件保持原来的可点状态
+                row.set_unknown()
+            else:
+                row.set_value(value)
+        if self._adv_header is not None:
+            self._collect_advanced()
         self.titlebar.set_title(st.name)
         self.titlebar.set_subtitle(st.room or "")
         self._sync_hide_button()
@@ -437,6 +1109,110 @@ class DetailDialog(QDialog):
             self._foot.setText("尚未读取到数据")
         else:
             self._foot.setText(f"数据更新于 {int(st.age)} 秒前")
+
+    def _sync_mode_row(self, st: DeviceState, row: ControlRow) -> None:
+        """模式行的激活项以 ``scene-mode``(3,9) 为准，``mode``(2,5) 只用于写入。
+
+        ``mode`` 在手调亮度/色温后不会变（实测一直是 5/6/7），拿它当激活判据
+        会让下拉一直停在某个其实已经失效的预设上。数值对应关系两者一致（5–9），
+        所以 scene 直接当 mode 的枚举值用；0 是客户端语义"无激活项"，枚举里
+        并没有这一项，只能用占位文案表示，不能伪造一个能被写出去的选项。
+        """
+        try:
+            v = int(st.mode_active_value())
+        except (TypeError, ValueError):
+            # 还没读到 / 值不合法：退回默认行为（按 mode 自己的值高亮），
+            # 既不报错也不空高亮。
+            row.set_value(st.values.get((row.prop.siid, row.prop.piid)))
+            return
+        if v == 0:
+            # 用户刚选完、设备还没把 scene 改过来：先保留他的选择，
+            # 否则下拉会在 600ms 内先跳回"无"、再跳回所选模式，闪两下。
+            if not self._mode_pending:
+                row.set_no_selection("无")
+            return
+        self._mode_pending = False
+        if not row.select_value(v):
+            # 1–4 是自定义场景、10 是流光，都不在 mode 枚举里
+            row.set_no_selection("其他")
+
+
+class _AdvancedHeader(QWidget):
+    """「更多功能」的折叠标题：▶/▼ + 标题，右侧显示这次按需读取的状态。"""
+
+    toggled = Signal()
+
+    H = 30
+
+    def __init__(self, title: str, palette: theme.Palette) -> None:
+        super().__init__()
+        self._p = palette
+        self._title = title
+        self._status = ""
+        self._open = False
+        self._hover = False
+        self.setFixedHeight(self.H)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setAttribute(Qt.WA_Hover, True)
+
+    def set_open(self, open_: bool) -> None:
+        if self._open != open_:
+            self._open = open_
+            self.update()
+
+    def set_status(self, text: str) -> None:
+        if self._status != text:
+            self._status = text
+            self.update()
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802
+        # 同卡片墙的房间标题：用 release，按下后拖开再松手不算点击
+        if event.button() == Qt.LeftButton and self.rect().contains(event.position().toPoint()):
+            self.toggled.emit()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def enterEvent(self, event) -> None:  # noqa: N802
+        self._hover = True
+        self.update()
+
+    def leaveEvent(self, event) -> None:  # noqa: N802
+        self._hover = False
+        self.update()
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        pal = self._p
+        color = pal.text_soft if self._hover else pal.text_mute
+        draw_text(p, QRect(0, 0, max(0, self.width() - 140), self.H), self._title,
+                  size=12, color=color, weight=QFont.DemiBold)
+
+        # 三角跟在标题后面：收起 ▶ / 展开 ▼
+        font = QFont(p.font())
+        font.setPixelSize(12)
+        font.setWeight(QFont.DemiBold)
+        x = QFontMetrics(font).horizontalAdvance(self._title) + 8
+        cy = self.H / 2
+        p.setPen(QPen(QColor(color), 1.6, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+        p.setBrush(Qt.NoBrush)
+        path = QPainterPath()
+        if self._open:
+            path.moveTo(QPointF(x - 4, cy - 2))
+            path.lineTo(QPointF(x, cy + 2))
+            path.lineTo(QPointF(x + 4, cy - 2))
+        else:
+            path.moveTo(QPointF(x - 2, cy - 4))
+            path.lineTo(QPointF(x + 2, cy))
+            path.lineTo(QPointF(x - 2, cy + 4))
+        p.drawPath(path)
+
+        if self._status:
+            draw_text(p, QRect(0, 0, self.width(), self.H), self._status,
+                      size=11, color=pal.text_mute,
+                      align=Qt.AlignRight | Qt.AlignVCenter)
+        p.end()
 
 
 class _Header(QWidget):

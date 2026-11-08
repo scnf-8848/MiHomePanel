@@ -12,6 +12,8 @@
 4. **不吞掉卡片的点击语义**。这些都是真实 QWidget，落在它们身上的鼠标事件不会
    冒泡给卡片，所以「点空白开详情、点滑条调亮度」不需要额外判断——这是不用
    QPainter 手绘滑条的主要理由（拖动捕获、移出控件后的追踪都是白送的）。
+5. **滚轮只滚页面，不改参数**。滑条和步进器都混入 ``WheelSafe``，滚轮事件
+   ``ignore()`` 后冒泡给外层 ``QScrollArea``；点击、拖动、长按加减不受影响。
 """
 
 from __future__ import annotations
@@ -32,6 +34,7 @@ from PySide6.QtWidgets import QSizePolicy, QWidget
 from ..core.catalog import format_value
 from ..core.spec import PropertySpec
 from . import theme
+from .wheel_guard import WheelSafe
 from .widgets import ToggleSwitch, draw_text
 
 #: 一行控件的高度。卡片 body 区 76 高，正好放两行（36 + 4 + 36）。
@@ -75,15 +78,34 @@ def kelvin_color(kelvin: float) -> QColor:
     return color
 
 
-def _numeric_range(prop: PropertySpec) -> tuple[float, float, float]:
+def _numeric_range(
+    prop: PropertySpec, *, fine_step: float = 0.0
+) -> tuple[float, float, float]:
     lo, hi, step = prop.value_range or (0, 100, 1)
-    lo, hi = float(lo), float(hi)
+    lo, hi, step = float(lo), float(hi), float(step or 1)
     # 有些属性是 uint32 全域（0..4294967295），滑条按 int32 夹住才不丢精度到溢出
     hi = min(hi, 2**31 - 1)
     lo = max(lo, -(2**31))
     if hi <= lo:
         hi = lo + 1
-    return lo, hi, max(1.0, float(step or 1))
+    if step <= 0:
+        step = 1.0
+    if fine_step > 0:
+        # 规格里的 step 是云端校验的最小合法档位。0.5 只有落在 step 的整数倍
+        # 上才启用（0.1/0.25/0.5 这类规格）；int32/step=1 的设备保持 1 档，
+        # 否则写 23.5 会被云端判为非法值。
+        ratio = fine_step / step
+        if ratio >= 1 and abs(ratio - round(ratio)) < 1e-6:
+            step = fine_step
+    else:
+        step = max(1.0, step)
+    return lo, hi, step
+
+
+def _clean_number(value: float) -> int | float:
+    """抹掉浮点累加噪声：24.0 → 24，23.500000000001 → 23.5。"""
+    v = round(float(value), 6)
+    return int(v) if abs(v - round(v)) < 1e-6 else v
 
 
 class CardControl(QWidget):
@@ -129,7 +151,7 @@ class CardControl(QWidget):
         return self._p.text_mute if self._dimmed else self._p.text_soft
 
     def _fmt(self, value: float) -> str:
-        return format_value(self.prop, int(round(value)))
+        return format_value(self.prop, _clean_number(value))
 
     def sizeHint(self) -> QSize:  # noqa: N802
         return QSize(120, self.height())
@@ -140,11 +162,11 @@ class CardControl(QWidget):
 # ---------------------------------------------------------------------------
 
 
-class CardSlider(CardControl):
+class CardSlider(WheelSafe, CardControl):
     """图标 + 轨道 + 数值。``gradient=True`` 时轨道本身是色带（色温用）。"""
 
     previewed = Signal(float)  # 拖动中的实时值（只更新界面，别发命令）
-    committed = Signal(int)  # 松手/滚轮之后才发
+    committed = Signal(int)  # 松手之后才发
 
     HEIGHT = ROW_H
 
@@ -156,14 +178,21 @@ class CardSlider(CardControl):
         *,
         label: str = "",
         gradient: bool = False,
+        compact: bool = False,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(prop, palette, accent, label=label, parent=parent)
         self._lo, self._hi, self._step = _numeric_range(prop)
         self._value = self._lo
         self._gradient = gradient
+        #: ``compact`` 给详情页用：左侧不画属性名（那一行已经有名字了），
+        #: 轨道从最左边开始，只给右侧数值留固定宽度。
+        self._compact = compact
+        self._unknown = False
         self._dragging = False
         self.setFixedHeight(self.HEIGHT)
+        # 滑条只认鼠标：点击跳值、拖动松手提交。键盘（方向键 / PageUp/Down /
+        # Home/End）一律不接，也不抢焦点——误触方向键不该悄悄改设备参数。
 
     # -- 值 --------------------------------------------------------------
     @property
@@ -181,13 +210,25 @@ class CardSlider(CardControl):
             v = float(value)  # type: ignore[arg-type]
         except (TypeError, ValueError):
             return
+        self._unknown = False
         v = min(self._hi, max(self._lo, v))
         if abs(v - self._value) > 1e-6:
             self._value = v
             self.update()
 
+    def set_unknown(self) -> None:
+        """值没读到：轨道置灰、不画滑块、数值显示「—」。
+
+        详情页「更多功能」里的行是懒读的，没读到时不能停在最小值假装读成功。
+        """
+        self._unknown = True
+        self.update()
+
     # -- 栅格 ------------------------------------------------------------
     def _span(self) -> tuple[float, float]:
+        if self._compact:
+            x0 = 1.0
+            return x0, float(max(x0 + 40, self.width() - VALUE_W - 2))
         x0 = float(LABEL_W + 8)
         x1 = float(max(x0 + 40, self.width() - VALUE_W - 8))
         return x0, x1
@@ -206,11 +247,15 @@ class CardSlider(CardControl):
     def paintEvent(self, event) -> None:  # noqa: N802
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
-        p.setOpacity(0.55 if self._dimmed else 1.0)
+        opacity = 0.55 if self._dimmed else 1.0
+        if not self.isEnabled():
+            opacity *= 0.45
+        p.setOpacity(opacity)
         h = self.height()
         cy = h / 2.0
 
-        draw_text(p, QRect(0, 0, LABEL_W, h), self._label, size=12, color=self._ink())
+        if not self._compact:
+            draw_text(p, QRect(0, 0, LABEL_W, h), self._label, size=12, color=self._ink())
 
         x0, x1 = self._span()
         track = QRect(int(x0), int(cy - TRACK_H / 2), int(x1 - x0), TRACK_H)
@@ -219,37 +264,38 @@ class CardSlider(CardControl):
         p.drawRoundedRect(track, TRACK_H / 2, TRACK_H / 2)
 
         ratio = max(0.0, min(1.0, self._ratio()))
-        if self._gradient:
-            grad = QLinearGradient(x0, 0.0, x1, 0.0)
-            # 只插两端的话，中间会被线性插值拉成灰白（橙→淡蓝的中点没有色相）。
-            # 按色温本身取 5 个档，才是「橙→暖白→白→冷白」的真实过渡。
-            for i in range(5):
-                t = i / 4.0
-                grad.setColorAt(t, kelvin_color(self._lo + (self._hi - self._lo) * t))
-            p.setBrush(grad)
-            p.drawRoundedRect(track, TRACK_H / 2, TRACK_H / 2)
-        else:
-            filled = int(track.width() * ratio)
-            if filled > 1:
-                p.setBrush(QColor(self._accent))
-                p.drawRoundedRect(
-                    QRect(track.x(), track.y(), filled, track.height()),
-                    TRACK_H / 2,
-                    TRACK_H / 2,
-                )
+        if not self._unknown:
+            if self._gradient:
+                grad = QLinearGradient(x0, 0.0, x1, 0.0)
+                # 只插两端的话，中间会被线性插值拉成灰白（橙→淡蓝的中点没有色相）。
+                # 按色温本身取 5 个档，才是「橙→暖白→白→冷白」的真实过渡。
+                for i in range(5):
+                    t = i / 4.0
+                    grad.setColorAt(t, kelvin_color(self._lo + (self._hi - self._lo) * t))
+                p.setBrush(grad)
+                p.drawRoundedRect(track, TRACK_H / 2, TRACK_H / 2)
+            else:
+                filled = int(track.width() * ratio)
+                if filled > 1:
+                    p.setBrush(QColor(self._accent))
+                    p.drawRoundedRect(
+                        QRect(track.x(), track.y(), filled, track.height()),
+                        TRACK_H / 2,
+                        TRACK_H / 2,
+                    )
 
-        thumb = QPointF(x0 + (x1 - x0) * ratio, cy)
-        p.setBrush(QColor("#FFFFFF"))
-        p.setPen(QPen(QColor(theme.blend(self._p.text, "#000000", 0.12 if not self._p.is_dark else 0.0)), 1))
-        r = THUMB_D / 2 + (1 if self._dragging else 0)
-        p.drawEllipse(thumb, r, r)
+            thumb = QPointF(x0 + (x1 - x0) * ratio, cy)
+            p.setBrush(QColor("#FFFFFF"))
+            p.setPen(QPen(QColor(theme.blend(self._p.text, "#000000", 0.12 if not self._p.is_dark else 0.0)), 1))
+            r = THUMB_D / 2 + (1 if self._dragging else 0)
+            p.drawEllipse(thumb, r, r)
 
         draw_text(
             p,
             QRect(self.width() - VALUE_W, 0, VALUE_W, h),
-            self._fmt(self._value),
+            "—" if self._unknown else self._fmt(self._value),
             size=12,
-            color=self._p.text if not self._dimmed else self._ink(),
+            color=self._p.text if not self._dimmed and not self._unknown else self._ink(),
             align=Qt.AlignRight | Qt.AlignVCenter,
         )
         p.end()
@@ -275,19 +321,6 @@ class CardSlider(CardControl):
         self.committed.emit(int(round(self._value)))
         event.accept()
 
-    def wheelEvent(self, event) -> None:  # noqa: N802
-        """桌面端刚需：滚轮微调 ±1 步。"""
-        if not self.isEnabled():
-            return
-        # 上滚加、下滚减（angleDelta 正数是向上）
-        step = 1 if event.angleDelta().y() > 0 else -1
-        target = min(self._hi, max(self._lo, self._value + step * self._step))
-        if target != self._value:
-            self._value = target
-            self.update()
-            self.committed.emit(int(round(target)))
-        event.accept()
-
     def _update_from(self, x: float) -> None:
         v = self._value_at(x)
         if abs(v - self._value) < 1e-6:
@@ -302,8 +335,8 @@ class CardSlider(CardControl):
 # ---------------------------------------------------------------------------
 
 
-class CardStepper(CardControl):
-    """``26°  −  +``（详情页）/ ``− 26°  +``（卡片 body）。按住不放连续加减，16°→30° 不用点十四下。
+class CardStepper(WheelSafe, CardControl):
+    """``− 26°  +`` 步进器（卡片 body 与详情页同款）。按住不放连续加减，16°→30° 不用点十四下。
 
     ``centered=True`` 时把「减号 + 数值 + 加号」当成**一整组**居中，并把减号挪到
     数字左侧（``− 26° +``）。卡片 body 有 312 宽（2×1），靠左贴右会在中间留出
@@ -312,7 +345,7 @@ class CardStepper(CardControl):
     手指不用在同一个位置分辨哪个是减号。
     """
 
-    committed = Signal(int)
+    committed = Signal(object)
 
     HEIGHT = ROW_H
     BTN = 26
@@ -336,7 +369,10 @@ class CardStepper(CardControl):
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(prop, palette, accent, label=label, parent=parent)
-        self._lo, self._hi, self._step = _numeric_range(prop)
+        # 温度类属性（unit=celsius）尝试 0.5 的半度档位；规格 step 不允许时
+        # ``_numeric_range`` 会沿用规格自己的最小合法档位（通常是 1）。
+        fine = 0.5 if prop.unit == "celsius" else 0.0
+        self._lo, self._hi, self._step = _numeric_range(prop, fine_step=fine)
         self._value = self._lo
         self._hot = 0  # -1 减、+1 加、0 无
         self._centered = centered
@@ -379,9 +415,9 @@ class CardStepper(CardControl):
     def _layout(self) -> tuple[QRect, QRect, QRect]:
         """返回 (数值区, 减号, 加号) 三个矩形。居中/靠右的差别只在这里。
 
-        靠右（详情页）沿用 ``数值 …… − +``：那一行左侧还要放属性名，
-        按钮聚在右端更好对齐全表。居中（卡片 body）是 ``− 数值 +``：
-        整组居中，数字两侧各一枚，TEXT_GAP 左右对称。
+        居中（卡片 body 和详情页）是 ``− 数值 +``：整组居中，数字两侧各一枚，
+        TEXT_GAP 左右对称。``centered=False`` 保留 ``数值 …… − +`` 的紧凑排布，
+        给单独控件预览这类窄场景用。
         """
         y = (self.height() - self.BTN) // 2
         if not self._centered:
@@ -405,6 +441,27 @@ class CardStepper(CardControl):
     def _buttons(self) -> tuple[QRect, QRect]:
         _, minus, plus = self._layout()
         return minus, plus
+
+    def sizeHint(self) -> QSize:  # noqa: N802
+        """居中排布时按「两枚按钮 + 最宽数值」的整组宽度留位。
+
+        详情页那一行是 ``标签 …… [− 数值 +]``，布局按 sizeHint 分配宽度；
+        默认 120 放不下 24px 的 "23.5°C"（整组约 216px），会被裁掉右侧加号。
+        按区间内会出现的文案（含半度值）取最大宽度，拖动时整组宽度也不会跳。
+        """
+        if not self._centered:
+            return QSize(120, self.height())
+        fm = QFontMetrics(self._text_font())
+        # 半度值（16.5°C）比两端的整数文案更宽，别只看 lo/hi
+        samples = (
+            self._lo,
+            self._hi,
+            min(self._hi, self._lo + self._step),
+            max(self._lo, self._hi - self._step),
+        )
+        text_w = max(fm.horizontalAdvance(self._fmt(v)) for v in samples) + 2
+        gap = self.TEXT_GAP - 1
+        return QSize(self.BTN * 2 + gap * 2 + text_w, self.height())
 
     # -- 绘制 ------------------------------------------------------------
     def paintEvent(self, event) -> None:  # noqa: N802
@@ -469,24 +526,23 @@ class CardStepper(CardControl):
             self.update()
         event.accept()
 
-    def wheelEvent(self, event) -> None:  # noqa: N802
-        if not self.isEnabled():
-            return
-        self._bump(1 if event.angleDelta().y() > 0 else -1)
-        event.accept()
-
     def _start_repeat(self) -> None:
         if self._hot:
             self._repeat.start()
 
+    def _snap(self, value: float) -> float:
+        """落到规格档位网格上，避免 0.5 步长累加出 23.500000001。"""
+        n = round((value - self._lo) / self._step)
+        raw = self._lo + n * self._step
+        return min(self._hi, max(self._lo, raw))
+
     def _bump(self, direction: int) -> None:
-        target = self._value + direction * self._step
-        target = min(self._hi, max(self._lo, target))
+        target = self._snap(self._value + direction * self._step)
         if abs(target - self._value) < 1e-6:
             return
         self._value = target
         self.update()
-        self.committed.emit(int(round(target)))
+        self.committed.emit(_clean_number(target))
 
 
 # ---------------------------------------------------------------------------
@@ -522,7 +578,12 @@ class CardChips(CardControl):
         self._items: list[tuple[int, str]] = [
             (o.value, o.display) for o in prop.value_list
         ]
-        self._current: int | None = self._items[0][0] if self._items else None
+        # 初始**不选中任何一项**：以前默认选中第一项，真实值还没同步到时第一帧
+        # 会假高亮成"第一个模式已激活"。现在只有 ``set_value`` 收到真实值才点亮，
+        # 没有激活项（值不在 items 里，例如 0）时整排都是未选中态。
+        self._current: int | None = None
+        #: 上一次从 store 同步到的"激活判据"值（型号适配时是 scene-mode，否则为空）
+        self._active_seen: int | None = None
         self._hover = -1
         self._spread = spread
         self.setFixedHeight(self.HEIGHT)
@@ -539,6 +600,32 @@ class CardChips(CardControl):
         try:
             v = int(value)  # type: ignore[arg-type]
         except (TypeError, ValueError):
+            return
+        if v != self._current:
+            self._current = v
+            self.update()
+
+    def set_active(self, value: object) -> None:
+        """同步"当前激活判据"（型号适配后由 store 给出，如挂灯的 scene-mode）。
+
+        和 ``set_value`` 的区别只在 0 的处理：0 是客户端语义"无激活项"，枚举里
+        没有这一项，所以是"整排不选中"而不是"选中 0"。为了不让用户点完立刻灭，
+        从某个非 0 值掉到 0 才清空；一直停在 0（开机就是"无"）时不覆盖本地刚
+        点出来的乐观高亮——下一次真值变化会纠正。
+        """
+        if value is None:
+            return
+        try:
+            v = int(value)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return
+        prev, self._active_seen = self._active_seen, v
+        if v == prev:
+            return
+        if v == 0:
+            if prev is not None:
+                self._current = 0
+                self.update()
             return
         if v != self._current:
             self._current = v

@@ -15,7 +15,16 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import QByteArray, QPoint, QPointF, QSettings, Qt, QTimer, Signal
+from PySide6.QtCore import (
+    QByteArray,
+    QEvent,
+    QPoint,
+    QPointF,
+    QSettings,
+    Qt,
+    QTimer,
+    Signal,
+)
 from PySide6.QtGui import QColor, QKeySequence, QPainter, QPainterPath, QShortcut
 from PySide6.QtWidgets import (
     QHBoxLayout,
@@ -31,7 +40,7 @@ from ..core.jobs import SerialWorker
 from ..core.prefs import Prefs
 from ..core.store import Store
 from . import theme, tooltip
-from .chrome import DimOverlay, TitleBar, WindowFrame
+from .chrome import DimOverlay, TitleBar, WindowFrame, exec_with_dim_click
 from .home_tabs import HomeTabs
 from .side_nav import SideNav
 from .wall import WallView
@@ -311,7 +320,23 @@ class MainWindow(QMainWindow):
         # 悬停提示走 tooltip.watch 注册的 provider，这里只要更新文字
         self.status.setText(text)
 
+    def changeEvent(self, event) -> None:  # noqa: N802
+        super().changeEvent(event)
+        if event.type() == QEvent.WindowStateChange and self.isMinimized():
+            # 最小化后画面完全不可见，暂停等于继续占着观看位
+            self._release_camera_sessions("窗口最小化")
+
+    def _release_camera_sessions(self, reason: str) -> None:
+        """最小化/退出：连独立窗口一起收掉，确保没有会话还占着观看位。"""
+        from .camera_popout import close_all_popouts
+        from .camera_view import playbacks
+
+        close_all_popouts()
+        self.wall.stop_playback(reason)
+        playbacks().release(None, reason)
+
     def closeEvent(self, event) -> None:  # noqa: N802
+        self._release_camera_sessions("关闭窗口")
         self._save_settings()
         self.prefs.save()
         self.client.flush()
@@ -346,10 +371,17 @@ class MainWindow(QMainWindow):
         self._run_dialog(dlg)
 
     def _run_dialog(self, dlg) -> None:
-        """模态子窗口统一入口：弹出期间压暗主窗口，关掉就恢复。"""
+        """模态子窗口统一入口：弹出期间压暗主窗口，关掉就恢复。
+
+        点压暗区关闭子窗口也在这里接（``exec_with_dim_click``）：只关当前这一层，
+        行为等同 Esc。
+        """
+        # 子窗口一盖上来，墙上的画面就看不见了；停播而不是暂停，
+        # 把观看位让给详情页（墙面和详情页共用同一个 CameraService）。
+        self.wall.stop_playback("打开子窗口")
         self._dim.cover(True)
         try:
-            dlg.exec()
+            exec_with_dim_click(dlg)
         finally:
             self._dim.cover(False)
 
@@ -490,6 +522,11 @@ class MainWindow(QMainWindow):
         from .detail import DetailDialog
 
         dlg = DetailDialog(st, self.store, self.palette_ref, self, icons=self.icon_provider)
+        # 墙上正在播这一路：把 player/sink 直接接到详情页，不重新 open。
+        # 接不过去（没在播 / 播的是别的设备 / 目标控件不可用）才退回原路。
+        if not self.wall.hand_off_active_to(dlg.camera_view, st.did):
+            self.wall.stop_playback("打开详情")
+        dlg.adopt_playing_camera()
         self._run_dialog(dlg)
 
     def _on_icon_ready(self, model: str) -> None:

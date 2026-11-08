@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""摄像头详情页截图（就绪态 + 播放态）。
+"""摄像头详情页截图（空态 + 播放态 + 释放态 + 错误态）。
 
 主程序的 ``shot_ui.py`` 截的是灯品类，不会触发取流；这条单独跑，用来检查画面卡片
 的尺寸、圆角、状态文字和按钮位置。
 
-打开详情页会先"预热"（连上但冻住首帧），所以第一张截的是就绪态：画面 + 中央播放键。
-然后模拟点一下播放，第二张截播放态：右下角的暂停键。第三张是"闲置释放"——暂停后
-把连接放掉，画面区变成一句提示 + 播放键（点一下会重新取流）；第四张是错误态，
+打开详情页**不取流**，所以第一张截的是空态：底色 + 中央播放键 + 一句提示。然后模拟
+点一下播放，等首帧到达后截播放态：右下角的暂停键。第三张是"闲置释放"——暂停后把
+连接放掉，画面区变成一句提示 + 播放键（点一下会重新取流）；第四张是错误态，
 用来核对"观看位已满"这类长文案有没有压到重试按钮上。
 
 用法：.venv/Scripts/python.exe -X utf8 scripts/shot_camera.py
@@ -28,7 +28,7 @@ from mihome.ui.detail import DetailDialog
 from mihome.ui.main_window import MainWindow
 
 OUT = Path("scripts/out")
-READY_TIMEOUT_MS = 20000
+START_TIMEOUT_MS = 20000
 
 
 def main() -> int:
@@ -47,6 +47,7 @@ def main() -> int:
     win.start()
 
     tries = {"n": 0}
+    waited = {"ms": 0}
 
     def look() -> None:
         tries["n"] += 1
@@ -69,30 +70,36 @@ def main() -> int:
         print(f"打开 {cam.name} / {cam.node.model}")
         dlg = DetailDialog(cam, win.store, win.palette_ref, win, icons=win.icon_provider)
         dlg.show()
+        QTimer.singleShot(600, shoot_idle)
 
-        waited = {"ms": 0}
-
-        def wait_ready() -> None:
-            """等预热完成（首帧到手后控件会自己进入 ready）。"""
+        def shoot_idle() -> None:
+            """空态：还没点播放，画面区只有一个播放键。"""
             view = dlg._camera
-            if view is None or view.state != view.READY:
+            if view is None:
+                print("没有画面控件")
+                dlg.close()
+                app.quit()
+                return
+            app.processEvents()
+            pix = dlg.grab()
+            pix.save(str(OUT / "camera_detail.png"))
+            print(f"已保存 camera_detail.png（空态）  {pix.width()}x{pix.height()}")
+            view.toggle()  # 点播放
+            waited["ms"] = 0
+            QTimer.singleShot(400, wait_playing)
+
+        def wait_playing() -> None:
+            view = dlg._camera
+            if view.state != view.PLAYING:
                 waited["ms"] += 400
-                if waited["ms"] > READY_TIMEOUT_MS:
+                if waited["ms"] > START_TIMEOUT_MS:
                     print(f"等不到画面，当前状态 {getattr(view, 'state', '?')}")
-                    print(f"  控件提示：{getattr(view, 'toolTip', lambda: '')()}")
+                    print(f"  控件提示：{view.toolTip()}")
                     dlg.close()
                     app.quit()
                     return
-                QTimer.singleShot(400, wait_ready)
+                QTimer.singleShot(400, wait_playing)
                 return
-            pix = dlg.grab()
-            pix.save(str(OUT / "camera_detail.png"))
-            print(f"已保存 camera_detail.png（就绪态）  {pix.width()}x{pix.height()}")
-            view.toggle()  # 点播放
-            QTimer.singleShot(2500, shoot_playing)
-
-        def shoot_playing() -> None:
-            view = dlg._camera
             # 没有真实鼠标，手动把 hover 打开，才能截到右下角的暂停键
             view._hover = True
             view._refresh_buttons()
@@ -115,25 +122,7 @@ def main() -> int:
             pix.save(str(OUT / "camera_error_state.png"))
             print(f"已保存 camera_error_state.png（错误态）  {pix.width()}x{pix.height()}")
             dlg.close()
-            # 再开一次详情页：这次应该先垫"上次的画面"，而不是纯黑等 5–7 秒
-            again = DetailDialog(
-                cam, win.store, win.palette_ref, win, icons=win.icon_provider
-            )
-            again.show()
-            QTimer.singleShot(1500, lambda: shoot_placeholder(again))
-
-        def shoot_placeholder(dlg2: DetailDialog) -> None:
-            pix = dlg2.grab()
-            pix.save(str(OUT / "camera_placeholder.png"))
-            view = dlg2._camera
-            print(
-                f"已保存 camera_placeholder.png（占位图）  {pix.width()}x{pix.height()}"
-                f"  状态={getattr(view, 'state', '?')}"
-            )
-            dlg2.close()
             app.quit()
-
-        QTimer.singleShot(600, wait_ready)
 
     QTimer.singleShot(800, look)
     return app.exec()

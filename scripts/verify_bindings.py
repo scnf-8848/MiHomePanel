@@ -48,7 +48,8 @@ def main() -> int:
         s = specs.get(n.spec_type)
         if s is None:
             continue
-        card = catalog.build_card(s, gang_names=n.gang_names, gang_rooms=n.gang_rooms)
+        card = catalog.build_card(s, model=n.model,
+                                  gang_names=n.gang_names, gang_rooms=n.gang_rooms)
         props = [c.prop for c in (*card.controls, *card.metrics) if c.prop]
         props += [g.power for g in card.gangs]
         seen: set[tuple[int, int]] = set()

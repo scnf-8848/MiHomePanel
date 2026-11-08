@@ -369,6 +369,15 @@ class Client:
         """逃生口：登录二维码等场景需要直接摸上游对象。"""
         return self._api
 
+    def locked(self, action: Any) -> Any:
+        """在串行锁里执行一次直接摸上游对象的调用。
+
+        ``requests.Session`` 不是线程安全的，所有云端请求都要走同一把锁；
+        摄像头跨网授权（``miss_get_vendor``）不在常规读写路径上，用它借锁。
+        """
+        with self._lock:
+            return action()
+
     @property
     def signed_in(self) -> bool:
         """本地有没有可用凭据。只看文件内容，不联网（``available`` 会真的去请求）。"""

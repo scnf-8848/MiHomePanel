@@ -536,6 +536,44 @@ INTERNAL_SERVICES = {
     "offline-data",
 }
 
+#: 型号级适配：只按 ``DeviceNode.model`` 精确命中，不做任何模糊匹配。
+@dataclass(frozen=True, slots=True)
+class ModelAdapter:
+    """**型号级**适配记录：只描述"这台机器多读哪个属性、模式看哪个属性"。
+
+    一定要按设备节点上报的 model 精确命中——不要按品类（light）泛化，
+    也不要靠属性名去猜设备行为。没登记的型号完全走默认路径。
+    """
+
+    #: 额外参与轮询的属性名（只读、不渲染）；空 = 不追加任何请求
+    extra: tuple[str, ...] = ()
+    #: 模式激活判据用的属性名；空 = 仍用 ``mode``(2,5) 自己的值（默认行为）
+    mode_active: str = ""
+
+
+#: 型号级适配表（唯一注册处）。
+#:
+#: 键是设备节点上报的型号（``DeviceNode.model``，如 ``yeelink.light.lamp22``），
+#: 必须精确匹配、点分形式；值是一条 ``ModelAdapter`` 记录。
+#:
+#: **新增一个型号适配 = 在下面加一条记录**，不需要改任何判断逻辑：
+#:   1. 加 ``"型号": ModelAdapter(extra=("属性名",), mode_active="属性名")``；
+#:   2. ``build_card(model=...)`` 会把它解析进 ``CardSpec.extra`` / ``CardSpec.mode_active``；
+#:   3. store 的 ``_card_props`` 自动把 ``extra`` 并入轮询与寻址登记；
+#:   4. 界面统一用 ``st.mode_active_value()`` 取值，不要自己查 ``values``。
+#:
+#: 安全退化：属性在 spec 里找不到、或运行时读不到，``extra`` / ``mode_active``
+#: 就是空的，一切回到默认行为（模式高亮按 ``mode``(2,5)），不报错、不空高亮。
+MODEL_ADAPTERS: dict[str, ModelAdapter] = {
+    # 米家显示器挂灯 1S：``scene-mode``(3,9) 是"当前实际生效的预设"，
+    # 0 = 无激活项。它会被任何亮度/色温写入清 0，所以只读来当判据；
+    # 写入仍然走 ``mode``(2,5)。
+    "yeelink.light.lamp22": ModelAdapter(
+        extra=("scene-mode",),
+        mode_active="scene-mode",
+    ),
+}
+
 # 属性名里出现这些词，基本是调试/参数，不暴露
 _INTERNAL_NAME_HINTS = (
     "parm",
@@ -619,6 +657,12 @@ class CardSpec:
     metrics: list[BoundControl] = field(default_factory=list)
     gangs: list[Gang] = field(default_factory=list)
     advanced: list[PropertySpec] = field(default_factory=list)
+    #: 只参与轮询、**不在卡片上渲染**的属性（型号级适配，见 ``MODEL_ADAPTERS``）。
+    #: 典型是"当前实际生效的预设"这类只读状态：卡片没位置放它，但界面判断
+    #: 激活态时必须实时。未适配的机型这里是空列表，轮询集合与以前完全一致。
+    extra: list[PropertySpec] = field(default_factory=list)
+    #: 模式激活判据用的属性（型号适配；``None`` = 用 ``mode`` 自己的值，默认行为）
+    mode_active: PropertySpec | None = None
     actions: list[ActionSpec] = field(default_factory=list)
     events: list[EventSpec] = field(default_factory=list)
     power_actions: tuple[ActionSpec, ActionSpec] | None = None
@@ -737,11 +781,16 @@ def _bind(spec: DeviceSpec, ctl: Control, primary: str | None) -> BoundControl:
 def build_card(
     spec: DeviceSpec,
     *,
+    model: str | None = None,
     gang_names: Mapping[int, str] | None = None,
     gang_rooms: Mapping[int, str] | None = None,
 ) -> CardSpec:
     """把一份 DeviceSpec 绑定成一张卡片描述。
 
+    ``model``: 设备节点上报的型号（``DeviceNode.model``，如
+    ``yeelink.light.lamp22``），是 ``MODEL_ADAPTERS`` 的唯一查找键。
+    不传 = 不做型号适配（走默认路径）；别拿 ``spec.model`` 顶替——
+    那是 URN 里的型号段，形式不同（``yeelink-lamp22``）。
     ``gang_names``: siid → 该路的名字（来自 ``did.sN`` 虚拟设备），决定按键标签。
     """
     prof = profile_for(spec.category, spec)
@@ -778,6 +827,18 @@ def build_card(
         card.events = [e for e in spec.events() if e.name in wanted_events]
 
     card.advanced = _advanced(spec, card)
+
+    # 型号级适配：**精确命中 model 字符串**才生效（规则见 MODEL_ADAPTERS 的注释）。
+    # 属性名在 spec 里找不到就当作没登记，安全退化到默认行为。
+    adapter = MODEL_ADAPTERS.get(model) if model else None
+    if adapter is not None:
+        for name in adapter.extra:
+            found = spec.find_all(name)
+            if found:
+                card.extra.append(found[0])
+        active = next((p for p in card.extra if p.name == adapter.mode_active), None)
+        if active is not None and any(c.slot == "mode" for c in card.controls):
+            card.mode_active = active
     return card
 
 

@@ -20,7 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QPoint, QPointF, Qt  # noqa: E402
-from PySide6.QtGui import QFont, QFontDatabase, QMouseEvent, QWheelEvent  # noqa: E402
+from PySide6.QtGui import QFont, QFontDatabase, QKeyEvent, QMouseEvent, QWheelEvent  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import QApplication, QFrame, QLabel, QVBoxLayout  # noqa: E402
 
@@ -154,7 +154,8 @@ def test_slider(app: QApplication) -> None:
         False,
     )
     QApplication.sendEvent(w, ev)
-    check("滚轮上滚 +1 步", int(w.value()), 41)
+    check("滚轮不改值（只滚页面）", int(w.value()), 40)
+    check_true("滚轮事件被 ignore，留给父级滚动区", not ev.isAccepted())
 
     w.setEnabled(False)
     before = int(w.value())
@@ -170,6 +171,67 @@ def test_slider(app: QApplication) -> None:
         g.set_value(v)
         g.grab()
     check("色温滑条区间", (int(g._lo), int(g._hi)), (2700, 6500))
+
+    # 详情页 compact 变体：不画属性名，轨道从最左开始，右侧只留数值宽度
+    c = CardSlider(BRIGHT, theme.LIGHT, theme.SLIDER_WARM, compact=True)
+    c.setFixedWidth(210)
+    c.show()
+    c.set_value(40)
+    app.processEvents()
+    x0, x1 = c._span()
+    check("compact 轨道从最左开始", round(x0), 1)
+    check_true("compact 轨道右端留给数值", c.width() - x1 >= 40, f"{c.width() - x1:.0f}px")
+
+    commits: list[int] = []
+    c.committed.connect(commits.append)
+
+    def key(kind, k) -> None:
+        QApplication.sendEvent(c, QKeyEvent(kind, k, Qt.NoModifier))
+
+    # 键盘一律不接：方向键 / PageUp/Down / Home/End 都不改值、不发提交
+    for k in (
+        Qt.Key_Left,
+        Qt.Key_Right,
+        Qt.Key_Up,
+        Qt.Key_Down,
+        Qt.Key_PageUp,
+        Qt.Key_PageDown,
+        Qt.Key_Home,
+        Qt.Key_End,
+    ):
+        key(QKeyEvent.Type.KeyPress, k)
+        key(QKeyEvent.Type.KeyRelease, k)
+    check("按键不改值", int(c.value()), 40)
+    check("按键不提交", commits, [])
+    check("不抢焦点", int(c.focusPolicy().value), 0)  # Qt.NoFocus == 0
+
+    # 鼠标仍然可用：点击跳值 + 拖动松手提交
+    drag(c, x0, x1)
+    check_true("鼠标拖动仍能提交", bool(commits), f"{commits}")
+    c.set_value(40)
+    commits.clear()
+
+    c.set_unknown()
+    check_true("未知态标记", c._unknown)
+    c.grab()
+    c.set_value(40)
+    check_true("拿到值后退出未知态", not c._unknown)
+
+    c.setEnabled(False)
+    drag(c, x1, x0)
+    check("禁用后拖不动", int(c.value()), 40)
+    check("禁用后不提交", commits, [])
+    c.setEnabled(True)
+
+    gc = CardSlider(CCT, theme.LIGHT, theme.SLIDER_WARM, gradient=True, compact=True)
+    gc.setFixedWidth(210)
+    gc.show()
+    gc.set_value(5474)
+    gc.grab()
+    check("compact 色温区间", (int(gc._lo), int(gc._hi)), (2700, 6500))
+
+    gc.hide()
+    c.hide()
     g.hide()
     w.hide()
 
@@ -182,6 +244,21 @@ def test_stepper(app: QApplication) -> None:
     w.set_value(26)
     got: list[int] = []
     w.committed.connect(got.append)
+
+    ev = QWheelEvent(
+        QPointF(150, 18),
+        QPointF(150, 18),
+        QPoint(0, 0),
+        QPoint(0, 120),
+        Qt.NoButton,
+        Qt.NoModifier,
+        Qt.ScrollUpdate,
+        False,
+    )
+    QApplication.sendEvent(w, ev)
+    check("步进器滚轮不改值", int(w.value()), 26)
+    check_true("步进器滚轮事件被 ignore", not ev.isAccepted())
+    check("步进器滚轮不发命令", len(got), 0)
 
     minus, plus = w._buttons()
     QTest.mouseClick(w, Qt.LeftButton, pos=plus.center())
@@ -217,6 +294,24 @@ def test_chips(app: QApplication) -> None:
     QTest.mouseClick(w, Qt.LeftButton, pos=chips[2][0].center())
     check("点第三项提交值 2", got[-1], 2)
     check("选中态跟着变", w.value(), 2)
+
+    # 胶囊组同样不吃滚轮（默认 QWidget 就是 ignore，这里锁住这个行为）
+    before = w.value()
+    got.clear()
+    ev = QWheelEvent(
+        QPointF(150, 13),
+        QPointF(150, 13),
+        QPoint(0, 0),
+        QPoint(0, 120),
+        Qt.NoButton,
+        Qt.NoModifier,
+        Qt.ScrollUpdate,
+        False,
+    )
+    QApplication.sendEvent(w, ev)
+    check("胶囊组滚轮不改值", w.value(), before)
+    check("胶囊组滚轮不发命令", len(got), 0)
+    check_true("胶囊组滚轮事件被 ignore", not ev.isAccepted())
 
     narrow = CardChips(MODE, theme.LIGHT, "#39A0F5")
     narrow.resize(150, narrow.height())

@@ -32,7 +32,7 @@ from .api import Client, HomeNode, PropRef, ReadValue, Topology, classify
 from .catalog import CardSpec, build_card, summary_line
 from .jobs import PRIORITY_CONTROL, PRIORITY_DATA, SerialWorker
 from .prefs import HIDDEN_ROOM, Prefs
-from .spec import DeviceSpec, SpecRepository
+from .spec import DeviceSpec, PropertySpec, SpecRepository
 from .tree import DeviceNode
 
 # 轮询时按"这个属性会不会主动上报"排序，但实测云端不区分，先只做去重。
@@ -80,6 +80,14 @@ class DeviceState:
         if prop is None:
             return None
         return self.values.get((prop.siid, prop.piid))
+
+    def mode_active_value(self) -> Any:
+        """型号适配后的"模式激活值"；没适配（或还没读到）返回 ``None``。
+
+        界面判断模式高亮统一走这里：``None`` 表示该走默认路径（用 ``mode``
+        自己的值），不要自己拼 siid/piid 去 ``values`` 里查。
+        """
+        return self.get_prop(self.card.mode_active)
 
     @property
     def power(self) -> bool | None:
@@ -225,12 +233,17 @@ class Store:
                 if spec is not None and prev.spec is not spec:
                     prev.spec = spec
                     prev.card = build_card(
-                        spec, gang_names=node.gang_names, gang_rooms=node.gang_rooms
+                        spec, model=node.model,
+                        gang_names=node.gang_names, gang_rooms=node.gang_rooms
                     )
+                _register_keys(prev, node.did)
                 devices[node.did] = prev
                 continue
             card = (
-                build_card(spec, gang_names=node.gang_names, gang_rooms=node.gang_rooms)
+                build_card(
+                    spec, model=node.model,
+                    gang_names=node.gang_names, gang_rooms=node.gang_rooms
+                )
                 if spec
                 else build_card_empty(node)
             )
@@ -240,8 +253,7 @@ class Store:
                 st.keys = prev.keys
                 st.updated_at = prev.updated_at
             # 预先登记卡片属性的完整寻址
-            for key, prop in _card_props(card):
-                st.keys[key] = PropRef(node.did, prop.siid, prop.piid)
+            _register_keys(st, node.did)
             devices[node.did] = st
         # 结构变化（增删设备）+ 状态变化（在线/改名）都要让界面知道
         changed = set(old) ^ set(devices)
@@ -280,6 +292,17 @@ class Store:
         if state.node.home:
             return state.node.home
         return self.topology.homes[0].name if self.topology.homes else ""
+
+    def device_room(self, did: str) -> tuple[str, str] | None:
+        """设备所在的 (家庭, 房间)；没有房间的设备记作「未分组」。
+
+        隐藏 / 恢复时要把 did 追加到**它自己的房间**末尾，``Prefs`` 不知道
+        设备归属，只能由这里解析。设备还没加载出来时返回 ``None``。
+        """
+        st = self.devices.get(did)
+        if st is None:
+            return None
+        return self._home_of(st), (st.node.room or "未分组")
 
     def rooms(self, home: str | None = None) -> list[RoomView]:
         """输出某个家庭的 房间 → 设备，顺序是"用户排过的在前，其余跟云端"。
@@ -389,6 +412,14 @@ class Store:
     def home_active_style(self) -> str:
         return self.prefs.home_active_style
 
+    # -- 摄像头取流方式 --------------------------------------------------
+    @property
+    def camera_network(self) -> str:
+        return self.prefs.camera_network
+
+    def set_camera_network(self, value: str) -> bool:
+        return self.prefs.set_camera_network(value)
+
     def set_home_layout(self, placement: str = "", style: str = "") -> None:
         """改的是"怎么显示"，不是"什么顺序"——设定顺序始终留在 ``prefs.home_order``。"""
         changed = False
@@ -426,24 +457,47 @@ class Store:
         self.prefs.set_room_order(home, names)
         self._layout_changed()
 
-    def set_device_order(self, home: str, room: str, dids: Sequence[str]) -> None:
+    def set_device_order(
+        self, home: str, room: str, dids: Sequence[str], *, notify: bool = True
+    ) -> None:
+        """写入房间内的卡片顺序（只含可见设备）。
+
+        主界面拖动排序时传 ``notify=False``：布局项已经当场挪好了，再广播一次
+        ``on_layout_changed`` 会把整面墙重建，滚动位置和刚放下的卡片都会跳。
+        隐藏设备不在顺序表里，这一点由 ``Prefs`` 的写入口统一保证。
+        """
         self.prefs.set_device_order(home, room, dids)
-        self._layout_changed()
+        if notify:
+            self._layout_changed()
 
     def set_scene_order(self, home: str, scene_ids: Sequence[str]) -> None:
         self.prefs.set_scene_order(home, scene_ids)
         self._layout_changed()
 
     def set_hidden(self, did: str, hidden: bool) -> None:
-        if not self.prefs.set_hidden(did, hidden):
+        # 恢复显示时要把 did 追加回它所在房间的末尾；隐藏时 Prefs 会把它
+        # 从顺序表里剔除，保证「顺序表 = 可见设备」。
+        slot = self.device_room(did) if not hidden else None
+        home, room = slot if slot is not None else ("", "")
+        if not self.prefs.set_hidden(did, hidden, home=home, room=room):
             return
         self._status("设备已隐藏，可在「设置 → 隐藏设备」里恢复" if hidden else "设备已恢复显示")
         self._layout_changed()
 
     def clear_hidden(self) -> None:
-        if self.prefs.clear_hidden():
-            self._status("已恢复全部隐藏设备")
-            self._layout_changed()
+        hidden = list(self.prefs.hidden)
+        if not self.prefs.clear_hidden():
+            return
+        # 全部恢复显示：逐台追加到各自房间末尾（与单台恢复同一口径）。
+        slots: list[tuple[str, str, str]] = []
+        for did in hidden:
+            slot = self.device_room(did)
+            if slot is not None:
+                slots.append((slot[0], slot[1], did))
+        if slots:
+            self.prefs.append_device_orders(slots)
+        self._status("已恢复全部隐藏设备")
+        self._layout_changed()
 
     def set_scene_hidden(self, scene_id: str, hidden: bool) -> None:
         if not self.prefs.set_scene_hidden(scene_id, hidden):
@@ -569,6 +623,65 @@ class Store:
             priority=PRIORITY_DATA,
             label="refresh",
             callback=lambda res, err: self._on_polled(self._poll_generation, res, err),
+        )
+
+    def read_props(
+        self,
+        did: str,
+        props: Iterable[PropertySpec],
+        done: Callable[[dict[tuple[int, int], ReadValue], str], None],
+    ) -> None:
+        """按需读一批不在轮询里的属性（详情页「更多功能」）。
+
+        这些属性平时不参与轮询：设备多的时候全量读一次要两秒。只有用户真的展开
+        「更多功能」才发这一批请求，读完照常回填 ``values`` 并通知界面刷新。
+        ``done`` 在主线程回调：(读取结果, 错误文案)；请求本身没出错时错误文案为空，
+        单项失败由界面按 ``ReadValue.ok`` 自己统计。
+        """
+        st = self.devices.get(did)
+        if st is None or not st.online:
+            done({}, "设备离线")
+            return
+        refs: list[PropRef] = []
+        seen: set[tuple[int, int]] = set()
+        for prop in props:
+            key = (prop.siid, prop.piid)
+            ref = st.keys.get(key)
+            if ref is not None and key not in seen:
+                seen.add(key)
+                refs.append(ref)
+        if not refs:
+            done({}, "没有可读取的属性")
+            return
+
+        def finish(res: Any, err: BaseException | None) -> None:
+            if err is not None or not isinstance(res, Mapping):
+                done({}, f"读取失败：{err or '无返回'}")
+                return
+            out: dict[tuple[int, int], ReadValue] = {}
+            changed = False
+            now = time.monotonic()
+            for ref, rv in res.items():
+                if not isinstance(rv, ReadValue):
+                    continue
+                key = (ref.siid, ref.piid)
+                out[key] = rv
+                if not rv.ok or key in st.optimistic:
+                    continue
+                st.updated_at = now
+                if st.values.get(key) != rv.value:
+                    st.values[key] = rv.value
+                    changed = True
+            if changed:
+                self._changed({did})
+            done(out, "")
+
+        self.worker.submit(
+            self.client.read,
+            (refs,),
+            priority=PRIORITY_DATA,
+            label="detail",
+            callback=finish,
         )
 
     # -- 写入 ------------------------------------------------------------
@@ -790,7 +903,24 @@ def _card_props(card: CardSpec) -> list[tuple[tuple[int, int], Any]]:
             out.append((m.prop.key, m.prop))
     for g in card.gangs:
         out.append((g.power.key, g.power))
+    # 型号级轮询扩展（CardSpec.extra）：只读状态，不渲染，但要跟着轮询走。
+    # 未适配的机型这里是空列表，所以轮询集合完全不变。
+    for p in card.extra:
+        out.append((p.key, p))
     return out
+
+
+def _register_keys(st: DeviceState, did: str) -> None:
+    """登记卡片各属性的完整寻址。
+
+    controls / metrics / gangs / extra 参与轮询；advanced 不参与轮询（展开详情页
+    才按需读），但也要登记——不然「更多功能」里的控件连写都写不出去
+    （``set_value`` 查不到 ref）。
+    """
+    for key, prop in _card_props(st.card):
+        st.keys[key] = PropRef(did, prop.siid, prop.piid)
+    for prop in st.card.advanced:
+        st.keys[(prop.siid, prop.piid)] = PropRef(did, prop.siid, prop.piid)
 
 
 def _card_keys(card: CardSpec) -> set[tuple[int, int]]:

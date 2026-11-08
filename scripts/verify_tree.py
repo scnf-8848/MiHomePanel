@@ -581,7 +581,7 @@ def section_panels() -> None:
             for _ in range(3):
                 QApplication.processEvents()
 
-        check(f"{pal.name}：外观页两张卡（主题 / 家庭标签）", len(cards_of(0)) == 2,
+        check(f"{pal.name}：外观页三张卡（主题 / 家庭标签 / 摄像头）", len(cards_of(0)) == 3,
               f"{len(cards_of(0))} 张")
         check(f"{pal.name}：排序页两张卡（设备树 / 场景树）", len(cards_of(1)) == 2,
               f"{len(cards_of(1))} 张")

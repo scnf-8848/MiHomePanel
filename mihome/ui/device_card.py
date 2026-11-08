@@ -43,7 +43,7 @@ from PySide6.QtWidgets import QSizePolicy, QWidget
 from ..core.catalog import summary_line
 from ..core.store import DeviceState
 from . import theme, tooltip
-from .card_templates import STYLES, CardBody, CardStyle
+from .card_templates import BODY_VIDEO, STYLES, CardBody, CardStyle
 from .widgets import IconProvider, draw_text
 
 PAD = 14
@@ -179,6 +179,13 @@ class DeviceCard(QWidget):
         # 不传 style 的调用方（验证脚本、详情页预览）拿到默认 1×1 标准小卡
         self._style = style or STYLES[0]
         self._body: CardBody | None = None
+        #: 布局在窄窗口里做的降级覆盖；``None`` = 用样式自带的尺寸
+        self._grid_span: int | None = None
+        self._grid_rows: int | None = None
+        #: 拖动排序时这张卡就是"占位框"：保留格子、不画内容
+        self._placeholder = False
+        #: 按下落在电源键 / 多键上时，松手不要再当成"打开详情"
+        self._press_on_control = False
         self._hover = False
         self._hot: tuple[str, int] | None = None  # ("power",0) 或 ("gang", siid)
         self.setMouseTracking(True)
@@ -199,21 +206,49 @@ class DeviceCard(QWidget):
         return self._style.span
 
     @property
+    def rows(self) -> int:
+        return self._style.rows
+
+    @property
     def style(self) -> CardStyle:
         return self._style
 
+    @property
+    def grid_span(self) -> int:
+        """当前实际占的列数。窄窗口把 2×2 降级时由布局覆盖。"""
+        return self._grid_span if self._grid_span is not None else self._style.span
+
+    @property
+    def grid_rows(self) -> int:
+        """当前实际占的行数。"""
+        return self._grid_rows if self._grid_rows is not None else self._style.rows
+
+    def set_grid_cells(self, span: int, rows: int) -> None:
+        """布局按列数做的降级：只改几何，不改样式偏好。
+
+        用户在右键菜单里选的仍是 2×2；窗口拉宽后布局会再次调回 2×2。
+        """
+        span, rows = max(1, int(span)), max(1, int(rows))
+        if (span, rows) == (self.grid_span, self.grid_rows):
+            return
+        self._grid_span, self._grid_rows = span, rows
+        self._apply_geometry()
+        if self._body is not None:
+            self._body.setGeometry(self._body_rect())
+        self.update()
+
     def _apply_geometry(self) -> None:
         # 2×1 = 两张 1×1 加一条列间距，跨列卡和单列卡才能严丝合缝地对齐
-        w = theme.CARD_MIN_W * self.span + theme.CARD_GAP * (self.span - 1)
-        # 所有卡片等高：多键面板也塞进同一高度，网格才整齐（米家原版就是等高）
-        h = theme.CARD_H
+        w = theme.CARD_MIN_W * self.grid_span + theme.CARD_GAP * (self.grid_span - 1)
+        # 2×2 = 两行等高卡加一条行间距
+        h = theme.CARD_H * self.grid_rows + theme.CARD_GAP * (self.grid_rows - 1)
         # 缓存设计尺寸：sizeHint 必须回这个固定值，不能回 self.width()——
         # 后者在当前尺寸被布局拉伸后会返回错误值，形成"越来越大"的反馈循环。
         self._design = QSize(w, h)
         self.setFixedSize(self._design)
 
     def sizeHint(self) -> QSize:  # noqa: N802
-        # FlowLayout 用 sizeHint 决定每行放几张，必须是稳定的设计尺寸
+        # CardGridLayout 用 sizeHint 决定每行放几张，必须是稳定的设计尺寸
         return self._design
 
     def minimumSizeHint(self) -> QSize:  # noqa: N802
@@ -232,7 +267,8 @@ class DeviceCard(QWidget):
             old.setParent(None)
             old.deleteLater()
             self._body = None
-        if not self._style.has_body:
+        if not self._style.has_body or self._style.body == BODY_VIDEO:
+            # 画面样式由 CameraCard 自己铺视频控件，这里不建 CardBody
             return
         body = CardBody(
             self._style,
@@ -258,6 +294,8 @@ class DeviceCard(QWidget):
         if style == self._style:
             return
         self._style = style
+        # 新样式有自己的尺寸；之前窄窗口的 1×1 降级不能继续压着它
+        self._grid_span = self._grid_rows = None
         self._apply_geometry()
         self._build_body()
         self.update()
@@ -286,6 +324,15 @@ class DeviceCard(QWidget):
         card = st.card
         pal = self._p
         rect = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+
+        if self._placeholder:
+            # 拖动中的落点：保留原来的格子，只画一个虚线框；内容在
+            # ``set_drag_placeholder`` 里已隐藏，网格不会因为少一张卡而塌。
+            p.setPen(QPen(QColor(pal.accent), 2, Qt.DashLine))
+            p.setBrush(QColor(theme.blend(pal.card, pal.accent, 0.08)))
+            p.drawRoundedRect(rect, theme.RADIUS_CARD, theme.RADIUS_CARD)
+            p.end()
+            return
 
         on = st.any_on
         base = theme.category_color(card.category)
@@ -552,21 +599,52 @@ class DeviceCard(QWidget):
             return ("power", 0)
         return None
 
+    def interactive_at(self, pos: QPoint) -> bool:
+        """这个点是不是电源键 / 多键——落在上面时不要开始拖动。"""
+        return self._hit(pos) is not None
+
+    def set_drag_placeholder(self, on: bool) -> None:
+        """拖动排序时把自己画成占位框，同时把内容藏起来。"""
+        on = bool(on)
+        if self._placeholder == on:
+            return
+        self._placeholder = on
+        if self._body is not None:
+            self._body.setVisible(not on)
+        self.update()
+
     def mousePressEvent(self, event) -> None:  # noqa: N802
+        self._press_on_control = False
         if event.button() == Qt.LeftButton:
             hit = self._hit(event.position().toPoint())
-            if hit is None:
-                self.clicked.emit(self.state.did)
+            if hit is not None:
+                self._press_on_control = True
+                st = self.state
+                if hit[0] == "power":
+                    ctl = st.card.control("power")
+                    if ctl and ctl.prop:
+                        self.toggled.emit(st.did, ctl.prop.siid, ctl.prop.piid)
+                else:
+                    gang = next((g for g in st.card.gangs if g.siid == hit[1]), None)
+                    if gang:
+                        self.toggled.emit(st.did, gang.power.siid, gang.power.piid)
+                event.accept()
                 return
-            st = self.state
-            if hit[0] == "power":
-                ctl = st.card.control("power")
-                if ctl and ctl.prop:
-                    self.toggled.emit(st.did, ctl.prop.siid, ctl.prop.piid)
-            else:
-                gang = next((g for g in st.card.gangs if g.siid == hit[1]), None)
-                if gang:
-                    self.toggled.emit(st.did, gang.power.siid, gang.power.piid)
+            # 卡片主体不再在按下时打开详情：先让墙面的拖动排序有机会接管。
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802
+        if event.button() == Qt.LeftButton:
+            if self._press_on_control:
+                self._press_on_control = False
+                event.accept()
+                return
+            # 按下在卡片上、松开仍在卡片内才算一次点击；拖出去松手是取消
+            if not self._placeholder and self.rect().contains(event.position().toPoint()):
+                self.clicked.emit(self.state.did)
+                event.accept()
+                return
+        super().mouseReleaseEvent(event)
 
     def mouseMoveEvent(self, event) -> None:  # noqa: N802
         hit = self._hit(event.position().toPoint())

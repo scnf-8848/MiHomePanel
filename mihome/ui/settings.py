@@ -39,6 +39,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from ..core.prefs import CAMERA_NETWORKS
 from ..core.store import Store
 from . import theme
 from .chrome import TitleBar, WindowFrame, surface_bg, surface_border
@@ -233,11 +234,13 @@ class SettingsDialog(QDialog):
         self._frame = WindowFrame(self, resizable=True,
                                   fill=lambda: surface_bg(self._p),
                                   border=lambda: surface_border(self._p))
-        self.resize(820, 620)
-        # 最小高度按"最高的一页"定：外观页是"标题 + 说明 + 两张卡"（主题预览 130 +
-        # 家庭标签两行 + 预览 ≈ 460），给 480 会把预览那一段裁掉。没有做整页滚动——
-        # 排序 / 隐藏页里本来就是可滚动的树，外面再套一层滚动会变成滚动套滚动
-        self.setMinimumSize(700, 560)
+        self.resize(820, 680)
+        # 最小高度按"最高的一页"定：外观页是"标题 + 说明 + 三张卡"（主题预览 130 +
+        # 家庭标签两行 + 预览 + 摄像头一行），实测需要 567，最小窗口 600 只给到 528，
+        # 摄像头那行会被裁掉。取 640（567 + 余量）留出取整空间。
+        # 没有做整页滚动——排序 / 隐藏页里本来就是可滚动的树，外面再套一层滚动
+        # 会变成滚动套滚动
+        self.setMinimumSize(700, 640)
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -295,7 +298,11 @@ class SettingsDialog(QDialog):
         # 重新 setStyleSheet 就全跟着换了，不必逐个控件设色
         self.setStyleSheet(_dialog_qss(palette))
         self.titlebar.set_palette(palette)
-        for box in (getattr(self, "cb_placement", None), getattr(self, "cb_style", None)):
+        for box in (
+            getattr(self, "cb_placement", None),
+            getattr(self, "cb_style", None),
+            getattr(self, "cb_camera_network", None),
+        ):
             if box is not None:
                 box.set_palette(palette)
         for card in self._theme_cards:
@@ -382,6 +389,27 @@ class SettingsDialog(QDialog):
         )
         tags.add_unit(self._preview_unit(self.preview), stretch=0)
         col.addWidget(tags)
+
+        col.addSpacing(8)
+        self._section(col, "摄像头")
+        camera = SettingsCard()
+        self.cb_camera_network = Combo(self._p)
+        self.cb_camera_network.setFixedWidth(COMBO_W)
+        for value, label in (
+            ("lan_first", "局域网优先"),
+            ("remote_first", "远程优先"),
+            ("remote_only", "仅远程"),
+        ):
+            if value in CAMERA_NETWORKS:
+                self.cb_camera_network.addItem(label, value)
+        self.cb_camera_network.currentIndexChanged.connect(self._on_camera_network)
+        camera.add_row(
+            "取流方式",
+            self.cb_camera_network,
+            sub="局域网优先：先直连，失败自动改远程；"
+            "远程优先：先远程，失败退回局域网；仅远程：始终走中继",
+        )
+        col.addWidget(camera)
         col.addStretch(1)
         return page
 
@@ -446,10 +474,18 @@ class SettingsDialog(QDialog):
             j = self.cb_style.findData(self.store.home_active_style)
             if j >= 0:
                 self.cb_style.setCurrentIndex(j)
+            k = self.cb_camera_network.findData(self.store.camera_network)
+            if k >= 0:
+                self.cb_camera_network.setCurrentIndex(k)
             self.preview.configure(self.store.home_placement, self.store.home_active_style)
             self._sync_preview_inset()
         finally:
             self._loading = False
+
+    def _on_camera_network(self) -> None:
+        if self._loading:
+            return
+        self.store.set_camera_network(str(self.cb_camera_network.currentData() or ""))
 
     def _on_theme_picked(self, key: str) -> None:
         palette = theme.DARK if key == "dark" else theme.LIGHT
@@ -519,7 +555,12 @@ class SettingsDialog(QDialog):
             )
             rooms = self.store.room_names(home.name)
             for room in rooms:
-                states = self.store.device_states(home.name, room)
+                # 已隐藏设备不参与排序：这里**彻底不渲染**。顺序表的含义是
+                # 「可见设备的顺序」，隐藏项不在表里，所以也没有"排在末尾"。
+                states = [
+                    st for st in self.store.device_states(home.name, room)
+                    if not self.store.prefs.is_hidden(st.did)
+                ]
                 r_item = self.tree_devices.add_row(
                     h_item, room,
                     {"kind": "room", "home": home.name, "room": room},
@@ -529,7 +570,6 @@ class SettingsDialog(QDialog):
                     self.tree_devices.add_row(
                         r_item, st.name,
                         {"kind": "device", "home": home.name, "room": room, "id": st.did},
-                        suffix="已隐藏" if self.store.prefs.is_hidden(st.did) else "",
                     )
 
             s_item = self.tree_scenes.add_row(
@@ -671,7 +711,10 @@ class SettingsDialog(QDialog):
         prefs = self.store.prefs
         changed = False
         for did in show:
-            changed |= prefs.set_hidden(did, False)
+            # 恢复显示 = 追加到所在房间末尾（房间归属只有 Store 知道）
+            slot = self.store.device_room(did)
+            home, room = slot if slot is not None else ("", "")
+            changed |= prefs.set_hidden(did, False, home=home, room=room)
         for did in hide:
             changed |= prefs.set_hidden(did, True)
         if changed:
@@ -830,9 +873,10 @@ class SettingsDialog(QDialog):
         self._fill_order_trees_silently()
 
     def _show_all(self) -> None:
-        self.store.prefs.clear_hidden()
-        self.store.prefs.clear_hidden_scenes()
-        self.store.refresh_layout()
+        # 设备：清隐藏 + 逐台追加到所在房间末尾 + 重建（走 Store 保证两端口径一致）
+        self.store.clear_hidden()
+        if self.store.prefs.clear_hidden_scenes():
+            self.store.refresh_layout()
         self._fill_hidden_tree()
         self._fill_order_trees_silently()
 

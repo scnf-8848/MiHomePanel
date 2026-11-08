@@ -18,8 +18,8 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import QPoint, QPointF, QRect, Qt, Signal
-from PySide6.QtGui import QColor, QFont, QFontMetrics, QPainter, QPainterPath, QPen
+from PySide6.QtCore import QEvent, QPoint, QPointF, QRect, Qt, Signal
+from PySide6.QtGui import QColor, QCursor, QFont, QFontMetrics, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import (
     QFrame,
     QLabel,
@@ -29,13 +29,19 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from ..core.camera import is_camera
 from ..core.store import DeviceState, RoomView, Store
 from . import theme
+from .camera_card import CameraCard
+from .camera_view import CameraView
+from .camera_wall import WallCameraController
+from .card_grid import CardGridLayout
 from .card_templates import available_styles, resolve_card_style
 from .device_card import DeviceCard
+from .dnd import DragGesture
 from .menu import Menu, add_choice, submenu
 from .scene_bar import SceneBar
-from .widgets import FlowLayout, IconProvider, draw_text
+from .widgets import IconProvider, draw_text
 
 
 def matches(state: DeviceState, query: str) -> bool:
@@ -247,9 +253,9 @@ class RoomSection(QWidget):
         self._collapsible = view.kind == "hidden"
         self._collapsed = bool(collapsed) and self._collapsible
         #: 每张卡片流；非分组分区只有一条
-        self.flows: list[FlowLayout] = []
+        self.flows: list[CardGridLayout] = []
         #: 房间 → (小标题, 卡片流宿主, 卡片流)，只有分组时才有
-        self._groups: dict[str, tuple[_GroupLabel, QWidget, FlowLayout]] = {}
+        self._groups: dict[str, tuple[_GroupLabel, QWidget, CardGridLayout]] = {}
 
         col = QVBoxLayout(self)
         col.setContentsMargins(0, 0, 0, 0)
@@ -278,7 +284,7 @@ class RoomSection(QWidget):
                 policy.setHeightForWidth(True)
                 host.setSizePolicy(policy)
                 # 卡片间距 8dp：米家首页网格的实测值（见风格参考 3.2）
-                flow = FlowLayout(host, margin=0, h_gap=8, v_gap=8)
+                flow = CardGridLayout(host, margin=0, h_gap=8, v_gap=8)
                 outer.addWidget(label)
                 outer.addWidget(host)
                 self._groups[room] = (label, host, flow)
@@ -286,14 +292,24 @@ class RoomSection(QWidget):
             outer.addStretch(1)
         else:
             # 卡片间距 8dp：米家首页网格的实测值（见风格参考 3.2）
-            self.flows.append(FlowLayout(body, margin=0, h_gap=8, v_gap=8))
+            self.flows.append(CardGridLayout(body, margin=0, h_gap=8, v_gap=8))
         col.addWidget(body)
         self._body.setVisible(not self._collapsed)
 
     @property
-    def flow(self) -> FlowLayout:
+    def flow(self) -> CardGridLayout:
         """主卡片流（非分组分区就是唯一那一条）。"""
         return self.flows[0]
+
+    @property
+    def draggable(self) -> bool:
+        """只有普通房间的单一卡片流支持拖动排序。
+
+        分组（已隐藏设备）分区里一条 flow 只装一个房间的一部分，跨组拖动
+        会让"顺序"和"房间归属"两件事混在一起；等隐藏列表也有独立排序入口
+        再放开。搜索过滤期间顺序不可见，同样不允许拖。
+        """
+        return not self._groups and self.view.kind != "hidden"
 
     # -- 折叠 ------------------------------------------------------------
     @property
@@ -415,8 +431,25 @@ class WallView(QScrollArea):
         self._col.setSpacing(24)
         self.setWidget(self._root)
 
+        # 摄像头：同一时刻只允许一张卡播放，取址在工作线程里
+        self._camera_ctl = WallCameraController(store, self)
+        # 滚出可视区域就停播（滚动条动一下就检查，成本只是一次矩形相交）
+        self.verticalScrollBar().valueChanged.connect(self._check_active_visible)
+
+        # 拖动排序的状态。事件在每张卡片上过滤，真正移动的是布局里的项顺序。
+        self._drag_gesture = DragGesture()
+        self._drag_card: DeviceCard | None = None
+        self._drag_section: RoomSection | None = None
+        self._drag_origin = -1
+        self._drag_started = False
+        self._drag_ghost: QLabel | None = None
+        self._drag_grab = QPoint()
+
     # -- 构建 ------------------------------------------------------------
     def _clear(self) -> None:
+        self._cancel_drag()
+        # 卡片马上要被 deleteLater，先把墙上的取流会话和播放器收掉
+        self._camera_ctl.stop_active("重建卡片墙")
         while self._col.count():
             item = self._col.takeAt(0)
             w = item.widget() if item is not None else None
@@ -437,8 +470,10 @@ class WallView(QScrollArea):
             self.scene_bar = SceneBar(self._p)
             self.scene_bar.scene_run.connect(self.scene_run)
             self.scene_bar.scene_menu.connect(self._on_scene_menu)
-            self.scene_bar.set_scenes(scenes)
+            # 先入布局再加内容：set_scenes 末尾会 setVisible(True)，此时若还没有父控件，
+            # Qt 会把它当成独立顶层窗口先 show 一次——切主题重建时就是那一闪的小窗。
             self._col.addWidget(self.scene_bar)
+            self.scene_bar.set_scenes(scenes)
 
         for view in self._store.rooms(self._home or None):
             # 只有「已隐藏设备」分区可折叠；其它房间的标题行照旧是一行静字
@@ -446,16 +481,29 @@ class WallView(QScrollArea):
             section = RoomSection(view, palette=self._p, collapsed=collapsed)
             section.collapse_changed.connect(self._on_section_collapsed)
             for st in view.devices:
-                card = DeviceCard(
+                cls = (
+                    CameraCard
+                    if is_camera(st.node.model, st.card.category)
+                    else DeviceCard
+                )
+                card = cls(
                     st,
                     self._icons,
                     self._p,
                     resolve_card_style(self._store.prefs, st.did, st.card),
                 )
+                if isinstance(card, CameraCard):
+                    card.play_requested.connect(
+                        lambda c=card: self._camera_ctl.request_play(c)
+                    )
+                    card.view_state_changed.connect(
+                        lambda state, c=card: self._camera_ctl.on_view_state(c, state)
+                    )
                 card.clicked.connect(self.card_clicked)
                 card.toggled.connect(self.card_toggled)
                 card.menu_requested.connect(self._on_card_menu)
                 card.value_committed.connect(self.card_value_committed)
+                card.installEventFilter(self)
                 section.add_card(card)
                 self._cards[st.did] = card
             # 卡片装完才知道台数，标题后面的「N 台」要在这里补一次
@@ -473,7 +521,7 @@ class WallView(QScrollArea):
     def _relayout(self) -> None:
         """让根布局重新分配各分区的高度。
 
-        ``_body`` 是 ``FlowLayout``（带 ``heightForWidth``）的宿主，收起时把它
+        ``_body`` 是 ``CardGridLayout``（带 ``heightForWidth``）的宿主，收起时把它
         hide 掉会切断那条链；父 ``QVBoxLayout`` 不会自己重算——实测收起后分区
         仍然保持展开时的高度，只是卡片不画了，下面多出一大片空白。必须显式
         ``activate()``。
@@ -489,6 +537,7 @@ class WallView(QScrollArea):
         """
         self._store.prefs.set_hidden_collapsed(collapsed)
         self._relayout()
+        self._check_active_visible()
 
     def _on_card_menu(self, did: str, pos: QPoint) -> None:
         """打开详情 / 卡片样式 / 隐藏设备。
@@ -570,6 +619,7 @@ class WallView(QScrollArea):
                 section.clear_filter()
             self._show_no_match(False)
             self._relayout()
+            self._check_active_visible()
             return
         visible = 0
         for section in self._sections:
@@ -582,6 +632,8 @@ class WallView(QScrollArea):
             visible += shown
         self._show_no_match(visible == 0 and bool(self._sections))
         self._relayout()
+        # 搜索期间一律停播（顺序和可见性都在变，继续播没有意义）
+        self._check_active_visible()
 
     def _show_no_match(self, on: bool) -> None:
         """搜不到东西时给一句提示，而不是留一片空白。"""
@@ -604,26 +656,217 @@ class WallView(QScrollArea):
             card = self._cards.get(did)
             st = self._store.devices.get(did)
             if card is not None and st is not None:
+                if not st.online:
+                    # 离线卡片不能继续占着观看位；先让控制器把会话和播放器收掉
+                    self._camera_ctl.stop_if_card(card, "设备离线")
                 card.refresh(st)
 
     def apply_card_style(self, did: str) -> None:
         """右键改完样式后**只**刷新这一张卡。
 
         设备集合和顺序都没变，重建整面墙会把滚动位置、其它卡上的悬停、
-        甚至正在拖动的滑条一起丢掉；这里只换样式再让 FlowLayout 重排一次。
+        甚至正在拖动的滑条一起丢掉；这里只换样式再让 CardGridLayout 重排一次。
         """
         card = self._cards.get(did)
         st = self._store.devices.get(did)
         if card is None or st is None:
             return
+        # 2×2 实时画面的卡片换样式时，正在播的那一路要先停掉
+        self._camera_ctl.stop_if_card(card, "改卡片样式")
         card.set_style(resolve_card_style(self._store.prefs, did, st.card))
         for section in self._sections:
             if did in section.cards:
                 section.invalidate_flows()
                 break
-        # 这里只标记失效、不强制 activate：卡片自己的 FlowLayout 会重排，
+        # 这里只标记失效、不强制 activate：卡片自己的 CardGridLayout 会重排，
         # 立刻重算根布局反而会把正在拖动的滑条/滚动位置带着抖一下。
         self._col.invalidate()
+
+    # -- 摄像头生命周期 ---------------------------------------------------
+    def stop_playback(self, reason: str = "") -> None:
+        """墙面上任何"看不见了"的动作都走这里：停播 + 放播放器 + 归还观看位。"""
+        self._camera_ctl.stop_active(reason)
+
+    def hand_off_active_to(self, target: CameraView | None, did: str) -> bool:
+        """把墙上正在播的这一路交给详情页（同一个播放器，不重连）。
+
+        返回 False 表示没交出去（没在播 / 播的是别的设备 / 目标控件不可用），
+        调用方应退回"先停再重开"。逻辑在 ``WallCameraController`` 里，这里只是
+        和 ``stop_playback`` 一样开个门——主窗口拿的是 ``WallView``，不持有 controller。
+        """
+        return self._camera_ctl.hand_off_active_to(target, did)
+
+    def _check_active_visible(self) -> None:
+        card = self._camera_ctl.active_card
+        if card is None:
+            return
+        if not card.isVisible() or self._filter:
+            self._camera_ctl.stop_active("卡片不可见")
+            return
+        vp = self.viewport().rect()
+        top_left = card.mapTo(self.viewport(), QPoint(0, 0))
+        if not vp.intersects(QRect(top_left, card.size())):
+            self._camera_ctl.stop_active("滚出可视区域")
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        # 窗口变窄可能触发 2×2 → 1×1 的降级；播放中的卡片若因此不可见也要收
+        self._check_active_visible()
+
+    # -- 拖动排序 ---------------------------------------------------------
+    def _section_of(self, card: DeviceCard) -> RoomSection | None:
+        for section in self._sections:
+            if card.state.did in section.cards:
+                return section
+        return None
+
+    def eventFilter(self, obj, event) -> bool:  # noqa: N802
+        if not isinstance(obj, DeviceCard):
+            return super().eventFilter(obj, event)
+        et = event.type()
+        if et == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
+            self._on_drag_press(obj, event)
+        elif et == QEvent.MouseMove and self._drag_card is obj:
+            if self._on_drag_move(obj, event):
+                return True
+        elif et == QEvent.MouseButtonRelease and event.button() == Qt.LeftButton:
+            if self._drag_card is obj:
+                if self._drag_started:
+                    self._finish_drag(commit=True)
+                    return True
+                self._cancel_drag()
+        return super().eventFilter(obj, event)
+
+    def _on_drag_press(self, card: DeviceCard, event) -> None:
+        section = self._section_of(card)
+        usable = (
+            section is not None
+            and section.draggable
+            and not self._filter
+            and not self._drag_started
+            and not card.interactive_at(event.position().toPoint())
+        )
+        if not usable:
+            self._cancel_drag()
+            return
+        self._drag_card = card
+        self._drag_section = section
+        self._drag_origin = section.flow.index_of(card)
+        self._drag_started = False
+        self._drag_gesture.press(event.globalPosition().toPoint())
+
+    def _on_drag_move(self, card: DeviceCard, event) -> bool:
+        global_pos = event.globalPosition().toPoint()
+        if not self._drag_started:
+            if not self._drag_gesture.move(global_pos):
+                return False
+            self._begin_drag(card, global_pos)
+            return True
+        self._update_drag(global_pos)
+        return True
+
+    def _begin_drag(self, card: DeviceCard, global_pos: QPoint) -> None:
+        self._drag_started = True
+        # 拖动时画面没有意义，而且会一直占着观看位
+        self._camera_ctl.stop_active("拖动排序")
+        pix = card.grab()
+        card_pos = card.mapTo(self.viewport(), QPoint(0, 0))
+        vp_pos = self.viewport().mapFromGlobal(global_pos)
+        self._drag_grab = vp_pos - card_pos
+        ghost = QLabel(self.viewport())
+        ghost.setPixmap(pix)
+        ghost.setAttribute(Qt.WA_TransparentForMouseEvents)
+        ghost.setGeometry(card_pos.x(), card_pos.y(), card.width(), card.height())
+        ghost.show()
+        ghost.raise_()
+        self._drag_ghost = ghost
+        # 被拖的卡片自己变成占位框：继续占 span×rows 个格子，网格不会塌
+        card.set_drag_placeholder(True)
+        card.setCursor(Qt.ClosedHandCursor)
+
+    def _update_drag(self, global_pos: QPoint) -> None:
+        if self._drag_card is None or self._drag_section is None:
+            return
+        vp = self.viewport()
+        vp_pos = vp.mapFromGlobal(global_pos)
+        if self._drag_ghost is not None:
+            self._drag_ghost.move(vp_pos - self._drag_grab)
+        # 靠近上下边缘时自动滚，长房间也能把卡拖到屏外
+        bar = self.verticalScrollBar()
+        if vp_pos.y() < 28:
+            bar.setValue(bar.value() - 24)
+        elif vp_pos.y() > vp.height() - 28:
+            bar.setValue(bar.value() + 24)
+        flow = self._drag_section.flow
+        host = flow.parentWidget()
+        if host is None:
+            return
+        flow_pos = host.mapFrom(vp, vp_pos)
+        source = self._drag_card
+        target = flow.drop_index(flow_pos, source)
+        current = flow.index_of(source)
+        if target != current and flow.move_item(current, target):
+            flow.invalidate()
+            flow.activate()
+            self._relayout()
+
+    def _finish_drag(self, *, commit: bool) -> None:
+        card, section = self._drag_card, self._drag_section
+        origin = self._drag_origin
+        if card is None:
+            self._cancel_drag()
+            return
+        card.set_drag_placeholder(False)
+        card.unsetCursor()
+        if self._drag_ghost is not None:
+            self._drag_ghost.hide()
+            self._drag_ghost.deleteLater()
+            self._drag_ghost = None
+        if section is not None:
+            flow = section.flow
+            if not commit:
+                # 取消：把布局项挪回按下时的位置，偏好一点都不写
+                current = flow.index_of(card)
+                if 0 <= origin < len(flow.widgets()) and current != origin:
+                    flow.move_item(current, origin)
+            else:
+                dids = [
+                    w.state.did
+                    for w in flow.widgets()
+                    if isinstance(w, DeviceCard)
+                ]
+                if dids:
+                    self._store.set_device_order(
+                        section.view.home,
+                        section.view.room,
+                        dids,
+                        notify=False,
+                    )
+            flow.invalidate()
+            flow.activate()
+        self._drag_gesture.reset()
+        self._drag_card = None
+        self._drag_section = None
+        self._drag_origin = -1
+        self._drag_started = False
+        self._relayout()
+
+    def _cancel_drag(self) -> None:
+        if self._drag_started:
+            self._finish_drag(commit=False)
+            return
+        self._drag_gesture.reset()
+        self._drag_card = None
+        self._drag_section = None
+        self._drag_origin = -1
+        self._drag_started = False
+
+    def keyPressEvent(self, event) -> None:  # noqa: N802
+        if event.key() == Qt.Key_Escape and self._drag_started:
+            self._finish_drag(commit=False)
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
     def scroll_to_room(self, home: str, room: str) -> None:
         """滚到指定家庭的指定房间。``room == "*"`` 回到顶部。"""

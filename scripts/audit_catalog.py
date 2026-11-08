@@ -61,7 +61,8 @@ def main() -> int:
             )
             continue
 
-        card = catalog.build_card(spec, gang_names=node.gang_names, gang_rooms=node.gang_rooms)
+        card = catalog.build_card(spec, model=node.model,
+                                  gang_names=node.gang_names, gang_rooms=node.gang_rooms)
         cov = catalog.coverage(card, spec)
         per_cat[spec.category].append(node.name)
         if card.missing:

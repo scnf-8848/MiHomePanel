@@ -1,16 +1,16 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""离屏验证：摄像头画面控件能不能真的收到帧、预加载与暂停是否按预期工作。
+"""离屏验证：摄像头画面控件能不能真的收到帧、点播放与暂停是否按预期工作。
 
 不打开主窗口、不改设备状态，只做取流链路与交互状态机的验证：
 
   1) 用本机凭据挑一台在线摄像头（默认第一台，可 ``--did`` 指定）
   2) 走 ``CameraService`` 起 go2rtc，拿本机 rtsp 地址
-  3) ``preload()`` 预热：首帧到手应自动冻结并进入 READY
-  4) 点播放（``toggle()``）应立刻出帧、进入 PLAYING
+  3) 默认停在 IDLE：没点播放就不该取流（帧数保持 0）
+  4) 点播放（``toggle()``）→ 外层拿到地址后 ``play()``；首帧到达应进入 PLAYING
   5) 再点应暂停（PAUSED）、帧数不再增长；再点恢复
   6) ``stop()`` 之后不再增长；离线设备的报错要可读
-  7) 截 ``camera_view_ready.png`` / ``camera_view.png`` 供人工核对
-  8) 闲置够久要放掉连接（``MIHOME_CAMERA_IDLE_SECONDS`` 调小来测），点播放重新取流
+  7) 截 ``camera_view_idle.png`` / ``camera_view.png`` 供人工核对
+  8) 暂停够久要放掉连接（``MIHOME_CAMERA_IDLE_SECONDS`` 调小来测），点播放会重新请求取流
   9) 断流原因解析：日志里新鲜的 ``cs2: EOF`` 要能认出来，旧的不算
  10) 崩溃留下的孤儿 go2rtc 要在下次启动时被清掉，且不误杀别的进程
 
@@ -48,7 +48,7 @@ from PySide6.QtWidgets import QApplication
 from mihome.core import paths
 from mihome.core.camera import CameraError, Go2rtcRuntime, _log_age, cleanup_stale
 from mihome.core.camera import shared as camera_service
-from mihome.ui import snapshots, theme
+from mihome.ui import theme
 from mihome.ui.camera_view import CameraView
 
 OUT = Path(__file__).resolve().parent / "out"
@@ -148,34 +148,31 @@ def main() -> int:
             os.environ.get("QT_FFMPEG_DECODING_HW_DEVICE_TYPES", "(未设置)"),
         )
 
-    print("\n[2] 预加载：首帧到手应自动冻结")
-    # 先清掉可能存在的旧占位图，才能验证"这次播放确实写了一张新的"
-    snapshots.path_for(node.did).unlink(missing_ok=True)
+    print("\n[2] 空态：没点播放就不该取流")
+    OUT.mkdir(parents=True, exist_ok=True)
+    pump(app, 1.5)
+    check("默认停在 IDLE", view.state == CameraView.IDLE, view.state)
+    check("空态没有帧", view.frames == 0, f"{view.frames} 帧")
+    view.grab().save(str(OUT / "camera_view_idle.png"))
+
+    print("\n[3] 点播放：请求取流并等首帧")
+    requested: list[bool] = []
+
+    def on_play_requested() -> None:
+        requested.append(True)
+        view.play(url)
+
+    view.play_requested.connect(on_play_requested)
     t1 = time.time()
-    view.preload(url, did=node.did)
-    while time.time() - t1 < 14 and view.state != CameraView.READY:
-        pump(app, 0.2)
-    first = time.time() - t1 if view.state == CameraView.READY else None
-    check("预热后进入就绪态", view.state == CameraView.READY, view.state)
+    view.toggle()
+    while time.time() - t1 < 16 and view.state != CameraView.PLAYING:
+        pump(app, 0.1)
+    first = time.time() - t1 if view.state == CameraView.PLAYING else None
+    check("点播放会请求取流", bool(requested), f"{len(requested)} 次")
     check("首帧耗时 ≤ 10s", first is not None and first <= 10.0,
           f"{first:.1f}s" if first is not None else "没收到")
-    OUT.mkdir(parents=True, exist_ok=True)
-    app.processEvents()
-    view.grab().save(str(OUT / "camera_view_ready.png"))
-
-    frozen = view.frames
-    pump(app, 2.0)
-    check("就绪态画面冻结（不继续解码）", view.frames == frozen, f"{frozen} → {view.frames}")
-
-    print("\n[3] 点播放：应立刻出帧")
-    t2 = time.time()
-    view.toggle()
-    while time.time() - t2 < 3 and view.frames <= frozen:
-        pump(app, 0.05)
-    resume = time.time() - t2 if view.frames > frozen else None
-    check("进入播放态", view.state == CameraView.PLAYING, view.state)
-    check("恢复延迟 ≤ 1s", resume is not None and resume <= 1.0,
-          f"{resume:.2f}s" if resume is not None else "没收到")
+    check("首帧到达进入播放态", view.state == CameraView.PLAYING, view.state)
+    view.grab().save(str(OUT / "camera_view.png"))
 
     print(f"\n[4] 连续播放 {args.seconds:.0f} 秒")
     before = view.frames
@@ -183,7 +180,6 @@ def main() -> int:
     total = view.frames - before
     fps = total / args.seconds if args.seconds else 0.0
     check("持续收到有效帧", total >= 20, f"{total} 帧, {fps:.1f} fps")
-    view.grab().save(str(OUT / "camera_view.png"))
 
     print("\n[5] 点暂停：画面应停住")
     view.toggle()
@@ -192,14 +188,6 @@ def main() -> int:
     pump(app, 2.0)
     check("进入暂停态", view.state == CameraView.PAUSED, view.state)
     check("暂停后不再增长", view.frames == paused, f"{paused} → {view.frames}")
-
-    shot = snapshots.path_for(node.did)
-    saved = snapshots.load(node.did)
-    check("暂停时把当前帧存成占位图", shot.is_file() and saved is not None,
-          f"{shot.name} {shot.stat().st_size // 1024 if shot.is_file() else 0} KB")
-    check("占位图缩到 960 宽（别把 5MP 原图存盘）",
-          saved is not None and saved.width() <= snapshots.SNAPSHOT_WIDTH,
-          f"{saved.width() if saved else 0}px")
 
     print("\n[6] 再点继续：应立刻续上")
     t3 = time.time()
@@ -212,8 +200,11 @@ def main() -> int:
           f"{again:.2f}s" if again is not None else "没收到")
 
     print("\n[7] 状态序列应完整")
-    want = ["preloading", "ready", "playing", "paused", "playing"]
-    seq = [s for s in states if s in want]
+    want = ["loading", "playing", "paused", "playing"]
+    seq: list[str] = []
+    for s in states:
+        if s in want and (not seq or seq[-1] != s):
+            seq.append(s)  # 自动重连会重复一次 loading，合并掉
     check("状态流转正确", seq[: len(want)] == want, " → ".join(seq[:8]))
 
     print("\n[8] 停止后不应继续收帧")
@@ -234,19 +225,20 @@ def main() -> int:
         except CameraError as exc:
             check("离线设备被拒绝", exc.kind == "offline", f"kind={exc.kind} / {exc}")
 
-    print("\n[10] 闲置够久应放掉连接（阈值临时调到 2 秒）")
+    print("\n[10] 暂停够久应放掉连接（阈值临时调到 2 秒）")
     os.environ["MIHOME_CAMERA_IDLE_SECONDS"] = "2"
     idle_view = CameraView(theme.DARK, theme.category_color("camera"))
     idle_view.resize(436, 220)
     idle_view.show()
     retried: list[bool] = []
-    idle_view.retry.connect(lambda: retried.append(True))
+    idle_view.play_requested.connect(lambda: retried.append(True))
     idle_url = camera_service().open(client, node)
-    idle_view.preload(idle_url)
+    idle_view.play(idle_url)
     t0 = time.time()
-    while time.time() - t0 < 20 and idle_view.state != CameraView.READY:
+    while time.time() - t0 < 20 and idle_view.state != CameraView.PLAYING:
         pump(app, 0.2)
-    check("预热进入就绪态", idle_view.state == CameraView.READY, idle_view.state)
+    check("起播进入播放态", idle_view.state == CameraView.PLAYING, idle_view.state)
+    idle_view.toggle()  # 暂停，开始计闲置
     t1 = time.time()
     while time.time() - t1 < 6 and idle_view.state != CameraView.RELEASED:
         pump(app, 0.2)

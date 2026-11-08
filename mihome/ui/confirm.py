@@ -17,7 +17,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QDialog, QHBoxLayout, QLabel, QPushButton, QVBoxLayout, QWidget
 
 from . import theme
-from .chrome import TitleBar, WindowFrame, surface_bg, surface_border
+from .chrome import TitleBar, WindowFrame, exec_with_dim_click, surface_bg, surface_border
 
 
 def _qss(p: theme.Palette, danger: bool) -> str:
@@ -107,7 +107,7 @@ def confirm(
     dlg = ConfirmDialog(
         title, text, palette, parent, ok_text=ok_text, cancel_text=cancel_text, danger=danger
     )
-    return dlg.exec() == QDialog.Accepted
+    return exec_with_dim_click(dlg) == QDialog.Accepted
 
 
 def notice(
@@ -120,7 +120,7 @@ def notice(
 ) -> None:
     """只有"知道了"一个按钮的提示框，用于"做了一半没做成"的情况。"""
     dlg = ConfirmDialog(title, text, palette, parent, ok_text=ok_text, cancel_text="")
-    dlg.exec()
+    exec_with_dim_click(dlg)
 
 
 __all__ = ["ConfirmDialog", "confirm", "notice"]

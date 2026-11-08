@@ -28,8 +28,9 @@ from PySide6.QtGui import (
     QPainterPath,
     QPen,
     QPolygonF,
+    QRegion,
 )
-from PySide6.QtWidgets import QApplication, QSizePolicy, QWidget
+from PySide6.QtWidgets import QApplication, QDialog, QSizePolicy, QWidget
 
 from . import theme
 from .widgets import draw_text
@@ -551,6 +552,9 @@ class DimOverlay(QWidget):
 
     子窗口弹出来时主窗口变暗，前层就自动成为视觉焦点——这是系统模态窗口原本
     自带的效果，无边框之后得自己补。蒙版不吃鼠标事件，否则主窗口的悬停全废。
+
+    "点压暗区域关掉子窗口"不在这里做：应用模态期间 Qt 会在窗口系统层丢弃落到
+    主窗口上的点击（主窗口里的任何控件都收不到），见 ``DimClickShield``。
     """
 
     def __init__(self, parent: QWidget) -> None:
@@ -584,14 +588,177 @@ class DimOverlay(QWidget):
         p.end()
 
 
+class DimClickShield(QWidget):
+    """模态子窗口外侧的点击层：点一下压暗区 = 按 Esc，只关当前这一层。
+
+    为什么不让 ``DimOverlay`` 直接吃点击：``QDialog.exec()`` 是应用模态，模态期间
+    Qt 在窗口系统层就把落到被拦窗口（主窗口）上的鼠标事件丢掉了，主窗口里的控件
+    根本收不到。唯一仍然能收点击的是模态窗口自己的子窗口，所以这里给每个弹窗挂
+    一个透明子窗口，铺满主窗口，再用 ``setMask`` 把弹窗本身挖空：
+
+    * 洞外按下再松开 —— ``reject()``，和 Esc 同一条路径；
+    * 洞内点击 —— 命中下面的弹窗，视频单击、滑条拖动都不受影响；
+    * 洞外按下、拖进弹窗再松开 —— 松开点落在洞里，不关；
+    * 弹窗上按下、拖到洞外松开 —— 按下事件不经过这里，不关；
+    * 滚轮 / 右键 —— 不参与。
+
+    视觉仍然是主窗口里的 ``DimOverlay``，这一层不画可见的内容；点击区域就是压暗
+    区域本身（同样的圆角、同样的范围），洞内被弹窗占住的部分不算。
+
+    **必须画一层 alpha=1**。Windows 对 ``WS_EX_LAYERED`` 窗口的命中测试是逐像素的：
+    alpha=0 的地方鼠标消息会直接穿透（微软文档里写明的 "hit testing of a layered
+    window... alpha value is zero will let the mouse messages through"），
+    ``setMask`` 只裁剪窗口区域，不会把零透明像素变成可点。完全透明的窗口在真机上
+    表现就是"看着有遮罩、点哪都没反应"；离屏 QPA 不模拟这条，所以只有真机能测出来。
+    alpha=1 的黑在 255 级里肉眼不可见，点击却能正常落到这一层。
+    """
+
+    def __init__(self, dialog: QWidget) -> None:
+        super().__init__(dialog, Qt.Window | Qt.FramelessWindowHint
+                         | Qt.WindowDoesNotAcceptFocus)
+        self.setAttribute(Qt.WA_ShowWithoutActivating, True)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WA_NoSystemBackground, True)
+        self._dialog = dialog
+        self._press: QPoint | None = None
+        dialog.installEventFilter(self)
+        if dialog.isVisible() and self._place():
+            self.show()
+            self.raise_()
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        # alpha=1 是给 Windows 命中测试看的（见类注释），肉眼不可见；
+        # 真正的压暗仍由主窗口里的 DimOverlay 画。setMask 已经把洞挖掉，
+        # 这层填充只会落在可点的压暗区上。
+        p = QPainter(self)
+        p.fillRect(self.rect(), QColor(0, 0, 0, 1))
+        p.end()
+
+    # -- 跟随弹窗 --------------------------------------------------------
+    def eventFilter(self, obj, event) -> bool:  # noqa: N802
+        if obj is self._dialog:
+            kind = event.type()
+            if kind == QEvent.Show:
+                if self._place():
+                    self.show()
+                    self.raise_()
+                    self._raise_layer_windows()
+            elif kind in (QEvent.Move, QEvent.Resize):
+                if self._place():
+                    self.raise_()
+                    self._raise_layer_windows()
+            elif kind in (QEvent.Hide, QEvent.Close):
+                self.hide()
+        return False
+
+    def _anchor(self) -> QWidget | None:
+        """铺哪个窗口：弹窗所在的最外层窗口（主窗口）。
+
+        嵌套时（详情页里再弹确认框）弹窗的 parent 是上一层弹窗，一直往上是主窗口。
+        """
+        w = self._dialog.parentWidget()
+        if w is None:
+            return None
+        while w.parentWidget() is not None:
+            w = w.parentWidget()
+        return w
+
+    def _stack(self) -> list[QWidget]:
+        """当前弹窗 + 还开着的父弹窗：挖洞要一起挖，否则会盖住父弹窗。
+
+        弹窗自己再开的独立子窗口（例如摄像头的独立播放窗）也是"洞"：那些区域
+        属于上一层，不该被遮罩点击判成"点外侧"。
+        """
+        out: list[QWidget] = []
+        w = self._dialog
+        while w is not None:
+            if isinstance(w, QDialog) and w.isVisible():
+                out.append(w)
+            w = w.parentWidget()
+        for child in self._dialog.findChildren(
+                QWidget, options=Qt.FindDirectChildrenOnly):
+            if child is not self and child.isWindow() and child.isVisible():
+                out.append(child)
+        return out
+
+    def _raise_layer_windows(self) -> None:
+        """遮罩抬起后，把弹窗上的独立子窗口再抬回去，免得盖住它们。"""
+        for child in self._dialog.findChildren(
+                QWidget, options=Qt.FindDirectChildrenOnly):
+            if child is not self and child.isWindow() and child.isVisible():
+                child.raise_()
+
+    def _place(self) -> bool:
+        anchor = self._anchor()
+        if anchor is None or not anchor.isVisible():
+            self.hide()
+            return False
+        self.setGeometry(anchor.geometry())
+        # 外边界跟压暗蒙版用同一条圆角路径，点击区域和看到的一致
+        base = QRegion(rounded_path(QRectF(self.rect()), WINDOW_RADIUS)
+                       .toFillPolygon().toPolygon())
+        holes = QRegion()
+        for w in self._stack():
+            holes += QRegion(w.frameGeometry().translated(-self.x(), -self.y()))
+        self.setMask(base.subtracted(holes))
+        return True
+
+    def _over_dialog(self, global_pos: QPoint) -> bool:
+        for w in self._stack():
+            if w.frameGeometry().contains(global_pos):
+                return True
+        return False
+
+    # -- 交互 ------------------------------------------------------------
+    def mousePressEvent(self, event) -> None:  # noqa: N802
+        self._press = (event.globalPosition().toPoint()
+                       if event.button() == Qt.LeftButton else None)
+        event.accept()
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802
+        press, self._press = self._press, None
+        if event.button() != Qt.LeftButton or press is None:
+            return
+        if not self.rect().contains(event.position().toPoint()):
+            return
+        # 按下和松开必须都在洞外：拖进 / 拖出弹窗的两端都不算"点遮罩"
+        if self._over_dialog(press) or self._over_dialog(event.globalPosition().toPoint()):
+            return
+        self._dialog.reject()
+
+    def wheelEvent(self, event) -> None:  # noqa: N802
+        # 压在遮罩上的滚轮不改变任何东西，更不关窗
+        event.ignore()
+
+
+def exec_with_dim_click(dialog: QDialog) -> int:
+    """模态执行弹窗，顺便让"点外侧压暗区"等同 Esc。
+
+    只关当前这一层：``reject()`` 和 Esc 是同一条路径；嵌套时每个弹窗各有一层
+    ``DimClickShield``，最上层的 shield 也在最上面，点到的只会是最上层。
+
+    同一弹窗重复 exec 时复用同一层（它跟着弹窗的 Show/Hide 走），不反复建窗口。
+    """
+    shield = getattr(dialog, "_dim_click_shield", None)
+    if shield is None:
+        shield = DimClickShield(dialog)
+        dialog._dim_click_shield = shield
+    try:
+        return dialog.exec()
+    finally:
+        shield.hide()
+
+
 __all__ = [
     "BAR_H",
+    "DimClickShield",
     "DimOverlay",
     "TitleBar",
     "WINDOW_RADIUS",
     "WindowFrame",
     "bar_bg",
     "dialog_bar_bg",
+    "exec_with_dim_click",
     "rounded_path",
     "surface_bg",
     "surface_border",

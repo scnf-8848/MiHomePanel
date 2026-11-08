@@ -6,7 +6,6 @@
   <data>/cache/spec/       MIoT-Spec 原始规格缓存（可按 urn 重新拉取）
   <data>/cache/devices.json 设备列表快照（首屏秒开用）
   <data>/cache/icons/      设备图标
-  <data>/snapshots/        每台摄像头的「上次画面」（下次打开时垫在画面区，掩盖首帧等待）
   <data>/logs/             运行日志
 """
 

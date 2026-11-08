@@ -50,6 +50,17 @@ HOME_PLACEMENT_DEFAULT = "fixed"
 HOME_STYLES = ("size", "weight", "pill")
 HOME_STYLE_DEFAULT = "size"
 
+# 摄像头取流方式：
+#   lan_first    —— 先走局域网直连（更快、更省摄像头带宽），明确失败或长时间无帧
+#                   时自动切远程中继，只切一次
+#   remote_first —— 先走远程中继；远程建不起来时退回局域网一次（异地/公司网络常用，
+#                   但远程比局域网慢 2–4 秒、且占一个观看位）
+#   remote_only  —— 始终走远程中继，绝不碰局域网（只想走中继时用）
+CAMERA_NETWORKS = ("lan_first", "remote_first", "remote_only")
+CAMERA_NETWORK_DEFAULT = "lan_first"
+#: 旧版只有 "lan_first"/"remote" 两档，读到 "remote" 按「仅远程」处理
+CAMERA_NETWORK_ALIASES = {"remote": "remote_only"}
+
 #: 卡片样式的默认 id（= 1×1 标准小卡）。样式自带宽度，所以这里不再有
 #: 「大小」这个独立偏好。id 只做词法校验；哪些 id 真的存在由
 #: ``ui/card_templates.py`` 的样式注册表决定，免得 core 反向依赖 ui。
@@ -134,6 +145,8 @@ class Prefs:
         self.hidden_scenes: list[str] = []
         self.home_placement = HOME_PLACEMENT_DEFAULT
         self.home_active_style = HOME_STYLE_DEFAULT
+        #: 摄像头取流方式，见 ``CAMERA_NETWORKS``
+        self.camera_network = CAMERA_NETWORK_DEFAULT
         #: did → 样式 id，只存显式改过的设备（默认 standard 不落盘）
         self.card_styles: dict[str, str] = {}
         #: 首页末尾「已隐藏设备」分组是否收起（只留标题行）
@@ -157,11 +170,23 @@ class Prefs:
         self.device_order = _order_map(data.get("device_order"))
         self.scene_order = _order_map(data.get("scene_order"))
         self.hidden = _str_list(data.get("hidden"))
+        # 老文件里隐藏设备的 did 可能还留在顺序表里。读入时顺手清掉，
+        # 让「顺序表 = 可见设备」从启动那一刻起就成立。
+        for key, dids in list(self.device_order.items()):
+            kept = [d for d in dids if d not in self.hidden]
+            if kept:
+                self.device_order[key] = kept
+            else:
+                self.device_order.pop(key, None)
         self.hidden_scenes = _str_list(data.get("hidden_scenes"))
         self.card_styles = _card_style_map(data.get("card_styles"))
         # 只认真正的 true：老文件里没有这个键，坏数据（"yes" / 1）也不该让分组
         # 一开就收起——那是用户看不到自己的设备，比"没记住"糟得多。
         self.hidden_collapsed = data.get("hidden_collapsed") is True
+        network = str(data.get("camera_network") or "")
+        network = CAMERA_NETWORK_ALIASES.get(network, network)
+        if network in CAMERA_NETWORKS:
+            self.camera_network = network
         layout = data.get("layout")
         if isinstance(layout, dict):
             placement = str(layout.get("home_placement") or "")
@@ -182,6 +207,7 @@ class Prefs:
             "hidden": self.hidden,
             "hidden_scenes": self.hidden_scenes,
             "hidden_collapsed": self.hidden_collapsed,
+            "camera_network": self.camera_network,
             "layout": {
                 "home_placement": self.home_placement,
                 "home_active_style": self.home_active_style,
@@ -222,7 +248,7 @@ class Prefs:
         self.save()
 
     def set_device_order(self, home: str, room: str, dids: Sequence[str]) -> None:
-        self.device_order[self._room_key(home, room)] = list(dids)
+        self.device_order[self._room_key(home, room)] = self._only_visible(dids)
         self.save()
 
     def set_scene_order(self, home: str, scene_ids: Sequence[str]) -> None:
@@ -249,7 +275,7 @@ class Prefs:
                 self.room_order[home] = list(names)
         if device_orders:
             for (home, room), dids in device_orders.items():
-                self.device_order[self.room_key(home, room)] = list(dids)
+                self.device_order[self.room_key(home, room)] = self._only_visible(dids)
         if scene_orders:
             for home, ids in scene_orders.items():
                 self.scene_order[home] = list(ids)
@@ -275,6 +301,14 @@ class Prefs:
         if value not in HOME_STYLES or value == self.home_active_style:
             return False
         self.home_active_style = value
+        self.save()
+        return True
+
+    # -- 摄像头取流方式 --------------------------------------------------
+    def set_camera_network(self, value: str) -> bool:
+        if value not in CAMERA_NETWORKS or value == self.camera_network:
+            return False
+        self.camera_network = value
         self.save()
         return True
 
@@ -330,8 +364,15 @@ class Prefs:
     def is_hidden(self, did: str) -> bool:
         return did in self.hidden
 
-    def set_hidden(self, did: str, hidden: bool) -> bool:
-        """返回是否真的产生了变化，方便界面判断要不要重建。"""
+    def set_hidden(
+        self, did: str, hidden: bool, *, home: str = "", room: str = ""
+    ) -> bool:
+        """返回是否真的产生了变化，方便界面判断要不要重建。
+
+        「顺序表 = 可见设备」是唯一不变量：藏起来时把 did 从顺序表里删掉，
+        恢复时再追加到所在房间的末尾。``home`` / ``room`` 由 ``Store`` 提供
+        （``Prefs`` 不知道设备归属），不传时只能保证不残留隐藏项。
+        """
         did = str(did)
         if not did:
             return False
@@ -339,10 +380,13 @@ class Prefs:
             if did in self.hidden:
                 return False
             self.hidden.append(did)
+            self._forget_device_order(did)
         else:
             if did not in self.hidden:
                 return False
             self.hidden.remove(did)
+            if home:
+                self._append_device_order(home, room, did)
         self.save()
         return True
 
@@ -394,6 +438,32 @@ class Prefs:
         self.save()
         return True
 
+    # -- 顺序表的可见性约束 ----------------------------------------------
+    def _only_visible(self, dids: Sequence[str]) -> list[str]:
+        """写入口统一剔除已隐藏设备，保证顺序表里只装可见设备。"""
+        hidden = self.hidden_set
+        return [d for d in dids if d not in hidden]
+
+    def _append_device_order(self, home: str, room: str, did: str) -> None:
+        """把一台设备追加到房间末尾；先去掉可能残留的同名项。"""
+        if not did:
+            return
+        key = self.room_key(home, room)
+        order = [d for d in self.device_order.get(key, ()) if d != did]
+        order.append(did)
+        self.device_order[key] = order
+
+    def _forget_device_order(self, did: str) -> None:
+        for key, dids in list(self.device_order.items()):
+            if did in dids:
+                self.device_order[key] = [d for d in dids if d != did]
+
+    def append_device_orders(self, slots: Iterable[tuple[str, str, str]]) -> None:
+        """批量恢复到所在房间末尾（「全部恢复显示」用），只落一次盘。"""
+        for home, room, did in slots:
+            self._append_device_order(home, room, did)
+        self.save()
+
     # -- 内部 ------------------------------------------------------------
     @staticmethod
     def room_key(home: str, room: str) -> str:
@@ -404,6 +474,8 @@ class Prefs:
 
 
 __all__ = [
+    "CAMERA_NETWORKS",
+    "CAMERA_NETWORK_DEFAULT",
     "CARD_STYLE_DEFAULT",
     "HIDDEN_ROOM",
     "HOME_PLACEMENTS",

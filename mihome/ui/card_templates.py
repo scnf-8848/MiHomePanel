@@ -17,8 +17,9 @@
 **合并的是"用户的那一次选择"，不是数据模型里的两个维度。** 尺寸和内容是两件
 不同性质的事，代码里必须分得开：
 
-* **尺寸（``span``）全品类通用** —— 只有 1×1 / 2×1，定义在 ``SIZES`` 表里，
-  菜单前段「宽卡 2×1」完全由它生成。加 2×2、改叫法都只动那张表。
+* **尺寸（``span`` + ``rows``）全品类通用** —— 1×1 / 2×1 / 2×2，定义在
+  ``SIZES`` 表里，菜单前段「宽卡 2×1」完全由它生成。加尺寸、改叫法都只动那张表。
+  2×2 目前只给摄像头实时画面用（``camera_live``），其它品类仍是等高小卡。
 * **内容（``label`` + ``slots``）跟品类走** —— 灯是「亮度 + 色温」，空调以后是
   「温度控制」，别的品类就没有。``label`` 只写内容名，**禁止**把尺寸抄进去
   （``__post_init__`` 会直接报错），否则同一段尺寸会有两个来源。
@@ -51,8 +52,9 @@
 
 骨架（别改）：
 
-* 所有卡片**等高** ``theme.CARD_H = 168``，宽度只有 1×1 / 2×1 两档，不做 2×2。
-  高度一变，等高网格就散了，``FlowLayout`` 的「放不下就换行」也会失效。
+* 所有卡片共用 ``theme.CARD_H = 168`` 的行高：1×1 / 2×1 是等高网格，
+  2×2 占两行（高 = ``2 × CARD_H + CARD_GAP``）。高度一变，等高网格就散了，
+  ``CardGridLayout`` 的「放不下就换行」也会失效。
 * 外壳（标题带 / 电源键 / 圆角底色）由 ``DeviceCard`` 画；样式**只管**
   ``BODY_RECT = (14, 76, W−28, 78)`` 这块内容带。两行 36 高滑条 + 4 间距填满。
 * 带滑条的样式一律 2×1：1×1 的 138 宽里排不下「属性名 + 轨道 + 数值」。
@@ -96,6 +98,9 @@ LIGHT_BRIGHT = "light_bright"
 PRESENCE_STATE = "presence_state"
 #: 空调「温度控制」：大数字步进器 + 模式胶囊。
 TEMP_CONTROL = "temp_control"
+#: 摄像头「实时画面」：2×2，body 里直接铺视频。**不是**摄像头品类的默认样式，
+#: 用户要在右键「卡片样式」里主动选；默认仍是 1×1 标准卡（产品图）。
+CAMERA_LIVE = "camera_live"
 
 #: body 区两行控件之间的间距。2×36 + 4 = 76，正好是 ``DeviceCard._body_rect()`` 的高。
 BODY_GAP = 4
@@ -115,35 +120,40 @@ GRADIENT_SLOTS = frozenset({"color_temp"})
 BODY_SLIDERS = "sliders"
 BODY_READOUT = "readout"
 BODY_CONTROLS = "controls"
-BODY_KINDS = (BODY_SLIDERS, BODY_READOUT, BODY_CONTROLS)
+#: 实时画面：body 不建 ``CardBody``，由 ``CameraCard`` 铺一个 ``CameraView``。
+#: 不占任何槽位，``slots`` 为空是正常的。
+BODY_VIDEO = "video"
+BODY_KINDS = (BODY_SLIDERS, BODY_READOUT, BODY_CONTROLS, BODY_VIDEO)
 
 
 @dataclass(frozen=True, slots=True)
 class CardSize:
     """卡片尺寸：**全品类通用**的一维，跟卡片里放什么内容无关。
 
-    ``span=1`` 占一列，``span=2`` 占两列（宽度 = ``2 × CARD_MIN_W + CARD_GAP``）。
-    高度永远统一 ``theme.CARD_H``，所以这里只描述列宽。尺寸文案只在这张表里
-    写一次，以后加 2×2 或想改叫法（"双列"）时，各样式的菜单文字自动跟着变。
+    ``span`` 占几列、``rows`` 占几行。宽度 = ``span × CARD_MIN_W + (span−1) × GAP``，
+    高度 = ``rows × CARD_H + (rows−1) × GAP``。尺寸文案只在这张表里写一次，
+    各样式的菜单文字自动跟着变。
     """
 
     span: int
     label: str
+    rows: int = 1
 
 
 #: 尺寸表的顺序就是菜单里同尺寸项的分组顺序。
 SIZES: tuple[CardSize, ...] = (
     CardSize(1, "小卡 1×1"),
     CardSize(2, "宽卡 2×1"),
+    CardSize(2, "大卡 2×2", rows=2),
 )
-_SIZE_BY_SPAN = {s.span: s for s in SIZES}
+_SIZE_BY_CELL = {(s.span, s.rows): s for s in SIZES}
 #: ``label`` 里出现这些词，说明把尺寸抄进了内容名，会和 ``span`` 生成的前缀打架。
-_SIZE_WORDS = ("小卡", "宽卡", "×1", "x1", "X1")
+_SIZE_WORDS = ("小卡", "宽卡", "大卡", "×1", "×2", "x1", "x2", "X1", "X2")
 
 
-def size_of(span: int) -> CardSize | None:
-    """``span`` → 通用尺寸定义；不在表里（比如误写成 3）返回 ``None``。"""
-    return _SIZE_BY_SPAN.get(span)
+def size_of(span: int, rows: int = 1) -> CardSize | None:
+    """``(span, rows)`` → 通用尺寸定义；不在表里（比如误写成 3）返回 ``None``。"""
+    return _SIZE_BY_CELL.get((span, rows))
 
 
 @dataclass(frozen=True, slots=True)
@@ -164,6 +174,7 @@ class CardStyle:
     id: str
     label: str
     span: int = 1
+    rows: int = 1
     slots: tuple[str, ...] = ()
     category: str | None = None
     body: str = BODY_SLIDERS
@@ -171,10 +182,10 @@ class CardStyle:
     def __post_init__(self) -> None:
         # 声明期就炸，别等菜单里显示成"宽卡 3×1"才发现。注册表是模块级常量，
         # 写错的样式在 import 时就定位得到，比运行时静默兜底好查。
-        if size_of(self.span) is None:
+        if size_of(self.span, self.rows) is None:
             raise ValueError(
-                f"样式 {self.id!r} 的 span={self.span} 不在尺寸表里"
-                f"（可选 {[s.span for s in SIZES]}）"
+                f"样式 {self.id!r} 的尺寸 {self.span}×{self.rows} 不在尺寸表里"
+                f"（可选 {[(s.span, s.rows) for s in SIZES]}）"
             )
         for word in _SIZE_WORDS:
             if word in self.label:
@@ -190,7 +201,7 @@ class CardStyle:
     @property
     def size(self) -> CardSize:
         """这个样式占的尺寸（通用定义，含菜单里的尺寸文案）。"""
-        return _SIZE_BY_SPAN[self.span]
+        return _SIZE_BY_CELL[(self.span, self.rows)]
 
     @property
     def menu_label(self) -> str:
@@ -204,7 +215,8 @@ class CardStyle:
 
     @property
     def has_body(self) -> bool:
-        return bool(self.slots)
+        # 画面样式没有槽位，但内容带确实被一个子控件占满，产品图不能再画。
+        return bool(self.slots) or self.body == BODY_VIDEO
 
     def available(self, card: CardSpec) -> bool:
         """这台设备能不能用这个样式。
@@ -280,6 +292,16 @@ STYLES: tuple[CardStyle, ...] = (
         category="air-conditioner",
         body=BODY_CONTROLS,
     ),
+    # 摄像头默认仍是 1×1 标准卡（产品图）；2×2 是用户主动选的查看方式。
+    # 没有槽位，body 由 ``CameraCard`` 铺一个 ``CameraView``，播放控件与详情页共用。
+    CardStyle(
+        id=CAMERA_LIVE,
+        label="实时画面",
+        span=2,
+        rows=2,
+        category="camera",
+        body=BODY_VIDEO,
+    ),
 )
 
 
@@ -305,12 +327,12 @@ def validate_styles(styles: Sequence[CardStyle]) -> None:
         seen_id[s.id] = s
     for i, a in enumerate(styles):
         for b in styles[i + 1:]:
-            if (a.label, a.span) != (b.label, b.span):
+            if (a.label, a.span, a.rows) != (b.label, b.span, b.rows):
                 continue
             if a.category is None or b.category is None or a.category == b.category:
                 raise ValueError(
                     f"样式 {a.id!r} 与 {b.id!r} 的 label 和尺寸都一样"
-                    f"（{a.label!r} / {a.span}列），菜单里会出现两行无法分辨的选项"
+                    f"（{a.label!r} / {a.span}×{a.rows}），菜单里会出现两行无法分辨的选项"
                     "；内容确有差别就把差别写进 label"
                 )
 
@@ -346,7 +368,7 @@ def style_by_id(style_id: str) -> CardStyle | None:
 def available_styles(card: CardSpec) -> tuple[CardStyle, ...]:
     """右键菜单里该设备能看到哪些样式。**默认样式永远排第一**。
 
-    排序键 ``(不是默认, span)``：先按"是否为默认"分组，再按尺寸升序。默认项
+    排序键 ``(不是默认, span, rows)``：先按"是否为默认"分组，再按尺寸升序。默认项
     必须第一，不只是好看——菜单第一项就是用户点「回默认」的落点，它要是排在
     中间，用户点完还得回想自己选的是哪一项。
 
@@ -357,7 +379,7 @@ def available_styles(card: CardSpec) -> tuple[CardStyle, ...]:
     fallback = default_style(card)
     return tuple(sorted(
         (s for s in STYLES if s.available(card)),
-        key=lambda s: (s.id != fallback.id, s.span),
+        key=lambda s: (s.id != fallback.id, s.span, s.rows),
     ))
 
 
@@ -530,7 +552,15 @@ class CardBody(QWidget):
             ctl = self._ctl.get(slot)
             prop = ctl.prop if ctl is not None else None
             value = state.get_prop(prop) if prop is not None else None
-            if value is not None:
+            active = state.mode_active_value() if slot == "mode" else None
+            if active is not None:
+                # 型号适配：有 mode_active（如挂灯的 scene-mode）时，胶囊的激活项
+                # 看它而不是 mode(2,5)——mode 只用于写入，手调亮度/色温后它不会变，
+                # 拿它当激活判据会让胶囊一直假亮着。值为 0 表示无激活项，0 不在
+                # items 里，所有胶囊自然是未选中态。
+                # 没适配 / 还没读到时返回 None，走下面的默认路径（mode），不空高亮。
+                widget.set_active(active)
+            elif value is not None:
                 widget.set_value(value)
             if readout:
                 widget.setEnabled(bool(state.online))
@@ -569,10 +599,13 @@ class CardBody(QWidget):
 
 
 __all__ = [
+    "BODY_CONTROLS",
     "BODY_GAP",
     "BODY_KINDS",
     "BODY_READOUT",
     "BODY_SLIDERS",
+    "BODY_VIDEO",
+    "CAMERA_LIVE",
     "GRADIENT_SLOTS",
     "LIGHT_BRIGHT",
     "LIGHT_DUAL",

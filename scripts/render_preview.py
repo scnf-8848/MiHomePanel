@@ -95,7 +95,8 @@ def load():
         if s is None:
             cards[n.did] = {"layout": "unknown", "icon": "device", "accent": "#9AA0A6", "category": "", "controls": [], "metrics": [], "gangs": [], "advanced": 0, "actions": []}
             continue
-        c = catalog.build_card(s, gang_names=n.gang_names, gang_rooms=n.gang_rooms)
+        c = catalog.build_card(s, model=n.model,
+                               gang_names=n.gang_names, gang_rooms=n.gang_rooms)
         cards[n.did] = {
             "layout": c.layout,
             "icon": c.icon,

@@ -35,12 +35,13 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtCore import QPoint, QRect, Qt  # noqa: E402
 from PySide6.QtGui import QColor  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
-from PySide6.QtWidgets import QApplication  # noqa: E402
+from PySide6.QtWidgets import QApplication, QComboBox  # noqa: E402
 
+from mihome.core import catalog  # noqa: E402
 from mihome.core.catalog import PROFILES  # noqa: E402
 from mihome.core.prefs import Prefs  # noqa: E402
-from mihome.core.spec import PropertySpec, ValueOption  # noqa: E402
-from mihome.core.store import DeviceState, RoomView  # noqa: E402
+from mihome.core.spec import PropertySpec, ValueOption, parse_raw  # noqa: E402
+from mihome.core.store import DeviceState, RoomView, _card_props  # noqa: E402
 from mihome.core.tree import DeviceNode  # noqa: E402
 from mihome.ui import theme  # noqa: E402
 from mihome.ui.card_controls import ROW_H  # noqa: E402
@@ -152,7 +153,8 @@ def make_state(
         values[(2, 3)] = 4000
     card = SimpleNamespace(
         category=category, span=1, gangs=[], controls=list(ctls.values()),
-        metrics=[], layout=category, power_actions=None, default_style="",
+        metrics=[], advanced=[], layout=category, power_actions=None,
+        default_style="", mode_active=None,
         control=lambda slot: ctls.get(slot),
     )
 
@@ -194,6 +196,94 @@ def make_presence_state(
     if state is not None:
         st.values[(3, 1)] = state
     st.values[(3, 2)] = 49
+    return st
+
+
+def select_prop(siid: int, piid: int, *options: tuple[int, str]) -> PropertySpec:
+    """**可写**枚举（模式下拉）。``enum_prop`` 是只读的，选完写不出去。"""
+    return PropertySpec(
+        siid=siid, piid=piid, name="p", urn="", description="", comment="",
+        format="uint8", access=("read", "write", "notify"), unit=None,
+        value_range=None,
+        value_list=tuple(ValueOption(v, text, text) for v, text in options),
+        service="", service_label="",
+    )
+
+
+LAMP_MODES = ((5, "阅读"), (6, "电脑"), (7, "影院"), (8, "暖光"), (9, "冷光"))
+
+#: 米家显示器挂灯 1S 的规格形状（照 `parse_raw` 的输入格式手写）。
+#: ``mode``(2,5) 可写、``scene-mode``(3,9) 只读——后者才是实际生效的预设。
+LAMP_RAW = {
+    "type": "urn:miot-spec-v2:device:light:0000A001:yeelink-lamp22:1:0000C802",
+    "description": "米家显示器挂灯 1S",
+    "services": [
+        {
+            "iid": 2,
+            "type": "urn:miot-spec-v2:service:light:00007802:yeelink-lamp22:1",
+            "description": "灯光",
+            "properties": [
+                {"iid": 1, "type": "urn:miot-spec-v2:property:on:00000006:yeelink-lamp22:1",
+                 "description": "开关", "format": "bool",
+                 "access": ["read", "write", "notify"]},
+                {"iid": 2, "type": "urn:miot-spec-v2:property:brightness:0000000D:yeelink-lamp22:1",
+                 "description": "亮度", "format": "uint8",
+                 "access": ["read", "write", "notify"], "value-range": [1, 100, 1]},
+                {"iid": 3, "type": "urn:miot-spec-v2:property:color-temperature:0000000B:yeelink-lamp22:1",
+                 "description": "色温", "format": "uint16",
+                 "access": ["read", "write", "notify"], "value-range": [2700, 6500, 1]},
+                {"iid": 5, "type": "urn:miot-spec-v2:property:mode:00000008:yeelink-lamp22:1",
+                 "description": "模式", "format": "uint8",
+                 "access": ["read", "write", "notify"],
+                 "value-list": [{"value": v, "description": t} for v, t in LAMP_MODES]},
+            ],
+        },
+        {
+            "iid": 3,
+            "type": "urn:miot-spec-v2:service:scene:0000780B:yeelink-lamp22:1",
+            "description": "情景",
+            "properties": [
+                {"iid": 9, "type": "urn:miot-spec-v2:property:scene-mode:00000010:yeelink-lamp22:1",
+                 "description": "情景模式", "format": "uint8",
+                 "access": ["read", "notify"], "value-range": [0, 10, 1]},
+            ],
+        },
+    ],
+}
+
+
+def make_lamp_state(
+    did: str = "lamp1",
+    *,
+    scene: object = 0,
+    mode: int = 5,
+) -> DeviceState:
+    """挂灯：``mode``(2,5) 只写，``scene-mode``(3,9) 当激活判据（0 = 无激活项）。
+
+    走的是 ``CardSpec.mode_active`` 那条真链路：``DeviceState.mode_active_value()``
+    从这个属性取值，界面不自己拼 siid/piid。
+    """
+    st = make_state(did, category="light", name="米家显示器挂灯 1S")
+    mode_prop = select_prop(2, 5, *LAMP_MODES)
+    scene_prop = enum_prop(3, 9, *((i, f"场景{i}") for i in range(11)))
+    st.card.controls.append(
+        SimpleNamespace(slot="mode", label="模式", prop=mode_prop,
+                        write=True, role="select")
+    )
+    st.card.mode_active = scene_prop
+    st.values[mode_prop.key] = mode
+    if scene is not None:
+        st.values[scene_prop.key] = scene
+
+    def _ctl(slot: str):
+        return next((c for c in st.card.controls if c.slot == slot), None)
+
+    def _bound(slot: str):
+        hit = _ctl(slot)
+        return hit if hit is not None else _by_slot(st.card.metrics, slot)
+
+    st.card.control = _ctl
+    st.card.bound = _bound
     return st
 
 
@@ -273,7 +363,7 @@ def make_ac_state(
     values[(4, 9)] = 54
     card = SimpleNamespace(
         category="air-conditioner", span=1, gangs=[], controls=list(ctls.values()),
-        metrics=metrics, layout="climate", power_actions=None,
+        metrics=metrics, layout="climate", power_actions=None, mode_active=None,
         default_style=(PROFILES["air-conditioner"].default_style if default is None
                        else default),
         control=lambda slot: ctls.get(slot),
@@ -319,6 +409,27 @@ class FakeStore:
 
     def scenes_for(self, home: str):
         return []
+
+
+class LooseStore(FakeStore):
+    """造详情页用：没实现的 Store 方法一律 no-op。
+
+    详情页会碰 ``set_value`` / 各种偏好；这个测试只关心"构造得出来、交接接口
+    名字对得上"，不关心写请求去了哪。如果哪天真的少了一个**必须**的方法，
+    这里会静默 no-op——所以只在"点开详情不崩"这一条上用它，别扩用。
+
+    ``set_value`` 单独记下来：模式行要验证"占位态下点一项写出去的是真实枚举值"。
+    """
+
+    def __init__(self, prefs: Prefs, states: list[DeviceState]) -> None:
+        super().__init__(prefs, states)
+        self.writes: list[tuple[str, tuple[int, int], object]] = []
+
+    def set_value(self, did: str, key: tuple[int, int], value: object) -> None:
+        self.writes.append((did, key, value))
+
+    def __getattr__(self, name: str):
+        return lambda *a, **k: None
 
 
 def main() -> int:
@@ -377,14 +488,14 @@ def main() -> int:
           "宽卡 2×1：亮度 + 色温")
 
     print("\n2a) 维度分离：尺寸通用 / 内容跟品类")
-    check("尺寸表只有 1×1 与 2×1，文案只在这里写一次",
-          [s.label for s in SIZES], ["小卡 1×1", "宽卡 2×1"])
+    check("尺寸表覆盖 1×1 / 2×1 / 2×2，文案只在这里写一次",
+          [s.label for s in SIZES], ["小卡 1×1", "宽卡 2×1", "大卡 2×2"])
     check("表外的 span 查不到", size_of(3), None)
     check_true("每个样式都指向同一张尺寸表（不是各写一份）",
-               all(size_of(s.span) is s.size for s in STYLES))
+               all(size_of(s.span, s.rows) is s.size for s in STYLES))
     for s in STYLES:
-        check_true(f"{s.id}：菜单前段由 span 生成",
-                   s.menu_label.startswith(f"{size_of(s.span).label}："),
+        check_true(f"{s.id}：菜单前段由尺寸表生成",
+                   s.menu_label.startswith(f"{size_of(s.span, s.rows).label}："),
                    s.menu_label)
 
     def raises(**kw) -> bool:
@@ -732,6 +843,7 @@ def main() -> int:
     states = [light, make_state("d2", name="餐厅灯")]
     store = FakeStore(p, states)
     wall = WallView(store, Icons(), theme.LIGHT)
+    wall.resize(900, 700)  # 离屏窗口不会自动撑到桌面宽；给足列数
     wall.build()
     wall.show()
     app.processEvents()
@@ -824,6 +936,31 @@ def main() -> int:
     check("切主题同步到墙上滑条",
           wall._cards["d1"]._body.controls["color_temp"]._p, theme.DARK)
 
+    # -- 主窗口点卡片 → 详情页的接口契约 -------------------------------
+    # 这条路径没有别的离屏脚本覆盖：曾经主窗口调了 WallView 上不存在的
+    # ``hand_off_active_to``，结果点任何设备都 AttributeError 崩在终端里，
+    # 而各模块自己的测试全绿。这里把「主窗口依赖的名字」钉住，少一个就红。
+    print("\n7) 主窗口 → 详情页：摄像头交接接口都在")
+    from mihome.ui.detail import DetailDialog  # noqa: PLC0415 — 只有这一段用
+
+    for name in ("stop_playback", "hand_off_active_to"):
+        check_true(f"WallView 有 {name}（主窗口直接调它）",
+                   callable(getattr(wall, name, None)))
+    # 墙上没在播时主窗口要能安全拿到 False，再退回"先停再开"
+    check("没在播时交接返回 False", wall.hand_off_active_to(None, "d1"), False)
+    check_true("详情页有 camera_view 属性（交接目标）",
+               isinstance(getattr(DetailDialog, "camera_view", None), property))
+    check_true("详情页有 adopt_playing_camera（接管后挂上播放器）",
+               callable(getattr(DetailDialog, "adopt_playing_camera", None)))
+    # 真造一个详情页走一遍主窗口那两步：先问 camera_view，再调 adopt。
+    # 名字对得上但构造就崩，同样是"点设备就废"，所以这一步不能省。
+    dlg = DetailDialog(light, LooseStore(p, [light]), theme.LIGHT, None, icons=Icons())
+    check("灯没有画面控件（camera_view 是 None）", dlg.camera_view, None)
+    check("没有画面控件时 adopt 返回 False，不抛异常",
+          dlg.adopt_playing_camera(), False)
+    check("非摄像头设备不会生成模式行（挂灯才走型号适配）", dlg._mode_row, None)
+    dlg.deleteLater()
+
     # -- 卡片底色：浅色模式下必须和背景分得开 -----------------------------
     # 浅色背景 #F1F2F4 只比白卡暗 13，混一层 10% 的品类色就只剩 1–3；
     # 电视 / 摄像头这类深灰品类混完比背景**还暗**（旧版 -2.2），卡片彻底糊进背景。
@@ -845,6 +982,79 @@ def main() -> int:
     check_true("深色模式的混色结果不受 min_gap 影响",
                all(theme.tint(c, 0.10, theme.DARK, min_gap=6) == theme.tint(c, 0.10, theme.DARK)
                    for c in theme.CATEGORY_COLOR.values()))
+
+    print("\n9) 挂灯模式：只给 yeelink.light.lamp22 开「无激活项」")
+    # 型号级适配（catalog.MODEL_ADAPTERS）：挂灯的 mode(2,5) 只用于写入，
+    # 手调亮度/色温后它不会变；真正生效的预设要从只读的 scene-mode(3,9) 读，
+    # 0 = 无激活项。**别的灯不能套**——那是这台设备实测出来的行为，套错了会
+    # 把别人的选中态弄坏。所以整件事只动"型号 → 属性"这一张表，通用逻辑零改动。
+    check("适配表只有挂灯一条（没扩散到别的型号）",
+          sorted(catalog.MODEL_ADAPTERS), ["yeelink.light.lamp22"])
+    spec = parse_raw(LAMP_RAW)
+    lamp_card = catalog.build_card(spec, model="yeelink.light.lamp22")
+    check("挂灯：scene-mode 被认成模式判据", lamp_card.mode_active.key, (3, 9))
+    check("挂灯：scene-mode 进了轮询集合（extra）",
+          [p.name for p in lamp_card.extra], ["scene-mode"])
+    # extra 不在 _card_props 里的话，界面拿到了属性也读不到值
+    check("挂灯：scene-mode 真的在轮询 / 寻址集合里",
+          (3, 9) in [k for k, _ in _card_props(lamp_card)], True)
+    check("同规格换个型号就完全不适配",
+          catalog.build_card(spec, model="yeelink.light.ceiling1").mode_active, None)
+    check("不传型号 = 不做型号适配",
+          catalog.build_card(spec).mode_active, None)
+
+    # 详情页：用客户端占位表示"无激活项"，不往枚举里塞假选项——假选项既能被
+    # 写出去（设备不认的值），也会被当成枚举值回读。
+    lamp = make_lamp_state(scene=7)
+    store_l = LooseStore(p, [lamp])
+    dlg_l = DetailDialog(lamp, store_l, theme.LIGHT, None, icons=Icons())
+    box = dlg_l._mode_row.editor
+    dlg_l._sync()  # 构造函数不自己刷值，轮询定时器才会；这里先手动走一次
+    check("模式行是下拉框", isinstance(box, QComboBox), True)
+    check("枚举项就是设备给的 5–9（没有伪造的「无」）",
+          [box.itemData(i) for i in range(box.count())], [5, 6, 7, 8, 9])
+    check("scene=7 → 选中「影院」", (box.currentIndex(), box.currentText()), (2, "影院"))
+
+    lamp.values[(3, 9)] = 0
+    dlg_l._sync()
+    check("scene=0（无激活项）→ 不选中任何真实项", box.currentIndex(), -1)
+    check("…同时在框里显示客户端文案「无」", box.placeholderText(), "无")
+
+    lamp.values[(3, 9)] = 3
+    dlg_l._sync()
+    check("自定义场景 3（不在枚举里）→ 显示「其他」",
+          (box.currentIndex(), box.placeholderText()), (-1, "其他"))
+
+    lamp.values[(3, 9)] = 6
+    dlg_l._sync()
+    check("回到正常值 → 占位文案复位，不留上一轮的「其他」",
+          (box.currentIndex(), box.placeholderText()), (1, "—"))
+
+    lamp.values.pop((3, 9))
+    lamp.values[(2, 5)] = 8
+    dlg_l._sync()
+    check("scene 还没读到 / 不合法 → 退回按 mode(2,5) 高亮",
+          (box.currentIndex(), box.currentText()), (3, "暖光"))
+
+    # 占位态下用户点一项：写出去的必须是真实枚举值，而不是「无」
+    lamp.values[(3, 9)] = 0
+    dlg_l._mode_pending = False
+    dlg_l._sync()
+    check("回到「无」占位态", (box.currentIndex(), box.placeholderText()), (-1, "无"))
+    store_l.writes.clear()
+    box.setCurrentIndex(2)
+    check("占位态下选「影院」→ 只写 (2,5,7)",
+          store_l.writes, [(lamp.did, (2, 5), 7)])
+    check("选完立刻高亮所选（不等设备回读）", box.currentIndex(), 2)
+
+    # 刚点完模式、设备还没把 scene 改过来：这一段不能被 0 擦掉，否则下拉会在
+    # 一两百毫秒内先跳回「无」再跳回所选模式，闪两下。``_on_change`` 会置位。
+    check("鼠标点选后进入 pending 保护", dlg_l._mode_pending, True)
+    lamp.values[(3, 9)] = 0
+    dlg_l._sync()
+    check("pending + scene=0 → 保留本地选择，不显示「无」",
+          (box.currentIndex(), box.currentText()), (2, "影院"))
+    dlg_l.deleteLater()
 
     print()
     if FAILS:
