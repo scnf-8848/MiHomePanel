@@ -24,6 +24,8 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+# 采集产物只做本地参考：目录已被 .gitignore 忽略（截图是米家 App 界面 + 带账号/家庭信息）。
+# 需要量尺寸就本地采一份，结论写进 docs/reference/米家App-UI风格参考.md，别提交原图。
 OUT = ROOT / "docs" / "reference" / "mihome-app"
 
 ADB_CANDIDATES = [

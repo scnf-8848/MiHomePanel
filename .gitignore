@@ -13,6 +13,11 @@ tools/go2rtc/
 pause.yaml
 # 本地长期记忆（含真实设备名、IP、DID）
 .workbuddy/
+# 米家 App 原始采集（截图 + uiautomator dump）：只做本地开发参考，不进仓库。
+# 两点原因见 TODO「工程约定：参考材料不入库」——是别人的 App 界面（版权），
+# 且截图里必然带账号/家庭/设备信息（隐私），脱敏一次不代表以后不用再脱。
+# 蒸馏后的规范文档 docs/reference/*.md 才是要提交的部分。
+docs/reference/mihome-app/
 # ruff 缓存
 .ruff_cache/
 # GPL-3.0 参考项目副本：现已挪到仓库外（..\_refs\），这条留着防回滚
