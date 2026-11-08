@@ -1085,3 +1085,22 @@ _（「摄像头实时画面」一期归档在本节「本轮完成（2026-11-07
       **不 dump**，脚本遮不到，必须手工补遮），文字统一换成 `示例家庭` / `示例-xxx` /
       `示例自动化-NN` / `192.168.1.x` / `100000000x`，配套 `.xml` 换文字但保留 `bounds`
 - [ ] 例行检查：`git grep -n -I -E "(192\.168\.|did=|userId|passToken|serviceToken)"`
+
+### 工程约定：清理本地 git 凭据前先确认归属（2026-11-09）
+
+Windows 凭据管理器里可能同时躺着几个客户端的 GitHub 令牌，**名字都带 github，但归属不同**：
+
+- **Git Credential Manager**：目标名固定是 `git:<scheme>://<host>`（如 `git:https://github.com`），
+  作用域通常是 `gist, repo, workflow`，等于全部仓库读写
+- **GitHub Desktop**：目标名是 `<服务> - <endpoint>/<login>`（keytar 的 `<service>/<account>`
+  形式，如 `GitHub - https://api.github.com/<login>`），是它自己的登录状态
+
+2026-11-09 就因为「名字里都含 github」把 Desktop 的那条一起删了，Desktop 当场判定
+「credentials can no longer be used」→ 自动登出并清空账号记录，需要重新 Sign in 一次。
+
+- [ ] 删除前先确认归属：`cmdkey /list` 看不出创建者，只能靠命名格式区分
+- [ ] 清完用 `git -c credential.interactive=false credential fill` 验证：应当报
+      `unable to get password`（= 已无缓存，会重新弹登录）
+- [ ] 本地删掉凭据**不会**让令牌在 GitHub 侧失效，要作废得去
+      Settings → Applications → Authorized OAuth Apps 手动 Revoke
+
