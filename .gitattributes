@@ -1,2 +1,7 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# run.bat 必须是 CRLF + GBK（cmd.exe 跑 chcp 936 才认里面的中文注释）。
+# 仓库里统一存 LF，签出时强制 CRLF：这样 Linux / macOS 协作者提交的 LF 版本
+# 不会把 Windows 用户那边的启动脚本弄坏。编码不做转换，GBK 字节原样保留。
+run.bat text eol=crlf
