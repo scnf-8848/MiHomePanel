@@ -51,6 +51,10 @@ class DeviceState:
     values: dict[tuple[int, int], Any] = field(default_factory=dict)
     keys: dict[tuple[int, int], PropRef] = field(default_factory=dict)
     optimistic: dict[tuple[int, int], Any] = field(default_factory=dict)
+    #: 每个属性**值最后一次变化**的云端时间戳（epoch 秒，来自 ``updateTime``）。
+    #: 只用于详情页"N 天未更新"的提示（判据见 ``core/freshness.py``），不参与取值逻辑；
+    #: 没有这个字段的属性（静态元数据）不会进来，界面据此不提示。
+    stamps: dict[tuple[int, int], int] = field(default_factory=dict)
     gen: int = 0
     updated_at: float = 0.0  # 本地最后一次成功读到数据的时间
     error: str = ""
@@ -251,6 +255,7 @@ class Store:
             if prev is not None:
                 st.values = {k: v for k, v in prev.values.items() if k in _card_keys(card)}
                 st.keys = prev.keys
+                st.stamps = {k: v for k, v in prev.stamps.items() if k in _card_keys(card)}
                 st.updated_at = prev.updated_at
             # 预先登记卡片属性的完整寻址
             _register_keys(st, node.did)
@@ -600,6 +605,8 @@ class Store:
                 continue
             st.updated_at = now
             st.missing = 0
+            if rv.update_time:
+                st.stamps[key] = rv.update_time
             if key in st.optimistic:
                 # 静默期的双保险：api 层已过滤，这里再挡一次
                 continue
@@ -669,6 +676,8 @@ class Store:
                 if not rv.ok or key in st.optimistic:
                     continue
                 st.updated_at = now
+                if rv.update_time:
+                    st.stamps[key] = rv.update_time
                 if st.values.get(key) != rv.value:
                     st.values[key] = rv.value
                     changed = True

@@ -35,6 +35,7 @@ from ..core import timing
 from ..core.camera import CameraError, is_camera, probe_local
 from ..core.camera import shared as camera_service
 from ..core.catalog import format_value
+from ..core.freshness import stale_text
 from ..core.prefs import HIDDEN_ROOM
 from ..core.spec import PropertySpec
 from ..core.store import DeviceState, Store
@@ -97,6 +98,8 @@ class ControlRow(QWidget):
         row.addWidget(self.name, 1)
 
         self.editor: QWidget | None = None
+        #: 读数陈旧提示（只有 readout 行有）；``None`` = 这一行不放提示位
+        self.hint: QLabel | None = None
         if role == "switch" or role == "toggle":
             sw = ToggleSwitch(palette=palette, accent=accent, size="md")
             sw.setEnabled(write)
@@ -130,6 +133,13 @@ class ControlRow(QWidget):
         elif role == "slider" and prop.value_range:
             self.editor = self._build_slider(prop, palette, accent, write)
         elif role == "readout":
+            # "多久没变"的提示位：平时整段是空字符串且隐藏，行宽与基线都不变，
+            # 只有云端时间戳真的超阈值才显示（判据见 core/freshness.py）
+            hint = QLabel("")
+            hint.setStyleSheet(f"color:{palette.text_mute}; font-size:12px;")
+            hint.setVisible(False)
+            self.hint = hint
+            row.addWidget(hint, 0, Qt.AlignRight)
             lab = QLabel("—")
             lab.setStyleSheet(f"color:{palette.text}; font-size:15px; font-weight:600;")
             lab.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
@@ -241,6 +251,19 @@ class ControlRow(QWidget):
         elif ed is not None and hasattr(self, "slider"):
             self.slider.set_value(value)
 
+    def set_stale(self, text: str) -> None:
+        """给读数行标注"多久没变"，空串 = 不提示。
+
+        只作用于 readout 行；开关 / 滑条 / 下拉都是用户可写的量，陈旧与否由用户自己
+        的动作决定，标出来只会让人以为坏了。
+        """
+        hint = self.hint
+        if hint is None:
+            return
+        if hint.text() != text:
+            hint.setText(text)
+        hint.setVisible(bool(text))
+
     def set_unknown(self) -> None:
         """值没读到（还没读、读取失败、设备不返回）时不要伪装成默认值。
 
@@ -279,6 +302,8 @@ class DetailDialog(QDialog):
         self._p = palette
         self._accent = theme.category_color(state.card.category)
         self._rows: list[ControlRow] = []
+        #: 只读读数行（卡片 metrics 那一组）：只有它们会带"多久没变"的提示
+        self._readout_rows: list[ControlRow] = []
         #: 挂灯这类机型的"模式"行：激活项看 scene-mode(3,9)，见 ``_sync_mode_row``
         self._mode_row: ControlRow | None = None
         #: 用户刚点过模式、设备还没把 scene-mode 改过来的过渡态
@@ -952,6 +977,7 @@ class DetailDialog(QDialog):
                 continue
             row = ControlRow(m.prop, m.label, self._p, self._accent, "readout", write=False)
             self._rows.append(row)
+            self._readout_rows.append(row)
             lay.addWidget(row)
 
     def _build_advanced(self) -> None:
@@ -1103,6 +1129,11 @@ class DetailDialog(QDialog):
                 row.set_value(value)
         if self._adv_header is not None:
             self._collect_advanced()
+        # 读数陈旧提示：只看 metrics（卡片上那几个数），用云端每个属性自己的
+        # updateTime；离线时 footer 已经写明，不再叠一层。
+        stamps = st.stamps
+        for row in self._readout_rows:
+            row.set_stale(stale_text(stamps.get(row.prop.key)) if st.online else "")
         self.titlebar.set_title(st.name)
         self.titlebar.set_subtitle(st.room or "")
         self._sync_hide_button()
