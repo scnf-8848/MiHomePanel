@@ -12,9 +12,10 @@
 3 路并发、推流还要占上行带宽——没人看的时候不该占着。
 
 **首帧要等一个完整 GOP**：摄像头 GOP 实测 3–4 秒，而 go2rtc 的 ``probe()`` 会吃掉
-会话起点那个 IDR，消费者只能等下一个 IDR 才解得出画面。所以加载态会明确写出已等待
-秒数，长时间没画面时用户能分清"在等"和"卡死"。这一段在客户端消不掉，别在这里加
-"多试几次"之类的无效重连。
+会话起点那个 IDR，消费者只能等下一个 IDR 才解得出画面。这一段在客户端消不掉，别在
+这里加"多试几次"之类的无效重连。加载态只说"加载中…"加一条流动的进度条：**不给
+秒数、也不做百分比**——链路上没有一处能给出可靠的剩余量（等 IDR 的相位完全随机），
+编一个数字反而会让用户以为卡在 60% 了。
 
 播放中右下角常驻一个半透明暂停键，随时能停。暂停不是断开：画面停在当前帧，
 再点一下立刻续上，不会重新打洞。但**暂停时设备仍在推流**（实测 ~170 KB/s），
@@ -80,6 +81,10 @@ _VIDEO_BG = "#0E1013"
 _FG = "#F5F7FA"
 _FG_SOFT = "#B9C0CC"
 
+# 加载态那条流动进度条：多久走完一趟、多久重画一次
+_PROGRESS_CYCLE_MS = 1300
+_PROGRESS_FRAME_MS = 40
+
 # 【临时探针】Qt 媒体状态 → 日志里的阶段名，只用于 core/timing.py
 _MEDIA_STATUS_NAMES = {
     QMediaPlayer.NoMedia: "NoMedia",
@@ -125,7 +130,6 @@ class PlaybackHandoff:
     painted: bool
     hint: str
     sub: str
-    elapsed: int
     retries: int
     lan_first_fallback: bool
     buf_bucket: int
@@ -281,7 +285,8 @@ class CameraView(QWidget):
         self._retries = 1
         #: 这次是"局域网优先的局域网会话"：明确失败时不再重连同一地址，交给外层切远程
         self._lan_first_fallback = False
-        self._elapsed = 0
+        #: 加载态进度条的相位（0..1），由 ``_clock`` 推进
+        self._progress = 0.0
         self._hover = False
         self._hint_provider: Callable[[], str] | None = None
         if not self._compact:
@@ -289,9 +294,9 @@ class CameraView(QWidget):
             self.setMinimumWidth(240)
         self.setMouseTracking(True)
 
-        # 加载态每秒把"已等待 N 秒"刷出来，用户才知道不是在死等
+        # 加载态靠一条流动的进度条表示"还在连"：光有静态文字，几秒不动就像卡死了
         self._clock = QTimer(self)
-        self._clock.setInterval(1000)
+        self._clock.setInterval(_PROGRESS_FRAME_MS)
         self._clock.timeout.connect(self._tick)
 
         # 闲置自动放连接：只对"暂停"生效——暂停时设备仍在推流、还占着观看位
@@ -525,7 +530,6 @@ class CameraView(QWidget):
             painted=self._painted,
             hint=self._hint,
             sub=self._sub,
-            elapsed=self._elapsed,
             retries=self._retries,
             lan_first_fallback=self._lan_first_fallback,
             buf_bucket=self._buf_bucket,
@@ -566,7 +570,6 @@ class CameraView(QWidget):
         self._painted = handoff.painted
         self._hint = handoff.hint
         self._sub = handoff.sub
-        self._elapsed = handoff.elapsed
         self._retries = handoff.retries
         self._lan_first_fallback = handoff.lan_first_fallback
         self._buf_bucket = handoff.buf_bucket
@@ -640,9 +643,9 @@ class CameraView(QWidget):
         self._pos_logged = False
         self._meta_logged = False
         timing.mark("RTSP 播放请求", url)
-        self._elapsed = 0
-        self._hint = "正在连接摄像头…"
-        self._sub = "局域网约 6 秒，远程 8–13 秒"
+        self._progress = 0.0
+        self._hint = "加载中…"
+        self._sub = ""
         self.setToolTip("")
         self._clock.start()
         self.update()
@@ -680,9 +683,9 @@ class CameraView(QWidget):
             return
         timing.mark("点下播放（控件）")
         self._retries = 1
-        self._elapsed = 0
-        self._hint = "正在连接摄像头…"
-        self._sub = "局域网约 6 秒，远程 8–13 秒"
+        self._progress = 0.0
+        self._hint = "加载中…"
+        self._sub = ""
         self.setToolTip("")
         self._clock.start()
         self._set_state(CameraView.LOADING)
@@ -690,11 +693,11 @@ class CameraView(QWidget):
         self.play_requested.emit()
 
     def _tick(self) -> None:
+        """推进加载态进度条的相位（不数秒、不报百分比）。"""
         if self._state != CameraView.LOADING:
             self._clock.stop()
             return
-        self._elapsed += 1
-        self._sub = f"已等待 {self._elapsed} 秒"
+        self._progress = (self._progress + _PROGRESS_FRAME_MS / _PROGRESS_CYCLE_MS) % 1.0
         self.update()
 
     def _release_idle(self) -> None:
@@ -778,7 +781,7 @@ class CameraView(QWidget):
         # 否则新会话的第一帧会被 `_on_frame` 当成残留帧丢掉
         self.stop()
         self._stopping = False
-        self._elapsed = 0
+        self._progress = 0.0
         self._hint = hint
         self._sub = sub
         self.setToolTip("")
@@ -788,8 +791,11 @@ class CameraView(QWidget):
 
     # -- 事件 ------------------------------------------------------------
     def _on_frame(self, frame: object) -> None:
-        # 暂停/停止之后 sink 里可能还排着一两帧，画上去会让静止画面跳一下
-        if self._stopping or self._state in (CameraView.PAUSED, CameraView.STOPPED):
+        # 暂停/停止之后 sink 里可能还排着一两帧，画上去会让静止画面跳一下。
+        # 另外只有"正在连"和"正在播"才该收帧：`release_player()` 把 `_stopping`
+        # 复位成 False 之后，拆会话期间漏出来的尾帧会被当成新画面画上去，
+        # 于是空态/已释放态底下多出一张静止截图（播放键还盖在上面）。
+        if self._stopping or self._state not in (CameraView.LOADING, CameraView.PLAYING):
             return
         try:
             if not frame.isValid():  # type: ignore[attr-defined]
@@ -1046,15 +1052,24 @@ class CameraView(QWidget):
                 align=Qt.AlignHCenter | Qt.AlignVCenter,
             )
         if self._state == CameraView.LOADING:
-            # 一条 accent 细线，表示"还在连"，避免用户以为卡死
-            w = int(rect.width() * 0.22)
-            painter.setPen(Qt.NoPen)
-            painter.setBrush(QColor(self._accent))
-            painter.drawRoundedRect(
-                QRect((rect.width() - w) // 2, line.bottom() + (44 if self._sub else 30), w, 3),
-                2,
-                2,
+            # 流动的细条：表示"还在连"，但**不给秒数也不假装百分比**——等 IDR 的
+            # 相位随机，编出来的进度条只会在某一格上停住，看着更像卡死
+            track_w = max(120, min(int(rect.width() * 0.34), 260))
+            track = QRect(
+                (rect.width() - track_w) // 2,
+                line.bottom() + (44 if self._sub else 30),
+                track_w,
+                3,
             )
+            painter.setPen(Qt.NoPen)
+            painter.setOpacity(0.18)
+            painter.setBrush(QColor(_FG_SOFT))
+            painter.drawRoundedRect(track, 2, 2)
+            painter.setOpacity(1.0)
+            seg_w = max(28, int(track_w * 0.34))
+            x = track.x() + int((track_w - seg_w) * self._progress)
+            painter.setBrush(QColor(self._accent))
+            painter.drawRoundedRect(QRect(x, track.y(), seg_w, 3), 2, 2)
 
 
 class PlaybackOwnership:

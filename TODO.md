@@ -354,8 +354,9 @@
         无法表达「无激活项」，选中态与实际状态不一致
       - **判据换成只读的 `scene-mode`(3,9)**：`mode`(2,5) 只用于写入，手调亮度/色温后
         它不会变（实测一直停在 5/6/7），拿它当"当前生效模式"会让下拉一直假亮
-      - **按型号做，不按品类**：`catalog.MODEL_ADAPTERS` 里一条
-        `"yeelink.light.lamp22": ModelAdapter(extra=("scene-mode",), mode_active="scene-mode")`。
+      - **按型号做，不按品类**：适配表里一条
+        `"yeelink.light.lamp22": ModelAdapter(extra=("scene-mode",), mode_active="scene-mode")`
+        （2026-11-09 起这张表在 `mihome/core/adapters/`，按厂商分文件）。
         "手调亮度后 mode 不变"是这台设备实测量出来的，别的灯没验过，不能按品类推给所有灯。
         `extra` 由 `store._card_props` 自动并入轮询，加型号不用碰 store；
         属性在 spec 里找不到 / 运行时读不到 → 退回按 `mode` 高亮，不报错也不空高亮
@@ -462,6 +463,207 @@ Qt 的 RTSP 首次 `SETUP` 收到 461 会自己回退 TCP；go2rtc 的 `frame.jp
 - go2rtc 的 API 比 `xiaomi` 模块先就绪，第一条 RTSP 请求会撞 `unsupported scheme`
   并被 stream 缓存；启动后多等 300ms + 控件自动重连兜底。修前约 1/3 概率失败，
   修后连跑 5 次全过
+
+### 摄像头首帧：5.3 s → 2.2 s（2026-11-08）
+
+用户的目标很明确：**手动点播放才加载，且首帧要进 3 秒**。先用
+`scripts/measure_camera_startup.py` 把 5–6 秒拆开，再写
+`scripts/measure_camera_coldstart.py` 做冷/热对照（每次接流后等生产者自然停，才是
+真正的"第一下点击"）：
+
+| 场景 | 首帧 |
+|---|---|
+| 冷启动，官方构建（8 次） | 4.82 / 4.84 / 4.82 / 6.32 …，均值 **5.33 s** |
+| 生产者已预热（7 次，随机相位） | 1.77–3.96，均值 2.69 s |
+| 冷启动，打补丁（8 次） | 1.85–3.15，均值 **2.18 s** |
+
+三件事查清了：
+
+- **那 3 秒就是「等一个 GOP」**：`pkg/xiaomi/miss/producer.go::Dial()` 先
+  `StartMedia()` 再 `probe()`，probe 为拿 VPS/SPS/PPS 读走的那一包恰好含 IDR 切片
+  （同一个 access unit），消费者于是永远从 GOP 中间开始，只能等下一个 IDR
+- **预热治不了根**：生产者热着时新消费者仍要等「下一个 IDR」，相位随机 → 1.8–4.0 秒，
+  最坏接近 4 秒；而且违背「手动播放才加载」
+- **试错留档**：把 probe 读到的包缓存后由 `Start()` 补发（`Producer.cache`）——裸流首包
+  确实变成 IDR，但 Qt 端到端只到 4.7 秒且时灵时不灵（补发早于 RTSP 的 PLAY、时间戳
+  落后于追上来的活流，ffmpeg 会跳过它继续等），**此路不通，别再试**
+
+- [x] `scripts/patches/go2rtc-keyframe.patch`（12 行）：probe 之后 `StopMedia()` →
+      150ms → `StartMedia()`，让新的一轮从 IDR 开头
+- [x] `scripts/build_go2rtc.py`：取上游快照 `990f4de` → `git apply` 补丁 → Go 1.27.3
+      编译（本机没有就自动下便携版到 `<data>/go`）→ 装到 `<data>/go2rtc/go2rtc.exe`，
+      原版留成 `go2rtc-official.exe`（改名即回退）
+- [x] `scripts/measure_camera_coldstart.py`：`--binary` 指到不同构建做 A/B
+- [x] 远程（relay）路径同样受益：`open()` 1.07–1.60 s + 首帧 = 2.86–3.07 s
+      （relay 握手那 0.9 s 仍在；用户明确表示暂不预建会话）
+
+### 通道实测：中继 4.2 s vs 局域网 2.1 s（2026-11-08）
+
+用户在打包版上试了一次播放，反馈"感觉没那么快"。翻 `<data>/logs` 之外的计时日志
+（打包版写在 `_internal/logs/camera_timing.log`）直接看到答案：那次走的是**远程中继**，
+而且 `prefs.json` 里 `camera_network` 是 `remote_only`（默认值应为 `lan_first`）：
+
+```
+环境 (本机=192.168.1.100/24 摄像头=192.168.1.101 网段=同网段 偏好=remote_only)
+快速可达性预判 (跳过（本次不走局域网）)
+```
+
+新增 `scripts/measure_app_play.py`：从 `DetailDialog` 点播放开始计时（把详情页、取流
+线程、中继握手、go2rtc 全算进去），`--lane lan/remote/keep` 分通道对照，偏好只改内存。
+
+| 场景 | 首帧 |
+|---|---|
+| 局域网，生产者冷（2 次） | **2.10 / 2.09 s** |
+| 局域网，进程内第一次点击 | 3.51–3.77 s |
+| 中继，用户那次真实操作 | 5.03 s（冷）/ 4.03 s |
+| 中继，脚本复测 | 4.89 / 3.49 s |
+
+分段（热态，从点下播放算）：
+
+| 阶段 | 局域网 | 中继 |
+|---|---|---|
+| RTSP 建流到拨号 | 0.13 s | 0.99 s 握手 + 0.95 s 建链 |
+| 生产者拨号（含补丁的 150 ms 重启） | 0.63 s | 0.32 s |
+| IDR 传输 + 解码 | 1.35 s | 1.65 s |
+
+「进程内第一次点击」多出来的 ~0.9 s 是 **go2rtc 自身启动**（子进程拉起 → `/api` 就绪
+实测 905 ms），已经由打开详情页时的 `_prefetch_camera` 吸收掉大部分；点得很快时仍会撞上。
+
+- [x] 把偏好改回 `lan_first`（4.2 s → 2.1 s，零代码改动）
+- [ ] 可选：go2rtc 启动再提前一点（程序启动或卡片墙就起），消掉首次点击的 ~0.9 s
+- [ ] 可选：中继路径预建会话能再省 0.9 s，但会占一个观看位（用户此前明确不做）
+
+### 加载提示：去掉秒数，改成「加载中…」+ 流动细条（2026-11-09）
+
+用户要求：别再写「2 秒 / 3 秒」，也别每秒数「已等待 N 秒」，要么只写"加载中"，
+要么给真实进度。
+
+- 结论是**不给百分比**：唯一的大头是"等下一个 IDR"，相位完全随机（实测 0–3 s 均匀
+  分布），链路上没有任何一处能算出剩余量。编一个分档进度条会在某一格上停住，看着
+  比不写更像卡死。
+- [x] `camera_view.py`：`_hint = "加载中…"`、`_sub = ""`；删掉 `_elapsed` 与
+      `已等待 N 秒` 的刷屏，`_clock` 从 1000 ms 计数器改成 40 ms 相位推进器
+      （`_progress` 0→1 循环 1.3 s）
+- [x] 进度条从"静止 accent 细线"改成"轨道 + 流动亮段"（轨道 `_FG_SOFT` 18%，
+      亮段用设备品类色，和标题图标同色）
+- [x] `_begin()` / `play()` / `show_progress()` 三处入口文案统一；切换通道的
+      「正在尝试远程中继，可能需要几秒…」也去掉了"几秒"
+- [x] `shot_camera.py` 增加第五张 `camera_loading.png`（点播放后 300 ms 抓）
+- [x] `PlaybackHandoff` 去掉 `elapsed` 字段（换渲染面时不再需要带计数器）
+
+### 型号适配拆成 `core/adapters/` 包（2026-11-09）
+
+用户判断"以后单独适配的设备一定会多"，且开源后别人要能直观地增删改，要求把
+`catalog.MODEL_ADAPTERS` 挪出 `catalog.py` 单独成目录。
+
+- 分层轴选了**厂商**（型号字符串第一段），不是品类：查找键是型号，型号第一段就是厂商，
+  `yeelink.py` 天然对应 `yeelink.*`；按品类分会让文件名反复暗示"灯都差不多"，正是
+  「设备特判按型号、不按品类」那条约定要防的
+- [x] `core/adapters/base.py`：`ModelAdapter`（多了 `note` 字段写"为什么"）、
+      `check_model()` 校验（必须「厂商.品类.型号」、不能带空格）、`collect()` 合并时
+      查重复型号并报错
+- [x] `core/adapters/yeelink.py`：`ADAPTERS` 一条（挂灯），实测结论写在 `note` 里
+- [x] `core/adapters/__init__.py`：`_MODULES` 显式登记 + `MODEL_ADAPTERS` + `find_adapter()`。
+      **不用 `pkgutil` 自动发现**——打包后静态分析看不到动态导入的模块，会变成
+      "开发机有适配、装完没有"
+- [x] `catalog.py` 只保留 `from .adapters import ...` 转出（`catalog.MODEL_ADAPTERS` 仍是
+      同一张表，老引用不断），`build_card` 改用 `find_adapter(model)`
+- [x] `verify_card_style.py` 第 9 段补 5 项：表是同一对象、每条适配都有 `note`、
+      `find_adapter` 命中/未命中、格式校验拒绝 4 种错写法、重复登记被拒（196 → 202 项）
+
+### 打包兼容：go2rtc 的查找路径（2026-11-08）
+
+`find_binary()` 原来只认「数据目录 + `__file__.parents[2]/tools`」。打包后模块被塞进
+`_internal`（PyInstaller onedir）或临时解包目录（onefile），`parents[2]` 算回仓库根
+这条直接失效 → **开发机正常、打包版一律"没有找到 go2rtc"**。
+
+- [x] `program_dirs()`：`sys.frozen` 时加 `sys.executable` 所在目录，再加
+      `sys._MEIPASS`；两者覆盖 PyInstaller（数据在 `_internal`）和 Nuitka（数据在
+      exe 旁边）。源码运行时只有仓库根，行为不变
+- [x] 顺序改为 显式 → `MIHOME_GO2RTC` → **程序目录**（`go2rtc/`、`tools/go2rtc/`）→
+      数据目录 → `PATH`。程序目录排前面，是为了让打包版自带的补丁版压过用户以前
+      下载的官方版
+- [x] `missing_binary_hint()`：打包版没有 `scripts/` 目录，别再让人"运行
+      install_go2rtc.py"，改成直接给出该放到的路径
+- [x] `verify_camera.py` 第 [13] 项伪造 frozen 布局守住这条（31/31 通过）
+
+打包相关的准备详见下一节。
+
+### 打包（2026-11-08）
+
+- [x] `scripts/build_exe.py`：PyInstaller onedir → `dist/MiHomePanel/`（119 MB / 888 文件）
+- [x] go2rtc 摆到 exe 旁边（`go2rtc/`）并带上 `BUILD.txt` + 它的 MIT 原文；
+      写成 `add-data` 塞进 `_internal` 也能找到，但放旁边用户能看见、能替换
+- [x] 新增 `MiHomePanel.exe --self-check`：不建窗口、不联网，只查「找得到 go2rtc /
+      `go2rtc -v` 跑得起来 / Qt 的 HEVC 解得了」。结果落 `<data>/logs/self-check.txt`
+      ——`--windowed` 的 exe 没有可读 stdout
+- [x] 打包脚本结尾自动跑自检，不过就返回 1
+- [x] **真实取流在打包产物上验过**（2026-11-09）：新增 `MiHomePanel.exe --probe-camera`
+      ——起界面、找到在线摄像头、开详情页、点播放，等到画面真上屏才停表。产物实测
+      `首帧 4.06s 画面 2960×1666`（frozen、lan_first、补丁版 go2rtc），结论「有画面」。
+      报告 `--windowed` 下写 `<data>/logs/probe-camera.txt`，**边跑边写**（中途崩掉
+      最后一行就是现场）；`--rounds N` 连测、`--lane lan|remote` 只改内存偏好。
+      为什么做成 exe 的开关而不是外部脚本：产物里的 Python 是嵌进去的，脚本驱动不了
+- [x] 顺手修掉打包版计时日志落到安装目录的问题：`timing._default_path()` 冻结时改走
+      `<data>/logs/camera_timing.log`（原来 `parents[2]` 指进 `_internal`，装到
+      Program Files 就写不进去）
+- [ ] `--patched`：让 `install_go2rtc.py` 从本项目 Release 取补丁版，普通用户
+      一条命令拿到 2 秒（现在要么自己编，要么等我们发包）
+- 坑：PyInstaller `--clean` 会清 `%LOCALAPPDATA%\pyinstaller` 缓存（几十个目录），
+  有些环境的安全策略拦批量删除 → 默认不开，改 `--force-clean`
+
+### 双击 exe 直接崩：窗口化进程的 sys.stdout 是 None（2026-11-08）
+
+用户双击 `dist\MiHomePanel\MiHomePanel.exe`，只弹一句 **"Failed to execute script
+'_launcher' due to unhandled exception: 'NoneType' object has no attribute 'isatty'"**，
+窗口都没起来。
+
+根因不在我们的代码里：`--windowed` 打出来的 exe 没有控制台，CPython 把 `sys.stdout` /
+`sys.stderr` 置成 `None`；而 `mijiaAPI/logger.py` 在**模块级**就构造了带颜色的 logger，
+`ColorFormatter.__init__` 里有 `sys.stdout.isatty()`。于是 `import mijiaAPI` 这一步就炸。
+崩溃栈看着落在 `mihome/app.py:15`（`from .ui.main_window import MainWindow` 的导入链里）。
+
+**为什么自检没抓到**：自检是用 `capture_output=True` 起的，子进程拿到了有效的管道句柄，
+`sys.stdout` 反而是正常文件对象。**只有不带任何句柄的启动（双击）才会 None**。
+
+修法：
+
+- `mihome/_stdio.py::ensure_streams()` 给缺的那一方兜一个 devnull，由
+  `mihome/__init__.py` 在包初始化时调用（早于一切子模块导入）
+- 所有 `subprocess.run/Popen` 显式 `stdin=subprocess.DEVNULL`（窗口化下继承到的是空句柄，
+  典型 `OSError: [WinError 6] 句柄无效`）
+- 打包入口 `_launcher.py` 接住启动期异常 → 写 `<data>/logs/crash.log` + 中文提示框
+  （PyInstaller 自带弹窗是英文、不能复制，用户和你都拿不到信息）
+- `build_exe.py` 新增**窗口冒烟**：`DETACHED_PROCESS` 起一次（等价双击），读窗口标题，
+  命中 `Unhandled exception` 判失败。正反两面都验过：旧包报 `[FAIL] 弹出了错误窗口：
+  Unhandled exception in script`，新包报 `[OK] 窗口已出现：米家控制台`
+
+偶发：`dist` 目录整体改名/删除会被环境的批量删除防护拒掉（`Permission denied`），
+逐个子目录改没问题，或者直接 `--dist dist2` 换个空目录重打。
+
+### 释放态显示成"一张静止旧画面"（2026-11-08）
+
+用户报"截图脚本停在详情页不动"，顺着查是 `scripts/shot_camera.py` 自己坏了：`shoot_idle`
+定义在 `QTimer.singleShot(600, shoot_idle)` 之后，闭包拿到的是未绑定的局部名，
+`UnboundLocalError` 打断了回调，所以**从没点过播放**。修好脚本后反而暴露出真问题：
+闲置释放后画面区是一张**静止的旧画面 + 播放键**、没有任何文字——正是当初「不垫上次
+画面」要避免的错觉。
+
+两个原因叠在一起：
+
+- 详情页 `_on_camera_state` 的 `released` 分支调了 `playbacks().release()`，而这个接口
+  是给卡片墙用的硬重置（`stop()` + `release_player()` → 回空态），把 `_release_idle()`
+  刚摆好的黑底 +「闲置 N 分钟，连接已释放」抹掉了
+- `_on_frame` 只挡 `paused` / `stopped`，而 `release_player()` 结尾会把 `_stopping`
+  复位成 `False`，拆会话期间漏出的尾帧就被当成新画面画在空态底下
+
+- [x] `_on_frame` 改成只在 `loading` / `playing` 收帧，其余状态一律丢弃
+- [x] 释放分支改成 `playbacks().forget()` + `camera_service().release(did)`：只放所有权
+      和 go2rtc 会话，控件外观留给自己
+- [x] 顺手把加载文案从「局域网约 6 秒，远程 8–13 秒」改成实测的「约 2 秒 / 约 3 秒」
+      （2026-11-09 又改掉了：秒数和「已等待 N 秒」全部删除，只留「加载中…」，见下节）
+- [x] `verify_camera.py` 28/28、`verify_camera_popout.py` 全部通过；`shot_camera.py`
+      四张图重出，释放态为黑底 + 两行文案
 
 ### 摄像头验证偶发 `exit=139`：显存不足 + 硬解
 
@@ -776,6 +978,10 @@ _（「摄像头实时画面」一期归档在本节「本轮完成（2026-11-07
 
 ## 技术债
 
+- [ ] `<data>/go2rtc/go2rtc.exe` 现在是**自建二进制**（`scripts/patches/go2rtc-keyframe.patch`
+      12 行，见 README「开播补丁」）。上游一改 `pkg/xiaomi/miss/producer.go::Dial()`，
+      补丁就会打不上（`build_go2rtc.py` 会明确报错）；跟进新版本时先重跑
+      `scripts/measure_camera_coldstart.py` 复核首帧，别默默退回 5 秒
 - [ ] `core/timing.py` 是取流计时的**临时探针**（文件头自己写了"用完可以整个文件删掉"），
       但 `MIHOME_CAMERA_TIMING` **默认开启**，每次取流都往 `logs/camera_timing.log` 追加
       （已 180KB）。首帧问题收尾后要么删掉、要么把默认改成关

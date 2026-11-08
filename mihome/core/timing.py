@@ -11,7 +11,8 @@
 * ``MIHOME_CAMERA_TIMING=0``（或 ``false`` / ``no`` / ``off``）关掉
 * ``MIHOME_CAMERA_TIMING_PATH=<文件>`` 改输出位置
 
-默认输出 ``<项目根>/logs/camera_timing.log``。
+默认输出 ``<项目根>/logs/camera_timing.log``；打包后写 ``<data>/logs/camera_timing.log``
+（安装目录可能不可写，且 ``parents[2]`` 会指到 ``_internal`` 里）。
 
 彻底删除
 --------
@@ -66,6 +67,12 @@ def _default_path() -> Path:
     raw = os.environ.get(_ENV_PATH, "").strip()
     if raw:
         return Path(raw).expanduser()
+    if getattr(sys, "frozen", False):
+        # 打包后 ``parents[2]`` 落在 _internal 里（甚至可能装进 Program Files，
+        # 那里不可写）。日志一律进数据目录，和 self-check.txt 放一起。
+        from . import paths
+
+        return paths.log_dir() / "camera_timing.log"
     return Path(__file__).resolve().parents[2] / "logs" / "camera_timing.log"
 
 
@@ -101,6 +108,7 @@ def _run(cmd: list[str], timeout: float = 2.5) -> str:
             capture_output=True,
             timeout=timeout,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            stdin=subprocess.DEVNULL,
         )
         return _decode(done.stdout or b"")
     except (OSError, subprocess.SubprocessError):

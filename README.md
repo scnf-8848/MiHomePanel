@@ -53,7 +53,7 @@ UI 规范：版式尺寸（dp）、6 列栅格、配色表、圆角与字号体�
 
 ## 和参考项目的关系
 
-`MiHome-Windows-0.5.0/` 是起点参考项目，能力层写得扎实，本项目**沿用了它的三个核心判断**：
+`huanyuejue/MiHome-Windows`（0.5.0 版）是起点参考项目，能力层写得扎实，本项目**沿用了它的三个核心判断**：
 
 1. 所有网络调用进**单线程串行队列**（`requests.Session` 不是线程安全的，且上游自带节流）
 2. 子线程**绝不直接回调 UI**，只把结果塞队列，主线程定时取走执行
@@ -94,14 +94,36 @@ UI 规范：版式尺寸（dp）、6 列栅格、配色表、圆角与字号体�
 
 **这件事按型号做，不按品类。** "手调亮度后 `mode` 不变"是这台设备实测出来的行为，
 其它灯的 `mode` 会不会跟着变完全没验过；按品类推给所有灯会把别人的选中态弄坏。所以
-`schema` 之外单独有一张 `catalog.MODEL_ADAPTERS`，键是 `DeviceNode.model` 的**精确
-字符串**（`yeelink.light.lamp22`），目前只有这一条：
+`schema` 之外单独有一张"型号 → 属性"的表，放在 `mihome/core/adapters/`，**一个厂商一个
+文件**：
 
-```python
-"yeelink.light.lamp22": ModelAdapter(extra=("scene-mode",), mode_active="scene-mode")
+```
+mihome/core/adapters/
+  __init__.py   汇总各厂商文件 → MODEL_ADAPTERS，对外只暴露 find_adapter(model)
+  base.py       ModelAdapter 结构 + 型号格式校验 + 合并时的重复检查
+  yeelink.py    yeelink.* 的适配规则
 ```
 
-`build_card(model=...)` 命中后把它解析进 `CardSpec.extra`（只读、要轮询）和
+一条规则就是一条记录，键是 `DeviceNode.model` 的**精确字符串**：
+
+```python
+"yeelink.light.lamp22": ModelAdapter(
+    extra=("scene-mode",),          # 额外参与轮询、不在卡片上渲染
+    mode_active="scene-mode",       # 模式高亮的判据
+    note="mode(2,5) 手调亮度后不变，真实预设看只读的 scene-mode(3,9)",
+)
+```
+
+按厂商分而不是按品类分，因为查找键就是型号、而型号第一段就是厂商：`yeelink.py` 只管
+`yeelink.*`，不会让文件名天天暗示"灯都差不多"。导入期会校验型号格式（必须
+「厂商.品类.型号」、不能带前后空格）和重复登记（同一型号写两遍直接报错）——写错了当场
+炸，不会拖成"某台设备莫名没有适配"。
+
+新增一个型号 = 在对应厂商文件里加一条，通用逻辑一行不用改。新增一个厂商 = 新建
+`<厂商>.py`，再在 `__init__.py` 的 `_MODULES` 里加一行 import 与一项（**不要改成
+`pkgutil` 自动发现**：打包成 exe 时静态分析看不到动态导入的模块）。
+
+`build_card(model=...)` 用 `find_adapter()` 命中后把它解析进 `CardSpec.extra`（只读、要轮询）和
 `CardSpec.mode_active`（界面判据）。`extra` 由 `store._card_props` 自动并入轮询与寻址，
 所以加一个型号适配不用碰 store。属性在 spec 里找不到、或运行时读不到时，两者都是空的，
 一切退回默认行为（按 `mode` 自己高亮），不报错也不空高亮。
@@ -120,10 +142,11 @@ UI 规范：版式尺寸（dp）、6 列栅格、配色表、圆角与字号体�
 ```
 mihome/
   core/
+    adapters/   型号级适配：一个厂商一个文件，键是精确型号（原 catalog.MODEL_ADAPTERS）
     api.py      云端访问：批量读写、错误码分类、能力学习、静默期、子设备路由
     camera.py   摄像头取流：找 go2rtc、生成配置、启停子进程（可选外部组件）
     relay.py    摄像头跨网：云端 P2P 授权、小米 relay 握手、本机 UDP 代理（无新依赖）
-    catalog.py  品类 → 卡片形态映射（21 个品类 + 槽位候选表 + 型号级适配表 MODEL_ADAPTERS）
+    catalog.py  品类 → 卡片形态映射（21 个品类 + 槽位候选表）
     spec.py     MIoT-Spec 原始规格解析（单位、事件、中文 comment、access）
     store.py    运行时状态机：卡片状态、乐观写入、轮询集合、房间分组
     jobs.py     单线程串行执行器（三级优先级 + 主线程回调）
@@ -169,17 +192,22 @@ scripts/
   verify_combo.py    下拉框验证：箭头/圆角/滚轮/接线/主题/当前值打勾；--native 查 WS_EX_LAYERED / alpha
   verify_wheel.py    滚轮验证：滑条/卡片/滚动区三种投递路径 + 拖动仍可调值 + 步进器/SafeSlider（离屏）
   verify_dim_click.py 点压暗区关闭子窗口：点遮罩 / 点内部不关 / Esc 一致 / 两种拖拽不关 / 滚轮不关 / 多层只关最上层（25 项，离屏）
-  verify_card_style.py 卡片样式：偏好往返与 v3 迁移、尺寸/内容维度分离、注册表自检、品类默认样式、只读读数 body、空调温度控制 body（步进器 + 胶囊）与接线、几何、轨道像素、菜单结构、局部刷新、浅色卡片底色可读性、温度 0.5 档、主窗口 → 详情页的接口契约、挂灯模式（型号级适配 + 占位文案）（196 项）
+  verify_card_style.py 卡片样式：偏好往返与 v3 迁移、尺寸/内容维度分离、注册表自检、品类默认样式、只读读数 body、空调温度控制 body（步进器 + 胶囊）与接线、几何、轨道像素、菜单结构、局部刷新、浅色卡片底色可读性、温度 0.5 档、主窗口 → 详情页的接口契约、挂灯模式（型号级适配 + 占位文案 + 适配表校验）（202 项）
   verify_hidden_fold.py 「已隐藏设备」折叠与按房间分层：只有该分组可折、三角紧贴标题、台数常驻、收起后只剩标题行高、落盘与重建、搜索临时展开、坏数据当展开（59 项）
   render_preview.py  用真实数据渲染卡片墙 HTML 预览
   shot.py            主窗口截图（--dark / --filter 关键词）
   shot_ui.py         多视图截图：主窗口 / 设置页 / 详情页 / 下拉框 / 胶囊标签 / 卡片样式 / 存在传感器状态卡 / 空调温度控制卡 / 已隐藏设备折叠（34 张）
   shot_states.py     交互态截图：房间标题悬停、详情页底部、离线禁用
-  install_go2rtc.py  下载可选的 go2rtc（MIT，7.7MB，走 GitHub assets API）
-  verify_camera.py   摄像头验证：预加载 / 播放 / 暂停 / 恢复 / 停止 / 离线 / 闲置释放 / 断流归因 / 孤儿清理 / 占位图（30 项，离屏）
+  install_go2rtc.py  下载可选的 go2rtc（MIT，7.7MB，走 GitHub assets API）——官方构建
+  build_go2rtc.py    自己编带开播补丁的 go2rtc（取快照 + 打补丁 + 下载 Go + 编译安装）
+  build_exe.py       打包成可发布的 Windows 目录：PyInstaller onedir、go2rtc 摆到 exe 旁边并附许可证、产物自带自检 + 无控制台启动冒烟
+  patches/go2rtc-keyframe.patch  那 12 行补丁本体（probe 之后重起一次视频流）
+  verify_camera.py   摄像头验证：预加载 / 播放 / 暂停 / 恢复 / 停止 / 离线 / 闲置释放 / 断流归因 / 孤儿清理 / 打包后路径（31 项，离屏）
   verify_camera_popout.py 摄像头独立窗口：按钮可见性 / 搬窗口不重连（同一播放器、帧号连续） / 收回原位 / 右下角缩放 / 与遮罩点击的边界（66 项，离屏）
-  shot_camera.py     摄像头详情页截图：就绪态、播放态、闲置释放、错误态、占位图（5 张）
+  shot_camera.py     摄像头详情页截图：就绪态、播放态、闲置释放、错误态（4 张）
   measure_camera_startup.py 首帧计时：把 5–7 秒拆成进程启动 / 云端换票 / 握手 / 等 IDR / 解码
+  measure_camera_coldstart.py 冷启动首帧对比：--binary 指到不同 go2rtc 构建（官方 5.3 s / 补丁版 2.2 s）
+  measure_app_play.py 走真实详情页点播放计时，--lane lan/remote/keep 分通道对照（局域网 2.1 s / 中继 4.2 s）
 ```
 
 ## 运行
@@ -204,6 +232,73 @@ python -m venv .venv
 会删掉那个 `auth.json`，然后直接拉起扫码窗口。米家 App 和云端的登录状态不受影响。
 目前**同一时间只支持一个账号**，换号就是"退出登录 → 重新扫码"；多账号同时在线的方案
 记在 [TODO.md](TODO.md)（上游 `mijiaAPI(auth_data_path=...)` 支持自定义路径，可行）。
+
+## 打包成 exe
+
+```bash
+.venv\Scripts\python.exe scripts\build_exe.py
+```
+
+产物是 `dist\MiHomePanel\`（约 120 MB / 888 个文件），**整个目录一起发**，不是只发那个 exe：
+
+```
+dist\MiHomePanel\
+  MiHomePanel.exe
+  _internal\            Qt / Python 运行时（PyInstaller 自动收集，含 ffmpeg 后端）
+  go2rtc\               摄像头取流组件（外部进程，PyInstaller 不会自动带）
+    go2rtc.exe          打补丁的那份 → 别人装完也是首帧约 2 秒
+    BUILD.txt           构建记录（自检靠它区分 2 秒 / 5 秒）
+    LICENSE             go2rtc 的 MIT 原文（再分发要求）
+  LICENSE  NOTICE.txt   本项目 GPL-3.0 + 第三方组件说明
+```
+
+脚本结尾会**在产物上**跑两项检查，都过才算打完：
+
+1. `MiHomePanel.exe --self-check`：找得到 go2rtc、`go2rtc -v` 跑得起来、Qt 的 HEVC
+   解得了。结果同时落在 `<data>\logs\self-check.txt`（`--windowed` 的 exe 没有可读的
+   stdout，看文件）。
+2. **窗口冒烟**：按"双击"的方式（`DETACHED_PROCESS`，不带任何标准句柄）再拉一次，
+   然后看两件事：窗口标题里有没有 `Unhandled exception`、`<data>\logs\crash.log`
+   有没有被重新写出来。任一命中就判失败。**这一步不能省**——自检是带管道跑的，
+   stdout 反而是有效句柄，见下面第 3 个坑。
+
+`--console` 打带控制台的版本排障，`--onefile` 打单文件（启动慢，go2rtc 仍要放旁边），
+`--skip-check` / `--skip-smoke` 跳过对应检查，`--force-clean` 让 PyInstaller 清缓存
+再编（有些环境会拦批量删除）。
+
+上面两项都**不碰摄像头**，所以还得手动真播一次——打包产物里的 Python 是嵌进去的，
+外部脚本驱动不了它，所以做成了 exe 自带的开关：
+
+```
+dist\MiHomePanel\MiHomePanel.exe --probe-camera            # 跑一次
+dist\MiHomePanel\MiHomePanel.exe --probe-camera --rounds 3 # 冷启动三次看区间
+```
+
+它起完整界面、找到那台在线摄像头、打开详情页、**点一下播放**，等到画面真的上屏才
+停表，报告写 `<data>\logs\probe-camera.txt`（含分辨率，能顺带证明不是黑屏）。`--lane
+lan|remote` 只改内存里的通道偏好，不动用户设置。这一步过了才算"别人装完能看到画面"。
+
+本机实测（2026-11-09，`chuangmi.camera.069a01`、补丁版 go2rtc、局域网）：产物上
+`3.97 s / 1.98 s（2960×1666）`，源码模式 `3.46 / 1.97 / 0.89`。第一次总是慢一点，
+因为 go2rtc 进程要冷启动。
+
+四个只在打包后才暴露的坑，脚本已经兜住，但改打包方式时要留意：
+
+- **go2rtc 不会被自动带上**。缺了它摄像头**完全不可用**（不是慢）——`find_binary()`
+  会去 exe 旁边找，找不到就明确报路径。
+- **Qt 多媒体后端是插件**。漏收集时程序能启动、日志干净，只有点播放才黑屏；
+  `--self-check` 查的就是它。
+- **`--windowed` 下 `sys.stdout` 是 `None`**（不是"没输出"，是对象不存在）。任何库在
+  导入期碰一下 `sys.stdout.isatty()` 就会让程序在 `import` 阶段崩掉，连窗口都建不起来
+  ——mijiaAPI 的彩色日志正好这么干。`mihome/_stdio.py` 在包初始化时给 stdout/stderr
+  兜一个 devnull，`ensure_streams()`，别删。
+  这个坑很阴：**从终端跑没问题**（Windows 把控制台句柄继承给子进程），只有双击才崩。
+  崩溃时 PyInstaller 只弹一句英文 "Unhandled exception in script"，所以打包入口
+  （`scripts/build_exe.py` 生成的 `_launcher.py`）另外接住了异常，写
+  `<data>\logs\crash.log` 并弹一个中文提示框。
+- **子进程的标准输入句柄无效**。窗口化进程没有控制台，`subprocess` 继承到的是空句柄
+  （典型症状 `OSError: [WinError 6] 句柄无效`），所以所有 `subprocess.run/Popen` 都显式
+  传 `stdin=subprocess.DEVNULL`。
 
 ## 交互约定：滚轮只滚页面
 
@@ -340,9 +435,12 @@ Qt 的 ffmpeg 后端在 Windows 上**默认走 D3D11 硬件解码**，交给应�
 
 ### 打开页面不取流，点播放才连
 
-首帧要 4–6 秒（P2P 打洞 + 等一个 GOP），自动播等于让用户盯着黑屏等。所以打开详情页
-**不建立 RTSP 会话**：只在后台把 go2rtc 和本机地址准备好（实测 0.85 s，不占观看位、
-不推流），画面区停在一个播放键上。用户点下去才连 RTSP，加载态每秒刷一次「已等待 N 秒」。
+首帧要 4–6 秒（官方 go2rtc 构建的实测值；装了开播补丁约 2 秒，见下），自动播等于让
+用户盯着黑屏等。所以打开详情页**不建立 RTSP 会话**：只在后台把 go2rtc 和本机地址
+准备好（实测 0.85 s，不占观看位、不推流），画面区停在一个播放键上。用户点下去才连
+RTSP，加载态只写一句「加载中…」加一条流动的细条——**不写秒数、也不做百分比**。
+链路上没有一处能给出可靠的剩余量（等 IDR 的相位完全随机），编个数字只会在某一格
+上停住，看着比不写更让人以为卡死。
 
 控件状态机在 `ui/camera_view.py`：`idle → loading → playing ⇄ paused`，另有
 `released`（暂停闲置放掉连接）和 `error`。播放中右下角常驻一个半透明暂停键（鼠标在
@@ -358,53 +456,105 @@ Qt 的 ffmpeg 后端在 Windows 上**默认走 D3D11 硬件解码**，交给应�
 `scripts/measure_camera_startup.py` 把整条链路拆开（Xiaomi Smart Camera 3 / 069a01，
 2960×1666 HEVC，局域网）：
 
-| 阶段 | 耗时 | 能不能省 |
-|---|---|---|
-| go2rtc 子进程启动到 `/api` 就绪 | 0.85 s | 打开详情页就在后台起，点播放时不用等 |
-| 云端 `miss_get_vendor` 换票 | 0.65 s | **go2rtc 每开一路都要调一次**，可以自己预取后并行 |
-| MISS 握手 + `probe` 到首个 RTP 包 | 0.55 s | 省不掉 |
-| **等下一个 IDR** | **2.5–3.0 s** | 省不掉，见下 |
-| 177–251 KB 的 IDR 传完 + 解码出帧 | ~1.0 s | 换子码流能小一截，但画质就没了 |
-| 合计 | **≈6 s** | go2rtc 预启动后，点播放 ≈5 s |
+| 阶段 | 官方构建 | 开播补丁版 | 能不能省 |
+|---|---|---|---|
+| go2rtc 子进程启动到 `/api` 就绪 | 0.85 s | 0.85 s | 打开详情页就在后台起，点播放时不用等 |
+| 云端 `miss_get_vendor` 换票 | 0.65 s | 0.65 s | **go2rtc 每开一路都要调一次**，可以自己预取后并行 |
+| MISS 握手 + `probe` 到首个 RTP 包 | 0.55 s | 0.75 s | 补丁多一次 video start，多 0.2 s |
+| **等下一个 IDR** | **2.5–3.0 s** | **0** | 补丁把它消掉了，见下 |
+| 177–251 KB 的 IDR 传完 + 解码出帧 | ~1.0 s | ~0.7 s | 换子码流能小一截，但画质就没了 |
+| **点播放 → 出画面（实测 8 次）** | **4.8–6.3 s** | **1.85–3.15 s** | |
 
-关键在第三行：**摄像头每 3.05 秒才出一个 IDR**（实测 `[5.25, 8.29, 11.29]`，间隔
-3.04 / 3.00），而**会话起点那个 IDR 到不了消费者手里**——收到的最初 60 帧 POC 从 0 开始
+关键在第四行：**摄像头每 3.05 秒才出一个 IDR**（实测 `[5.25, 8.29, 11.29]`，间隔
+3.04 / 3.00），而**会话起点那个 IDR 到不了消费者手里**——`pkg/xiaomi/miss/producer.go`
+的 `Dial()` 是「先 `StartMedia()` 再 `probe()`」，probe 为了拿 VPS/SPS/PPS 会把开播那一包
+读走，而 IDR 切片和参数集恰好在同一个 access unit 里。于是收到的最初 60 帧 POC 从 0 开始
 却全是非关键帧，ffmpeg 只能一路报 `Could not find ref with POC 0/1/2…`，直到下一个 IDR
-才解得出画面。也就是说每次打开都要完整等一个 GOP。
+才解得出画面。也就是说**每次打开都要完整等一个 GOP**，而且随相位抖动（4.8–6.3 秒）。
 
 不是「谁先连谁独占」的错觉：让一路先占住生产者，后面接进来的第二、三、四路只要等
-**0.94 / 1.17 / 1.46 秒**（随机相位），只有**会话的第一路**固定等满 3 秒。把
-`probe()` 吃掉的那几包算进来就说得通了——go2rtc 为了拿 VPS/SPS 会先读掉开头若干包再交给
-消费者，而摄像头恰好把 IDR 放在最前面。
+**0.94 / 1.17 / 1.46 秒**（随机相位），只有**会话的第一路**固定等满 3 秒。
 
 所以米家 App「感觉秒开」不是因为它连得快，而是它**立刻显示上次的静止画面**，再在背后
-慢慢地出实时流。我们不垫旧画面（见下），只能老实等；3 秒那一截在客户端无法消除，真要
-消掉只有两条路：自己缓存关键帧（相当于自建一层 RTSP 代理），或者给 go2rtc 打补丁——
-都不划算。
+慢慢地出实时流。我们不垫旧画面（见下），那 3 秒只能从链路本身消掉——**已经消掉了**：
+`scripts/patches/go2rtc-keyframe.patch` 在 probe 之后把流停掉、150 ms 后重起一次
+（摄像头每次 video start 都从 IDR 开头），消费者第一包就能解码，补丁只有 12 行。
+
+### 开播补丁（可选，首帧 2 秒）
+
+`scripts/build_go2rtc.py` 自己编一版带补丁的 go2rtc：
+
+```bash
+.venv\Scripts\python.exe scripts\build_go2rtc.py
+```
+
+- 取上游快照 `990f4de`（验证过的那个）→ `git apply scripts/patches/go2rtc-keyframe.patch`
+  → 用 Go 1.27.3 编译（本机没有 Go 会自动下便携版到 `<data>/go/`，76 MB，只下一次）
+  → 装到 `<data>/go2rtc/go2rtc.exe`
+- 装之前把原来的官方构建留成 `go2rtc-official.exe`；**想回退把它改名回 `go2rtc.exe` 即可**，
+  两个脚本互不干扰
+- 实测 8 次：1.85 / 1.87 / 1.89 / 2.15 / 2.16 / 2.25 / 2.64 / 3.15 秒，均值 2.18；
+  远程（relay）路径同样受益，端到端 2.86–3.07 秒（多出来的是 relay 握手那 0.9 秒）
+- 代价：**这是一个自建二进制**。上游改了这段代码补丁会打不上，脚本会明确报错并提示手工改；
+  想跟进新版本得重跑一遍（补丁与 `producer.go` 的 `Dial()` 一一对应，改动面很小）。
+  上游哪天自己修了「probe 吃掉开播 IDR」，删掉补丁和这个脚本即可
+- 试过但**不行**的方案记在这里免得重走：把 probe 读到的包缓存起来在 `Start()` 里补发
+  （`Producer.cache`）。裸流里首包确实变成 IDR，但 Qt 端到端只到 4.7 秒且时灵时不灵——
+  补发是在 RTSP 还没 PLAY 完时写的，和建流竞争；而且老包的时间戳/POC 落后于追上来的活流，
+  ffmpeg 会直接跳过它继续等下一个 IDR
+
 
 ### 为什么不再垫上次的画面
 
 试过把每台摄像头最后一帧缩到 960 宽存成 JPEG（`ui/snapshots.py`、`<data>/snapshots/`）
 垫在画面区，让加载"看起来"秒开。但旧画面和实时的门口状态对不上，容易误导；既然改成
-用户主动点播放，把「已等待几秒」写清楚就够了。这套缓存已随 `ui/snapshots.py` 一起删掉。
+用户主动点播放，加载态如实说"在连"就够了（一行字 + 一条流动的细条）。这套缓存已随
+`ui/snapshots.py` 一起删掉。
 
 如果确实需要更快，只能从链路本身下手：`MIHOME_CAMERA_SUBTYPE=sd` 换子码流（IDR 从
 ~177 KB 降到 ~21 KB，画质明显下降，但**GOP 不会变短**），或者装 ffmpeg 让 go2rtc 转码
 成短 GOP 的 H.264（依赖多 80 MB、还要吃 CPU）。
 
+「闲置释放」那一档踩过同一个坑的变种：释放后本该是黑底 + 「闲置 N 分钟，连接已释放」。
+实际却是一张**静止的旧画面**加一个播放键、一句解释都没有——先是因为详情页拿
+`playbacks().release()` 收尾，而那个接口是给卡片墙用的硬重置（`stop()` +
+`release_player()` → 回到空态），刚摆好的释放态被抹掉了；接着拆会话期间漏出来的
+尾帧又落在空态底下（`_on_frame` 当时只挡 `paused` / `stopped`）。现在释放分支只放
+所有权和 go2rtc 会话、控件外观留给自己，`_on_frame` 也改成只在 `loading` / `playing`
+收帧，其余状态一律丢弃。
+
 
 **没装 go2rtc 时不会静默失败**：画面区域直接写「没有找到 go2rtc」，并给出安装命令。
 
-只装一次（7.7MB，MIT）：
+只装一次（7.7MB，MIT）——**官方构建，首帧 4.8–6.3 秒**：
 
 ```bash
 .venv\Scripts\python.exe scripts\install_go2rtc.py
 ```
 
-装到 `%LOCALAPPDATA%\MiHomePanel\go2rtc\go2rtc.exe`，也可以用环境变量
-`MIHOME_GO2RTC` 指向别的副本。脚本走 GitHub 的 **assets API**，不是
+想要首帧 2 秒就用上面的 `build_go2rtc.py` 编带补丁的版本；两个脚本都装到
+`%LOCALAPPDATA%\MiHomePanel\go2rtc\go2rtc.exe`，也可以用环境变量
+`MIHOME_GO2RTC` 指向别的副本。`install_go2rtc.py` 走 GitHub 的 **assets API**，不是
 `releases/download`——后者 302 到 `objects.githubusercontent.com`，本机网络下
 `github.com` 和几个常见镜像都不通，只有 `api.github.com` 可用。
+（`build_go2rtc.py` 取源码用的也是 `api.github.com` 的 zipball；这条不能带
+`Accept: application/octet-stream`，会回 415。）
+
+**查找顺序**（`core/camera.py::find_binary`）：显式指定 → `MIHOME_GO2RTC` →
+**程序目录**（`go2rtc/`、`tools/go2rtc/`）→ 数据目录 → `PATH`。程序目录排在前面是
+为了打包版：把 go2rtc 和 exe 装在一起，它跟着程序版本走，是默认项；数据目录那份
+是用户自己下载/编译的，要压过它就用环境变量。打包后 `__file__` 落在 `_internal`
+里，`parents[2]` 算回仓库根这条会失效，所以 `program_dirs()` 额外加了
+`sys.executable` 所在目录和 `sys._MEIPASS` 两个候选（PyInstaller onedir 把数据放
+`_internal`，Nuitka 放在 exe 旁边，两者覆盖）。`verify_camera.py` 第 [13] 项会伪造
+一个 frozen 布局守住这条。
+
+**打包成 exe 时**：go2rtc 是外部进程，不会被自动收集，得摆到安装目录的
+`go2rtc/go2rtc.exe`（`scripts/build_exe.py` 已经做了）。想让别人也拿到 2 秒，就得
+**发补丁后的那一份**（MIT 允许再分发，但要把它的许可证一并带上，脚本会取；致谢表里
+也如实登记了这处改动）；只发官方构建的话，别人装完是 4.8–6.3 秒——功能完整，只是慢。
+缺件时的提示会区分两种情况：源码运行让你跑 `install_go2rtc.py`，打包版直接告诉你该
+放到哪个路径（打包版没有 `scripts/` 目录）。细节见「打包成 exe」。
 
 详情页播放中，画面右下角有一个「独立窗口」键：把同一块画面控件弹到一个约 62% 屏宽、
 可四边（含右下角）缩放的无边框窗口。切换只做 `setParent` 和尺寸策略切换，
@@ -731,13 +881,14 @@ Qt 的 ffmpeg 后端在 Windows 上**默认走 D3D11 硬件解码**，交给应�
 | 项目 | 许可证 | 具体贡献 | 状态 |
 |---|---|---|---|
 | [Do1e/mijia-api](https://github.com/Do1e/mijia-api)（PyPI `mijiaAPI`） | GPL-3.0-or-later | 云端传输层：扫码登录、`gen_nonce` / RC4 签名与加解密、`serviceToken` 刷新、`/miotspec/*` 封装；`core/api.py` 和 `scripts/probe_geek_passcode.py` 直接调用。**它决定了本项目也必须是 GPL-3.0** | `已依赖` |
-| [huanyuejue/MiHome-Windows](https://github.com/huanyuejue/MiHome-Windows)（仓库内 `MiHome-Windows-0.5.0/`） | GPL-3.0 | 起点参考项目，详见「和参考项目的关系」：沿用单线程串行队列、子线程不直接回调 UI、乐观 UI + 版本号这三个判断，以及 16ms / 3s / 5min 定时器的分工。界面层完全重写。TODO 里的小爱文字指令、定时开关、托盘、桌面挂件也以它的功能清单为参照 | `已沿用` |
+| [huanyuejue/MiHome-Windows](https://github.com/huanyuejue/MiHome-Windows) | GPL-3.0 | 起点参考项目，详见「和参考项目的关系」：沿用单线程串行队列、子线程不直接回调 UI、乐观 UI + 版本号这三个判断，以及 16ms / 3s / 5min 定时器的分工。界面层完全重写。TODO 里的小爱文字指令、定时开关、托盘、桌面挂件也以它的功能清单为参照 | `已沿用` |
 | PySide6 / Qt for Python | LGPL-3.0 / GPL-2.0 / GPL-3.0 三选一 | 整个 UI 框架 | `已依赖` |
 | [Material Icons](https://github.com/google/material-design-icons) | Apache-2.0 | 顶栏「刷新」按钮的图标形状：`ui/main_window.py::_refresh_path` 按它的 `refresh` 字形（24×24 视口）逐段抄写坐标后缩放，形状未改。自绘两版（弧 + 斜线、环 + 三角箭头）在 20px 下都读不出来，理由见踩坑清单 | `已沿用` |
 | `qrcode`（BSD）、`Pillow`（MIT-CMU）、`pycryptodome`（BSD-2-Clause / Unlicense / MIT） | 见 `requirements.txt` 与各发行包 | 二维码渲染、图片处理、X25519（探测 `miss_get_vendor` 时用过，正式引入要显式声明）。经 pip 安装，不随本项目分发 | `已依赖`；X25519 那条是 `仅参考` |
 
-> `MiHome-Windows-0.5.0/` 只是随仓库保留的参考副本，它自己的 UI 依赖
-> `H1DDENADM1N/PySide6-SiliconUI`、`qtawesome` 等，本项目**没有**沿用，故不单独登记。
+> 参考副本**不在本仓库里**（它自己的 UI 依赖 `H1DDENADM1N/PySide6-SiliconUI`、`qtawesome`
+> 等，本项目**没有**沿用，故不单独登记）。本机留了一份在 `..\_refs\MiHome-Windows-0.5.0\`
+> 供核对致谢，已被 `.gitignore` 排除，不进版本库也不进发行包。
 > 设备能力数据取自小米官方 [MIoT-Spec / miot-spec.org](https://miot-spec.org) 与米家 App
 > 私有接口——它们是规范和数据服务、不是开源项目，在此注明来源。
 
@@ -750,7 +901,7 @@ P2P；`miss_get_vendor` 已用本项目凭据实测拿到 `vendor=4`（CS2）的
 
 | 项目 | 许可证 | 具体贡献 | 状态 |
 |---|---|---|---|
-| [AlexxIT/go2rtc](https://github.com/AlexxIT/go2rtc) | MIT | **实际采用的取流组件**：可选外部进程，把 P2P/CS2 码流转成本机 RTSP；程序只消费 `rtsp://127.0.0.1:<port>/cam_<did>`。由 `scripts/install_go2rtc.py` 下载到 `<data>/go2rtc/`，**不随仓库 / 发行包分发** | `已依赖` |
+| [AlexxIT/go2rtc](https://github.com/AlexxIT/go2rtc) | MIT | **实际采用的取流组件**：可选外部进程，把 P2P/CS2 码流转成本机 RTSP；程序只消费 `rtsp://127.0.0.1:<port>/cam_<did>`。由 `scripts/install_go2rtc.py` 下载官方构建，或 `scripts/build_go2rtc.py` 按 `scripts/patches/go2rtc-keyframe.patch` **打了 12 行本地补丁**（`pkg/xiaomi/miss/producer.go::Dial()`：probe 之后重起一次视频流，消掉「等一个 GOP」那 3 秒）自行编译到 `<data>/go2rtc/`，**不随仓库分发**（打包成安装包时可以随程序目录附带，见上文「打包成 exe 时」，需一并附上其许可声明） | `已依赖` |
 | [Reign9201/mihome-mac](https://github.com/Reign9201/mihome-mac) | GPL-3.0 | 协议蓝本：`core/src/` 的 X25519→ChaCha20、PPPP 帧、relay 状态机、MISS 认证与取流，以及 `docs/04`、`docs/06` 里的字节序和坑；**`chuangmi.camera.069a01` 由该项目真机验证出画**。本次只借判断、没有移植代码 | `仅参考` |
 | [DHJ999/mi-home](https://github.com/DHJ999/mi-home) | 注意：应用层**无开源许可**（GitHub 标 MIT 是误判，仓库只有 `LICENSE-go2rtc.txt`） | 只借接口约定、不抄码：`app/go2rtc.mjs` 的 `xiaomi://` 流源、`/api/streams`、`/api/xiaomi/recordings` 回放参数，以及云台按住连转、回放时间轴的交互 | `仅参考` |
 | [Songmanual/MijiaDeck](https://github.com/Songmanual/MijiaDeck) | GPL-3.0 | 同源 Python/PySide6 的 `camera_preview.py` / `camera_access.py` 集成形态；它的请求写法补上了我们缺的 `app_pubkey`，P2P 授权接口因此打通 | `仅参考` |

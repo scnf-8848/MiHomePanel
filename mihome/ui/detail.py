@@ -689,12 +689,15 @@ class DetailDialog(QDialog):
                 self._cam_popout.close()
         if state == CameraView.RELEASED:
             # 闲置释放：远程会话要一起放掉，否则观看位还占着。
-            # 由所有者统一收尾，顺带把播放器释放掉；不是所有者时退回原路径。
+            # 控件在 `_release_idle()` 里已经把播放器停掉、画面清空、文案摆好了，
+            # 这里只放"所有权 + go2rtc 会话"。不能走 `playbacks().release()`——
+            # 它还会 stop() + release_player()，把控件重置回空态，那句"闲置 N 分钟
+            # 连接已释放"就永远看不到，而且重置瞬间漏出来的尾帧会留在画面上。
             if self._cam_play_token:
                 timing.end_on(self._cam_play_token, "闲置释放")
                 self._cam_play_token = 0
-            if not playbacks().release(self._camera, "闲置释放"):
-                camera_service().release(self.state.did)
+            playbacks().forget(self._camera)
+            camera_service().release(self.state.did)
             if self._cam_remote:
                 self._cam_url = ""
         if state == CameraView.PLAYING:
@@ -770,7 +773,7 @@ class DetailDialog(QDialog):
         if self._camera is not None:
             if target_remote:
                 self._camera.show_progress(
-                    "局域网直连不可用", "正在尝试远程中继，可能需要几秒…"
+                    "局域网直连不可用", "正在尝试远程中继…"
                 )
             else:
                 self._camera.show_progress("远程中继不可用", "正在尝试局域网直连…")

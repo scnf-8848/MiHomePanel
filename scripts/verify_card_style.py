@@ -37,7 +37,7 @@ from PySide6.QtGui import QColor  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import QApplication, QComboBox  # noqa: E402
 
-from mihome.core import catalog  # noqa: E402
+from mihome.core import adapters, catalog  # noqa: E402
 from mihome.core.catalog import PROFILES  # noqa: E402
 from mihome.core.prefs import Prefs  # noqa: E402
 from mihome.core.spec import PropertySpec, ValueOption, parse_raw  # noqa: E402
@@ -984,12 +984,39 @@ def main() -> int:
                    for c in theme.CATEGORY_COLOR.values()))
 
     print("\n9) 挂灯模式：只给 yeelink.light.lamp22 开「无激活项」")
-    # 型号级适配（catalog.MODEL_ADAPTERS）：挂灯的 mode(2,5) 只用于写入，
+    # 型号级适配（mihome/core/adapters/）：挂灯的 mode(2,5) 只用于写入，
     # 手调亮度/色温后它不会变；真正生效的预设要从只读的 scene-mode(3,9) 读，
     # 0 = 无激活项。**别的灯不能套**——那是这台设备实测出来的行为，套错了会
     # 把别人的选中态弄坏。所以整件事只动"型号 → 属性"这一张表，通用逻辑零改动。
     check("适配表只有挂灯一条（没扩散到别的型号）",
           sorted(catalog.MODEL_ADAPTERS), ["yeelink.light.lamp22"])
+    # 表在 adapters 包里，catalog 只是转出；两边必须是同一对象，不然查表会各查各的
+    check_true("catalog.MODEL_ADAPTERS 就是 adapters 里那张表",
+               catalog.MODEL_ADAPTERS is adapters.MODEL_ADAPTERS)
+    check("每条适配都写清了 note", [m for m, a in adapters.MODEL_ADAPTERS.items()
+                                  if not a.note.strip()], [])
+    check("find_adapter 认已知型号", adapters.find_adapter("yeelink.light.lamp22").mode_active,
+          "scene-mode")
+    check("find_adapter 对未登记型号返回 None",
+          [adapters.find_adapter("dmaker.fan.p5"), adapters.find_adapter(None),
+           adapters.find_adapter("")], [None, None, None])
+    # 登记期的两道闸：写错型号格式、同一型号写两遍，都要当场报错
+    bad_models = []
+    for wrong in ("light", "yeelink.light.lamp22 ", "", "yeelink.light"):
+        try:
+            adapters.check_model(wrong)
+        except ValueError:
+            bad_models.append(wrong)
+    check("格式不对的型号键会被拒（品类名/空格/空/段数不足）", bad_models,
+          ["light", "yeelink.light.lamp22 ", "", "yeelink.light"])
+    dup = (("yeelink", {"yeelink.light.lamp22": adapters.ModelAdapter()}),
+           ("yeelink", {"yeelink.light.lamp22": adapters.ModelAdapter()}))
+    try:
+        adapters.collect(dup)
+        dup_raised = False
+    except ValueError as exc:
+        dup_raised = "登记了两次" in str(exc)
+    check_true("重复登记同一型号会被拒", dup_raised)
     spec = parse_raw(LAMP_RAW)
     lamp_card = catalog.build_card(spec, model="yeelink.light.lamp22")
     check("挂灯：scene-mode 被认成模式判据", lamp_card.mode_active.key, (3, 9))

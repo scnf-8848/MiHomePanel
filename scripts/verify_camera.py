@@ -13,6 +13,7 @@
   8) 暂停够久要放掉连接（``MIHOME_CAMERA_IDLE_SECONDS`` 调小来测），点播放会重新请求取流
   9) 断流原因解析：日志里新鲜的 ``cs2: EOF`` 要能认出来，旧的不算
  10) 崩溃留下的孤儿 go2rtc 要在下次启动时被清掉，且不误杀别的进程
+ 11) 打包兼容：伪造 frozen 布局，确认"exe 旁边的 go2rtc"能优先找到
 
 用法：
   .venv/Scripts/python.exe -X utf8 scripts/verify_camera.py
@@ -311,6 +312,46 @@ def main() -> int:
     check("不误杀非 go2rtc 进程", cleanup_stale() is None and not record.exists())
     check("本进程还活着", True, f"pid={os.getpid()}")
     shutil.rmtree(scratch, ignore_errors=True)
+
+    # [13] 打包兼容：exe 旁边的 go2rtc 要优先于数据目录那份
+    # 打包后模块在 _internal / _MEIPASS 里，靠 __file__ 算回仓库根会失效；
+    # 这里伪造一个 frozen 布局，确认查找顺序真的会把程序目录排在前面。
+    pack = Path(tempfile.mkdtemp(prefix="mihome-pack-"))
+    try:
+        import mihome.core.camera as cam_mod
+
+        bundled = pack / "go2rtc" / "go2rtc.exe"
+        bundled.parent.mkdir(parents=True, exist_ok=True)
+        bundled.write_bytes(b"")
+        had_frozen = hasattr(sys, "frozen")
+        saved_frozen = getattr(sys, "frozen", None)
+        saved_exe = sys.executable
+        saved_meipass = getattr(sys, "_MEIPASS", None)
+        try:
+            sys.frozen = True  # type: ignore[attr-defined]
+            sys.executable = str(pack / "MiHomePanel.exe")
+            sys._MEIPASS = str(pack / "_internal")  # type: ignore[attr-defined]
+            found = cam_mod.find_binary()
+            check("打包后能找到程序目录里的 go2rtc", found == bundled, f"{found}")
+            check(
+                "程序目录优先于数据目录",
+                cam_mod.program_dirs()[0] == pack,
+                f"{cam_mod.program_dirs()[0]}",
+            )
+            hint = cam_mod.missing_binary_hint()
+            check("打包版的缺件提示不再让人跑 scripts/", "scripts/" not in hint, hint)
+        finally:
+            sys.executable = saved_exe
+            if saved_meipass is None:
+                sys.__dict__.pop("_MEIPASS", None)
+            else:
+                sys._MEIPASS = saved_meipass  # type: ignore[attr-defined]
+            if had_frozen:
+                sys.frozen = saved_frozen  # type: ignore[attr-defined]
+            else:
+                sys.__dict__.pop("frozen", None)
+    finally:
+        shutil.rmtree(pack, ignore_errors=True)
 
     failed = [c for c in CHECKS if not c[1]]
     print(f"\n结果：{len(CHECKS) - len(failed)}/{len(CHECKS)} 通过")

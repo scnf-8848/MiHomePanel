@@ -351,7 +351,7 @@ class WallCameraController(QObject):
         self._live = False
         self._started = time.monotonic()
         if target_remote:
-            card.show_progress("局域网直连不可用", "正在尝试远程中继，可能需要几秒…")
+            card.show_progress("局域网直连不可用", "正在尝试远程中继…")
         else:
             card.show_progress("远程中继不可用", "正在尝试局域网直连…")
         self._token += 1

@@ -122,22 +122,81 @@ def probe_local(
     return False, elapsed, f"{tries} 个包均无应答"
 
 
+def _exe_name() -> str:
+    return "go2rtc.exe" if sys.platform == "win32" else "go2rtc"
+
+
+def program_dirs() -> list[Path]:
+    """程序自己能放资源的目录，按优先级排。
+
+    源码运行时只有一个：仓库根。**打包后不是这样**——PyInstaller 会把模块塞进
+    ``_internal``（onedir）或临时解包目录（onefile），``Path(__file__).parents[2]``
+    算回仓库根这条就失效了。要显式补上两个候选：exe 所在目录与其解包目录，否则
+    开发机上好好的，打包版一律"没有找到 go2rtc"。
+    """
+    dirs: list[Path] = []
+    if getattr(sys, "frozen", False):
+        try:
+            dirs.append(Path(sys.executable).resolve().parent)
+        except OSError:
+            pass
+    meipass = getattr(sys, "_MEIPASS", "")
+    if meipass:
+        dirs.append(Path(meipass))
+    dirs.append(Path(__file__).resolve().parents[2])
+
+    seen: set[str] = set()
+    out: list[Path] = []
+    for d in dirs:
+        key = os.path.normcase(str(d))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(d)
+    return out
+
+
 def find_binary(explicit: str | os.PathLike[str] | None = None) -> Path | None:
-    """按"显式指定 → 环境变量 → 数据目录 → 项目 tools → PATH"找 go2rtc。"""
-    exe = "go2rtc.exe" if sys.platform == "win32" else "go2rtc"
+    """按"显式指定 → 环境变量 → 程序目录 → 数据目录 → PATH"找 go2rtc。
+
+    程序目录排在数据目录前面：打包版把 go2rtc.exe 一起装在安装目录里，它跟着程序
+    版本走，是默认项；数据目录那份是用户自己下载/编译的，属于覆盖，要压过它请用
+    ``MIHOME_GO2RTC`` 或 ``explicit``。
+    """
+    exe = _exe_name()
     candidates: list[Path] = []
     if explicit:
         candidates.append(Path(explicit).expanduser())
     env = os.environ.get("MIHOME_GO2RTC", "").strip()
     if env:
         candidates.append(Path(env).expanduser())
+    for root in program_dirs():
+        candidates.append(root / "go2rtc" / exe)
+        candidates.append(root / "tools" / "go2rtc" / exe)
     candidates.append(paths.data_dir() / "go2rtc" / exe)
-    candidates.append(Path(__file__).resolve().parents[2] / "tools" / "go2rtc" / exe)
     for c in candidates:
         if c.is_file():
             return c
     found = shutil.which("go2rtc")
     return Path(found) if found else None
+
+
+def missing_binary_hint() -> str:
+    """缺 go2rtc 时该怎么说。
+
+    打包版没有 ``scripts/`` 目录，让用户"运行 install_go2rtc.py"是一句空话，
+    得改成"把它放到这个位置"。
+    """
+    if getattr(sys, "frozen", False):
+        target = program_dirs()[0] / "go2rtc" / _exe_name()
+        return (
+            f"没有找到 go2rtc。把 go2rtc 放到 {target}，"
+            "或设置环境变量 MIHOME_GO2RTC 指向它"
+        )
+    return (
+        "没有找到 go2rtc。运行 scripts/install_go2rtc.py 自动下载，"
+        "或设置环境变量 MIHOME_GO2RTC 指向 go2rtc.exe"
+    )
 
 
 def _port_free(port: int) -> bool:
@@ -181,6 +240,7 @@ def _process_image(pid: int) -> str:
             errors="replace",
             timeout=5,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            stdin=subprocess.DEVNULL,
         ).stdout
     except (OSError, subprocess.SubprocessError):
         return ""
@@ -207,6 +267,7 @@ def _command_line(pid: int) -> str:
             out = subprocess.run(
                 cmd, check=False, capture_output=True, text=True,
                 errors="replace", timeout=8, creationflags=flags,
+                stdin=subprocess.DEVNULL,
             ).stdout
         except (OSError, subprocess.SubprocessError):
             continue
@@ -223,7 +284,14 @@ def _kill_pid(pid: int) -> None:
     else:
         cmd = ["kill", "-9", str(pid)]
     try:
-        subprocess.run(cmd, check=False, capture_output=True, timeout=8, creationflags=flags)
+        subprocess.run(
+            cmd,
+            check=False,
+            capture_output=True,
+            timeout=8,
+            creationflags=flags,
+            stdin=subprocess.DEVNULL,
+        )
     except (OSError, subprocess.SubprocessError):
         pass
 
@@ -427,6 +495,7 @@ class Go2rtcRuntime:
             with open(self._log_path, "wb") as log:
                 self._proc = subprocess.Popen(
                     [str(self.binary), "-config", str(cfg)],
+                    stdin=subprocess.DEVNULL,
                     stdout=log,
                     stderr=subprocess.STDOUT,
                     cwd=str(self._workdir),
@@ -623,11 +692,7 @@ class CameraService:
 
         binary = find_binary()
         if binary is None:
-            raise CameraError(
-                "没有找到 go2rtc。运行 scripts/install_go2rtc.py 自动下载，"
-                "或设置环境变量 MIHOME_GO2RTC 指向 go2rtc.exe",
-                "no_binary",
-            )
+            raise CameraError(missing_binary_hint(), "no_binary")
 
         auth = getattr(client.raw(), "auth_data", {}) or {}
         user_id = str(auth.get("userId", "") or "")
@@ -793,6 +858,8 @@ __all__ = [
     "Go2rtcRuntime",
     "find_binary",
     "is_camera",
+    "missing_binary_hint",
     "probe_local",
+    "program_dirs",
     "shared",
 ]

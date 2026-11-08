@@ -1,13 +1,14 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""摄像头详情页截图（空态 + 播放态 + 释放态 + 错误态）。
+"""摄像头详情页截图（空态 + 加载态 + 播放态 + 释放态 + 错误态）。
 
 主程序的 ``shot_ui.py`` 截的是灯品类，不会触发取流；这条单独跑，用来检查画面卡片
 的尺寸、圆角、状态文字和按钮位置。
 
 打开详情页**不取流**，所以第一张截的是空态：底色 + 中央播放键 + 一句提示。然后模拟
-点一下播放，等首帧到达后截播放态：右下角的暂停键。第三张是"闲置释放"——暂停后把
-连接放掉，画面区变成一句提示 + 播放键（点一下会重新取流）；第四张是错误态，
-用来核对"观看位已满"这类长文案有没有压到重试按钮上。
+点一下播放，先截加载态（「加载中…」+ 流动细条，不写秒数），等首帧到达后截播放态：
+右下角的暂停键。第四张是"闲置释放"——暂停后把连接放掉，画面区变成一句提示 + 播放键
+（点一下会重新取流）；第五张是错误态，用来核对"观看位已满"这类长文案有没有压到
+重试按钮上。
 
 用法：.venv/Scripts/python.exe -X utf8 scripts/shot_camera.py
 """
@@ -70,8 +71,9 @@ def main() -> int:
         print(f"打开 {cam.name} / {cam.node.model}")
         dlg = DetailDialog(cam, win.store, win.palette_ref, win, icons=win.icon_provider)
         dlg.show()
-        QTimer.singleShot(600, shoot_idle)
 
+        # 必须先把回调定义出来再调度：这两个函数是 look() 的局部名，若在定义之前
+        # 引用，闭包拿到的还是未绑定的局部变量，定时器一触发就 UnboundLocalError。
         def shoot_idle() -> None:
             """空态：还没点播放，画面区只有一个播放键。"""
             view = dlg._camera
@@ -86,7 +88,18 @@ def main() -> int:
             print(f"已保存 camera_detail.png（空态）  {pix.width()}x{pix.height()}")
             view.toggle()  # 点播放
             waited["ms"] = 0
+            QTimer.singleShot(300, shoot_loading)
             QTimer.singleShot(400, wait_playing)
+
+        def shoot_loading() -> None:
+            """加载态：一句「加载中…」加一条流动的细条，不给秒数。"""
+            view = dlg._camera
+            if view.state != view.LOADING:
+                return
+            app.processEvents()
+            pix = dlg.grab()
+            pix.save(str(OUT / "camera_loading.png"))
+            print(f"已保存 camera_loading.png（加载态）  {pix.width()}x{pix.height()}")
 
         def wait_playing() -> None:
             view = dlg._camera
@@ -110,8 +123,13 @@ def main() -> int:
             # 暂停 → 主动触发一次闲置释放，截"连接已释放"的样子
             view.toggle()
             view._idle.stop()
+            print(f"  暂停后状态 {view.state}")
             view._release_idle()
             app.processEvents()
+            print(
+                f"  释放后 状态 {view.state}  残留画面 {view._image is not None}"
+                f"  提示 {view._hint!r}"
+            )
             pix = dlg.grab()
             pix.save(str(OUT / "camera_released.png"))
             print(f"已保存 camera_released.png（闲置释放）  {pix.width()}x{pix.height()}")
@@ -123,6 +141,8 @@ def main() -> int:
             print(f"已保存 camera_error_state.png（错误态）  {pix.width()}x{pix.height()}")
             dlg.close()
             app.quit()
+
+        QTimer.singleShot(600, shoot_idle)
 
     QTimer.singleShot(800, look)
     return app.exec()

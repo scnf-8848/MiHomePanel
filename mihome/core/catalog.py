@@ -24,6 +24,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
+from .adapters import MODEL_ADAPTERS, ModelAdapter, find_adapter
 from .spec import ActionSpec, DeviceSpec, EventSpec, PropertySpec, squash, unit_symbol
 
 # ---------------------------------------------------------------------------
@@ -536,43 +537,19 @@ INTERNAL_SERVICES = {
     "offline-data",
 }
 
-#: 型号级适配：只按 ``DeviceNode.model`` 精确命中，不做任何模糊匹配。
-@dataclass(frozen=True, slots=True)
-class ModelAdapter:
-    """**型号级**适配记录：只描述"这台机器多读哪个属性、模式看哪个属性"。
-
-    一定要按设备节点上报的 model 精确命中——不要按品类（light）泛化，
-    也不要靠属性名去猜设备行为。没登记的型号完全走默认路径。
-    """
-
-    #: 额外参与轮询的属性名（只读、不渲染）；空 = 不追加任何请求
-    extra: tuple[str, ...] = ()
-    #: 模式激活判据用的属性名；空 = 仍用 ``mode``(2,5) 自己的值（默认行为）
-    mode_active: str = ""
-
-
-#: 型号级适配表（唯一注册处）。
-#:
-#: 键是设备节点上报的型号（``DeviceNode.model``，如 ``yeelink.light.lamp22``），
-#: 必须精确匹配、点分形式；值是一条 ``ModelAdapter`` 记录。
-#:
-#: **新增一个型号适配 = 在下面加一条记录**，不需要改任何判断逻辑：
-#:   1. 加 ``"型号": ModelAdapter(extra=("属性名",), mode_active="属性名")``；
-#:   2. ``build_card(model=...)`` 会把它解析进 ``CardSpec.extra`` / ``CardSpec.mode_active``；
-#:   3. store 的 ``_card_props`` 自动把 ``extra`` 并入轮询与寻址登记；
-#:   4. 界面统一用 ``st.mode_active_value()`` 取值，不要自己查 ``values``。
-#:
-#: 安全退化：属性在 spec 里找不到、或运行时读不到，``extra`` / ``mode_active``
-#: 就是空的，一切回到默认行为（模式高亮按 ``mode``(2,5)），不报错、不空高亮。
-MODEL_ADAPTERS: dict[str, ModelAdapter] = {
-    # 米家显示器挂灯 1S：``scene-mode``(3,9) 是"当前实际生效的预设"，
-    # 0 = 无激活项。它会被任何亮度/色温写入清 0，所以只读来当判据；
-    # 写入仍然走 ``mode``(2,5)。
-    "yeelink.light.lamp22": ModelAdapter(
-        extra=("scene-mode",),
-        mode_active="scene-mode",
-    ),
-}
+# ---------------------------------------------------------------------------
+# 型号级适配
+# ---------------------------------------------------------------------------
+# 规则本身在 ``mihome/core/adapters/``：一个厂商一个文件，一条型号一条记录，
+# 增删改都只动那个包，这里不用变。消费链路仍是四步：
+#
+#   1. ``find_adapter(model)`` 精确命中型号（查不到就整条跳过）；
+#   2. 命中的规则解析进 ``CardSpec.extra`` / ``CardSpec.mode_active``；
+#   3. store 的 ``_card_props`` 把 ``extra`` 并入轮询与寻址登记；
+#   4. 界面统一用 ``st.mode_active_value()`` 取值，不自己拼 siid/piid。
+#
+# 属性在 spec 里找不到、或运行时读不到，``extra`` / ``mode_active`` 就是空的，
+# 一切回到默认行为（模式高亮按 ``mode``(2,5)），不报错、不空高亮。
 
 # 属性名里出现这些词，基本是调试/参数，不暴露
 _INTERNAL_NAME_HINTS = (
@@ -828,9 +805,9 @@ def build_card(
 
     card.advanced = _advanced(spec, card)
 
-    # 型号级适配：**精确命中 model 字符串**才生效（规则见 MODEL_ADAPTERS 的注释）。
+    # 型号级适配：**精确命中 model 字符串**才生效（规则在 mihome/core/adapters/）。
     # 属性名在 spec 里找不到就当作没登记，安全退化到默认行为。
-    adapter = MODEL_ADAPTERS.get(model) if model else None
+    adapter = find_adapter(model)
     if adapter is not None:
         for name in adapter.extra:
             found = spec.find_all(name)
@@ -979,16 +956,19 @@ def coverage(card: CardSpec, spec: DeviceSpec) -> dict[str, int]:
 
 
 __all__ = [
+    "GENERIC",
+    "MODEL_ADAPTERS",
+    "PROFILES",
+    "SLOTS",
     "BoundControl",
     "CardSpec",
     "CategoryProfile",
     "Control",
     "Gang",
-    "GENERIC",
-    "PROFILES",
-    "SLOTS",
+    "ModelAdapter",
     "build_card",
     "coverage",
+    "find_adapter",
     "format_value",
     "gang_label",
     "known_categories",
