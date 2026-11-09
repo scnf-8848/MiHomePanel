@@ -217,6 +217,29 @@ def _window_checks(app: QApplication) -> None:
         check("叫回来恢复 3 秒一轮",
               win._poll_timer.interval() == POLL_MS)  # noqa: SLF001
 
+        # -- 多消费者：窗口不能盖掉别人要的频率 --------------------------
+        # 这是 poll_demand 这一层存在的**唯一理由**。将来桌面挂件要 1 秒时，
+        # 窗口切后台不能把它顶回 15 秒。
+        win.poll_demand.set("widget", 1000, "桌面挂件（假）")
+        check("别人要 1 秒时立刻按 1 秒跑",
+              win._poll_timer.interval() == 1000,  # noqa: SLF001
+              f"{win._poll_timer.interval()}ms")  # noqa: SLF001
+        win.close()  # 收进托盘 = 窗口自己退到 15 秒档
+        app.processEvents()
+        check("窗口收进托盘也顶不掉挂件的 1 秒",
+              win._poll_timer.interval() == 1000,  # noqa: SLF001
+              f"{win._poll_timer.interval()}ms")  # noqa: SLF001
+        win.poll_demand.clear("widget")
+        check("撤掉挂件后回到窗口自己的 15 秒",
+              win._poll_timer.interval() == POLL_HIDDEN_MS,  # noqa: SLF001
+              f"{win._poll_timer.interval()}ms")  # noqa: SLF001
+        win.show_from_tray()
+        app.processEvents()
+        check("叫回来后仍是 3 秒", win._poll_timer.interval() == POLL_MS)  # noqa: SLF001
+        check("事件轮询表存在但没人要时是停的",
+              win.poll_events.interval_ms is None,  # noqa: SLF001
+              str(win.poll_events.interval_ms))  # noqa: SLF001
+
         # 关掉偏好之后，关闭按钮就是退出。
         # 这里要盯的是"程序真的退"，不是"清理跑过"：托盘把
         # quitOnLastWindowClosed 关了，只 shutdown + accept 会让窗口消失、进程

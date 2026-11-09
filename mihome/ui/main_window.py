@@ -41,6 +41,7 @@ from ..core.api import Client
 from ..core.icons import IconCache
 from ..core.jobs import SerialWorker
 from ..core.prefs import Prefs
+from ..core.poll_demand import PollDemandBoard
 from ..core.store import Store
 from . import theme, tooltip
 from .chrome import DimOverlay, TitleBar, WindowFrame, exec_with_dim_click
@@ -270,12 +271,23 @@ class MainWindow(QMainWindow):
         self.btn_refresh.clicked.connect(self._reload)
         self.btn_theme.clicked.connect(self.toggle_theme)
 
+        # 轮询频率不由这里直接拍：窗口只登记"我现在要 3 秒还是 15 秒"，
+        # 由 ``poll_demand`` 取最严的那份（将来的挂件、自动化各自登记一条）。
+        self.poll_demand = PollDemandBoard("属性轮询", idle_ms=POLL_MS)
+        #: 事件轮询（``/miotspec/event/get``）的登记表。**现在还没有消费者**，
+        #: 所以 ``idle_ms=None`` = 不轮询、不起请求。将来自动化要读事件时，
+        #: 由它自己 ``self.poll_events.set("automation", 3000, "自动化规则")``，
+        #: 接线照抄 ``_on_poll_interval`` 那三行即可，不用改这里的结构。
+        self.poll_events = PollDemandBoard("事件轮询", idle_ms=None)
+
         self._drain_timer = QTimer(self)
         self._drain_timer.timeout.connect(self._drain)
         self._drain_timer.start(DRAIN_MS)
 
         self._poll_timer = QTimer(self)
         self._poll_timer.timeout.connect(self._poll)
+        self.poll_demand.subscribe(self._on_poll_interval)
+        self.poll_demand.set("window", POLL_MS, "窗口可见")
         self._poll_timer.start(POLL_MS)
 
         self._topo_timer = QTimer(self)
@@ -520,24 +532,41 @@ class MainWindow(QMainWindow):
             self.store.poll()
 
     def _apply_poll_mode(self) -> None:
-        """按"看不看得见"选轮询频率，回到前台时立刻补一轮。
+        """按"看不看得见"登记属性轮询的需求，回到前台时立刻补一轮。
 
         判据是 ``isVisible() and not isMinimized()``：收进托盘（``hide()``）和
         最小化到任务栏都是"看不见"，开机直接进托盘（从没 show 过）同样走降频档。
-        降频只动 ``_poll_timer`` 的间隔，3 秒那套请求/失败退避逻辑一行没改。
+        降频只动定时器的间隔，请求闸门与失败退避那套逻辑一行没改。
 
-        ``setInterval`` 会把正在跑的定时器重新计时——正是想要的：切到后台时从
-        头数 15 秒，切回前台时立刻归零并补一次 ``poll``，所以第一眼不会看到旧值。
+        这里**只管登记**，不碰定时器：定时器由 :meth:`_on_poll_interval` 按
+        "所有需求里最严的那条"来设。将来挂件 / 自动化各报一条，就不会互相覆盖。
         """
-        timer = getattr(self, "_poll_timer", None)
-        if timer is None:  # 构造期间（窗口标志变化会先来一次 changeEvent）
+        if getattr(self, "poll_demand", None) is None:  # 构造期间
             return
         active = self.isVisible() and not self.isMinimized()
-        ms = POLL_MS if active else POLL_HIDDEN_MS
-        if timer.interval() != ms:
-            timer.setInterval(ms)
+        self.poll_demand.set(
+            "window",
+            POLL_MS if active else POLL_HIDDEN_MS,
+            "窗口可见" if active else "窗口在托盘 / 最小化",
+        )
         if active:
             self._poll()
+
+    def _on_poll_interval(self, ms: int | None) -> None:
+        """需求表算出新间隔时调这里。``None`` = 没人要，停表。"""
+        timer = getattr(self, "_poll_timer", None)
+        if timer is None:
+            return
+        if ms is None:
+            timer.stop()
+            return
+        # ``setInterval`` 会把正在跑的定时器重新计时——正是想要的：切到后台时从
+        # 头数 15 秒，切回前台时立刻归零，配一次 ``poll`` 所以第一眼不会看到旧值。
+        # 值没变时需求表不会回调（见 ``PollDemandBoard._refresh``），所以不会互相重置。
+        if timer.interval() != ms:
+            timer.setInterval(ms)
+        if not timer.isActive():
+            timer.start()
 
     def _refresh_topology(self) -> None:
         if not self.store.loading and self.store.devices:

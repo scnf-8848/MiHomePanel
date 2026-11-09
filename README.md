@@ -197,7 +197,8 @@ dist\MiHomePanel\MiHomePanel.exe --probe-camera --rounds 3 # 冷启动三次看�
   操作电脑。设计草案与落地顺序都在 TODO 里
 - **多账号切换**、**排序页改版**
 - **桌面挂件**（复用现有卡片组件）
-- 门锁开锁记录、人体触发这类**事件**：规格里有 `events`，但云端没有查到可用的拉取接口
+- 门锁开锁记录、人体触发这类**事件**：接口已经找到了（`/miotspec/event/get`），但**功能还没做**；
+  同理，与米家 App 自动化的互通（读自动化列表、发"虚拟事件"触发自动化）也停在调研阶段
 - **局域网直连**（miIO / MIoT LAN）：**明确不做**。虽然能把响应压到几十毫秒，但要按设备型号
   各写一套本地会话，换台设备就失效——装到别人家里大部分设备都会失灵，不划算
 - 摄像头**云台控制**（音频与禁音按钮已完成）
@@ -284,10 +285,11 @@ docs            UI 规范与开发文档
 
 `docs/reference/mijia-geek-login-code.md` 第 8 节的资料表同样属于致谢范围，登记在此免得漏：
 
-- [eyaeya/xiaomi-central-hub-gateway-cli](https://github.com/eyaeya/xiaomi-central-hub-gateway-cli)（GPL-3.0）：云端取址 / 取码 RPC 契约
+- [eyaeya/xiaomi-central-hub-gateway-cli](https://github.com/eyaeya/xiaomi-central-hub-gateway-cli)（GPL-3.0）：云端取址 / 取码 RPC 契约；极客版节点目录里的 `deviceInput` 事件语义（`did/siid/eiid + arguments` 过滤）
 - [ChishFoxcat/MIJIA_GEEK](https://github.com/ChishFoxcat/MIJIA_GEEK)（无 LICENSE）：油猴脚本抓包重放思路
 - [609293964/MIJIA_GEEK-for-fnos](https://github.com/609293964/MIJIA_GEEK-for-fnos)（无 LICENSE）：飞牛版 HAR 自动解析
 - [weieast1314/oh-my-sage](https://github.com/weieast1314/oh-my-sage) / [allocnode/oh-my-sage](https://github.com/allocnode/oh-my-sage)（均 MIT）：网关本地协议与「常驻服务只登录一次」
+- `docs/reference/mijia-automation-events.md` 第 10 节的资料表（虚拟事件用法、`GetSceneList` 抓包整理）同样在此致谢；其中 `imkero.net` 与 `phuker.github.io` 是个人博客文章，`tsight.io` 是分析文章，**只取事实、不抄码**
 - 小米官方 MIoT-Spec RPC 文档、`asmslight.com` 操作路径：非开源项目，仅作资料
 
 `docs/reference/drag-sort-spec.md` 是用户提供的《拖动排序实现方案》行为契约，原始出处

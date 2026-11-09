@@ -40,7 +40,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from mihome.core.api import Client  # noqa: E402
+from mihome.core.api import Client
 
 SCENE_LIST = "/appgateway/miot/appsceneservice/AppSceneService/GetSceneList"
 EVENT_GET = "/miotspec/event/get"
@@ -91,7 +91,11 @@ def _action_text(a: dict) -> str:
     dev = str(pj.get("device_name") or "")
     val = pj.get("value")
     if cmd == "set_properties" and isinstance(val, list):
-        props = "、".join(f"{p.get('siid')}.{p.get('piid')}={p.get('value')}" for p in val if isinstance(p, dict))
+        props = "、".join(
+            f"{p.get('siid')}.{p.get('piid')}={p.get('value')}"
+            for p in val
+            if isinstance(p, dict)
+        )
         return f"{dev} 设属性 {props}"
     if cmd == "action" and isinstance(val, dict):
         args = [x.get("value") for x in (val.get("in") or []) if isinstance(x, dict)]
@@ -123,7 +127,9 @@ def _hub_did(api) -> str:
     """名字带「中枢网关」或型号是 ``xiaomi.gateway.hub1`` 的那台。"""
     for home in api.get_homes_list():
         for dev in api._get_devices_list(str(home.get("id"))):
-            if str(dev.get("model")) == "xiaomi.gateway.hub1" or "中枢网关" in str(dev.get("name") or ""):
+            if str(dev.get("model")) == "xiaomi.gateway.hub1" or "中枢网关" in str(
+                dev.get("name") or ""
+            ):
                 return str(dev.get("did") or "")
     return ""
 
@@ -131,12 +137,14 @@ def _hub_did(api) -> str:
 def _emit(api, did: str, name: str) -> tuple[bool, float, str]:
     t0 = time.perf_counter()
     try:
-        res = api.run_action({
-            "did": did,
-            "siid": VIRTUAL_SERVICE,
-            "aiid": VIRTUAL_ACTION,
-            "in": [name],
-        })
+        res = api.run_action(
+            {
+                "did": did,
+                "siid": VIRTUAL_SERVICE,
+                "aiid": VIRTUAL_ACTION,
+                "in": [name],
+            }
+        )
     except Exception as exc:  # noqa: BLE001
         return False, time.perf_counter() - t0, f"{type(exc).__name__}: {exc}"
     ms = (time.perf_counter() - t0) * 1000
@@ -145,14 +153,22 @@ def _emit(api, did: str, name: str) -> tuple[bool, float, str]:
     return False, ms, json.dumps(res, ensure_ascii=False)[:200]
 
 
-def _last_events(api, refs: list[tuple[str, int, int]]) -> dict[tuple[str, int, int], tuple[object, int]]:
+def _last_events(
+    api, refs: list[tuple[str, int, int]]
+) -> dict[tuple[str, int, int], tuple[object, int]]:
     """``{(did, siid, eiid): (参数列表, updateTime)}``；读不到的条目直接跳过。"""
     got: dict[tuple[str, int, int], tuple[object, int]] = {}
     if not refs:
         return got
-    rows = api._request(EVENT_GET, {"params": [{"did": d, "siid": s, "eiid": e} for d, s, e in refs]})
+    rows = api._request(
+        EVENT_GET, {"params": [{"did": d, "siid": s, "eiid": e} for d, s, e in refs]}
+    )
     for row in rows or []:
-        key = (str(row.get("did") or ""), int(row.get("siid") or 0), int(row.get("eiid") or 0))
+        key = (
+            str(row.get("did") or ""),
+            int(row.get("siid") or 0),
+            int(row.get("eiid") or 0),
+        )
         if row.get("code") not in (0, None):
             continue
         try:
@@ -167,11 +183,21 @@ def _fmt_args(args: object) -> str:
     if isinstance(args, list):
         if not args:
             return "(无参数)"
-        return "、".join(f"{a.get('piid')}={a.get('value')!r}" for a in args if isinstance(a, dict))
+        return "、".join(
+            f"{a.get('piid')}={a.get('value')!r}" for a in args if isinstance(a, dict)
+        )
     return str(args)
 
 
 # -- 子命令 ---------------------------------------------------------------
+def _is_manual(scene: dict) -> bool:
+    """能不能在智能页手动点/语音执行：看触发器里有没有 ``user.click``。"""
+    for t in (scene.get("scene_trigger") or {}).get("triggers") or []:
+        if str(t.get("key")) == "user.click":
+            return True
+    return False
+
+
 def cmd_list(_args) -> int:
     client = Client()
     if not client.available:
@@ -180,15 +206,24 @@ def cmd_list(_args) -> int:
     api = client.raw()
     for hid, owner, hname in _homes(api):
         scenes = _scenes(api, hid, owner)
-        autos = [s for s in scenes if s.get("type") == 1]
-        manual = [s for s in scenes if s.get("type") == 0]
-        print(f"\n=== 家庭「{hname}」(home_id={hid})：自动化 {len(autos)} 条 / 手动场景 {len(manual)} 条")
-        for tag, group in (("自动化", autos), ("手动", manual)):
+        # ``type`` 字段不能当"手动 / 自动化"的判据（0 和 1 两组里都混着两种），
+        # 可靠判据是触发器里有没有 ``user.click``——这类正好等于 GetSimpleSceneList 那批
+        manual = [s for s in scenes if _is_manual(s)]
+        autos = [s for s in scenes if not _is_manual(s)]
+        print(
+            f"\n=== 家庭「{hname}」(home_id={hid})："
+            f"自动化 {len(autos)} 条 / 可手动执行 {len(manual)} 条（共 {len(scenes)}）"
+        )
+        for tag, group in (("自动化", autos), ("可手动", manual)):
             for s in group:
                 flags = "启用" if s.get("enable") else "停用"
                 print(f"\n[{tag}·{flags}] {s.get('name')}")
                 trig = (s.get("scene_trigger") or {}).get("triggers") or []
-                mode = "任一条件" if (s.get("scene_trigger") or {}).get("express") == 1 else "全部条件"
+                mode = (
+                    "任一条件"
+                    if (s.get("scene_trigger") or {}).get("express") == 1
+                    else "全部条件"
+                )
                 for t in trig:
                     print(f"    触发（{mode}）: {_trigger_text(t)}")
                 for c in (s.get("scene_condition") or {}).get("conditions") or []:
@@ -210,7 +245,9 @@ def cmd_events(args) -> int:
     refs = _event_refs(api, hid, owner)
     hub = _hub_did(api)
     if hub:
-        refs.setdefault((hub, VIRTUAL_SERVICE, VIRTUAL_EVENT), f"{hub} / 中枢网关虚拟事件")
+        refs.setdefault(
+            (hub, VIRTUAL_SERVICE, VIRTUAL_EVENT), f"{hub} / 中枢网关虚拟事件"
+        )
     if not refs:
         print("这个家庭的自动化里没有事件类触发源，也没有找到中枢网关")
         return 1
@@ -220,7 +257,10 @@ def cmd_events(args) -> int:
     print(f"家庭「{hname}」，盯 {len(keys)} 个事件源，每 {args.interval:.2f}s 读一次：")
     for k in keys:
         print(f"  {k[0]:<24} {k[1]}.{k[2]:<5} {refs[k]}")
-    print("\n按 Ctrl+C 结束。去按一下实体按键、开一次门锁，或从米家 App 触发一个虚拟事件。\n", flush=True)
+    print(
+        "\n按 Ctrl+C 结束。去按一下实体按键、开一次门锁，或从米家 App 触发一个虚拟事件。\n",
+        flush=True,
+    )
 
     started = time.monotonic()
     seen: dict[tuple[str, int, int], int] = {}
@@ -241,15 +281,20 @@ def cmd_events(args) -> int:
                 before = seen.get(key)
                 if before is None:
                     seen[key] = ts
-                    print(f"{at:7.2f}s  基线  {refs[key]}  ← {_fmt_args(ev_args)}  "
-                          f"（云端戳 {time.strftime('%H:%M:%S', time.localtime(ts)) if ts else '无'}）")
+                    print(
+                        f"{at:7.2f}s  基线  {refs[key]}  ← {_fmt_args(ev_args)}  "
+                        f"（云端戳 {time.strftime('%H:%M:%S', time.localtime(ts)) if ts else '无'}）"
+                    )
                     continue
                 if ts <= before:
                     continue
                 seen[key] = ts
                 age = (time.time() - ts) if ts else 0.0
-                print(f"{at:7.2f}s  变化  {refs[key]}  → {_fmt_args(ev_args)}   "
-                      f"云端戳 +{age:.2f}s   往返 {rtt:.0f}ms", flush=True)
+                print(
+                    f"{at:7.2f}s  变化  {refs[key]}  → {_fmt_args(ev_args)}   "
+                    f"云端戳 +{age:.2f}s   往返 {rtt:.0f}ms",
+                    flush=True,
+                )
             time.sleep(args.interval)
     except KeyboardInterrupt:
         print("\n（手动中断）")
@@ -269,7 +314,9 @@ def cmd_emit(args) -> int:
         print("可以用 --did 指定承载中枢功能的那台设备")
         return 1
     ok, ms, msg = _emit(api, hub, args.name)
-    print(f"{'成功' if ok else '失败'}：did={hub} 事件名「{args.name}」 往返 {ms:.0f}ms  {msg}")
+    print(
+        f"{'成功' if ok else '失败'}：did={hub} 事件名「{args.name}」 往返 {ms:.0f}ms  {msg}"
+    )
     return 0 if ok else 1
 
 
@@ -295,9 +342,16 @@ def cmd_latency(args) -> int:
     deadline = t0 + args.timeout
     while time.perf_counter() < deadline:
         got = _last_events(api, [key]).get(key)
-        if got and got[0] and str((got[0] or [{}])[0].get("value")) == name and got[1] > before:
-            print(f"云端可见：发出后 {(time.perf_counter() - t0) * 1000:.0f}ms"
-                  f"（查询间隔 {args.interval:.2f}s，所以真实值在两者之间）")
+        if (
+            got
+            and got[0]
+            and str((got[0] or [{}])[0].get("value")) == name
+            and got[1] > before
+        ):
+            print(
+                f"云端可见：发出后 {(time.perf_counter() - t0) * 1000:.0f}ms"
+                f"（查询间隔 {args.interval:.2f}s，所以真实值在两者之间）"
+            )
             return 0
         time.sleep(args.interval)
     print(f"{args.timeout:.0f}s 内没读到这次事件，检查网关在线状态")
@@ -312,8 +366,12 @@ def main() -> int:
     p_list.set_defaults(func=cmd_list)
 
     p_ev = sub.add_parser("events", help="盯事件变化（只读）")
-    p_ev.add_argument("--interval", type=float, default=0.5, help="轮询间隔，秒（默认 0.5）")
-    p_ev.add_argument("--seconds", type=float, default=0.0, help="跑多久，秒（0=一直跑）")
+    p_ev.add_argument(
+        "--interval", type=float, default=0.5, help="轮询间隔，秒（默认 0.5）"
+    )
+    p_ev.add_argument(
+        "--seconds", type=float, default=0.0, help="跑多久，秒（0=一直跑）"
+    )
     p_ev.add_argument("--did", default="", help="只看某台设备的事件")
     p_ev.set_defaults(func=cmd_events)
 
@@ -323,8 +381,12 @@ def main() -> int:
     p_emit.set_defaults(func=cmd_emit)
 
     p_lat = sub.add_parser("latency", help="量发出→云端可见的延迟（写一个唯一名字）")
-    p_lat.add_argument("--interval", type=float, default=0.2, help="查询间隔，秒（默认 0.2）")
-    p_lat.add_argument("--timeout", type=float, default=6.0, help="最长等多久，秒（默认 6）")
+    p_lat.add_argument(
+        "--interval", type=float, default=0.2, help="查询间隔，秒（默认 0.2）"
+    )
+    p_lat.add_argument(
+        "--timeout", type=float, default=6.0, help="最长等多久，秒（默认 6）"
+    )
     p_lat.add_argument("--did", default="", help="中枢网关 did（默认自动找）")
     p_lat.set_defaults(func=cmd_latency)
 
