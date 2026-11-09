@@ -1,21 +1,35 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""【临时探针】摄像头取流计时 —— 用完可以整个文件删掉。
+"""摄像头取流计时日志 —— 诊断用，**默认关闭**。
 
 这不是功能代码，只在取流链路上打时间点，用来在真实网络里判断首帧到底卡在哪。
-不打点的时候（``on == False``）所有函数立刻返回，不建线程、不建文件。
+关着的时候（``on == False``）所有函数立刻返回，不建线程、不写文件，也不采网络环境，
+所以发布版默认没有开销；要排查时开一次环境变量复现即可。
 
 开关
 ----
-环境变量 ``MIHOME_CAMERA_TIMING``，**默认开启**：
+环境变量 ``MIHOME_CAMERA_TIMING``，**默认关闭**：
 
-* ``MIHOME_CAMERA_TIMING=0``（或 ``false`` / ``no`` / ``off``）关掉
+* ``MIHOME_CAMERA_TIMING=1``（或 ``true`` / ``yes`` / ``on``）打开
 * ``MIHOME_CAMERA_TIMING_PATH=<文件>`` 改输出位置
 
 默认输出 ``<项目根>/logs/camera_timing.log``；打包后写 ``<data>/logs/camera_timing.log``
 （安装目录可能不可写，且 ``parents[2]`` 会指到 ``_internal`` 里）。
 
-彻底删除
---------
+体积
+----
+单文件上限 ``MAX_BYTES``（2 MB），超过就把它改名成 ``.log.1`` 再重开一份，
+只留一代历史，不会无限追加。轮转在写线程内部做（基于累计写入量，不额外的 stat），
+所以不会和写句柄抢文件。
+
+和 go2rtc 日志级别的关系
+------------------------
+``core/camera.py`` 在计时打开时才把 go2rtc 日志提到 ``trace``（默认 ``warn``）——
+``LoadingMedia`` 那几秒只能靠 go2rtc 的 RTSP 请求行（DESCRIBE/SETUP/PLAY）拆开。
+只想看 go2rtc 自己的日志、不要这份计时，用 ``MIHOME_GO2RTC_LOG=debug`` 单独开，
+不必开计时。
+
+撤除
+----
 1. 删掉本文件
 2. 删掉 ``logs/camera_timing.log``
 3. 全局搜索 ``timing.``，把 ``core/relay.py``、``core/camera.py``、
@@ -31,6 +45,8 @@
 摄像头 ``localip`` 与是否同网段、本次偏好档位。采集用 ``ipconfig`` /
 ``netsh wlan show interfaces``，在后台线程做，结果缓存给下一条记录复用；
 采集失败只写「未知」，不影响取流，也不发任何网络请求。
+这些值**只写本机这个日志文件、不上传**（判断"是不是同网段 / 走的 Wi-Fi 还是
+有线 / 是不是本机热点"全靠它，跨网排障时最有用，所以不做脱敏）。
 
 go2rtc 日志
 -----------
@@ -57,10 +73,12 @@ from pathlib import Path
 
 _ENV = "MIHOME_CAMERA_TIMING"
 _ENV_PATH = "MIHOME_CAMERA_TIMING_PATH"
-_OFF = {"0", "false", "no", "off", "disable", "disabled"}
+_ON = {"1", "true", "yes", "on", "enable", "enabled"}
+#: 单文件上限，超过就轮转成 ``.log.1``（只留一代）
+MAX_BYTES = 2 * 1024 * 1024
 
 #: 关掉时所有打点都是空操作
-on = os.environ.get(_ENV, "").strip().lower() not in _OFF
+on = os.environ.get(_ENV, "").strip().lower() in _ON
 
 
 def _default_path() -> Path:
@@ -401,33 +419,77 @@ def _fmt(ts: float) -> str:
     return datetime.fromtimestamp(ts).strftime("%H:%M:%S.%f")[:-3]
 
 
-def _write_loop() -> None:
+_HEADER = (
+    "# 摄像头取流计时（mihome/core/timing.py）；"
+    "MIHOME_CAMERA_TIMING=1 打开，默认关闭；删掉本文件即可撤除\n"
+)
+
+
+def _rotate() -> None:
+    """把写满的日志改名成 ``.log.1``，只留一代历史。
+
+    只在写线程放下句柄之后调用——Windows 不允许重命名还开着的文件。
+    改名失败（占用 / 权限）就算了，下一次仍会从超限处接着轮转，不影响取流。
+    """
     try:
-        LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        handle = LOG_PATH.open("a", encoding="utf-8")
+        older = LOG_PATH.with_name(LOG_PATH.name + ".1")
+        if older.exists():
+            older.unlink()
+        LOG_PATH.replace(older)
     except OSError:
-        # 写不了就静默丢弃：探针绝不能反过来影响取流
-        while _q.get() is not None:
-            pass
-        return
-    with handle:
-        if handle.tell() == 0:
-            handle.write(
-                "# 【临时探针】mihome/core/timing.py；"
-                "MIHOME_CAMERA_TIMING=0 关闭；删掉本文件即可撤除\n"
-            )
-        while True:
-            item = _q.get()
-            if item is None:
-                handle.flush()
-                return
-            if isinstance(item, tuple):
-                item = _format_mark(*item)  # type: ignore[arg-type]
+        pass
+
+
+def _write_loop() -> None:
+    handle = None
+    written = 0
+    broken = False
+    while True:
+        item = _q.get()
+        if item is None:
+            if handle is not None:
+                try:
+                    handle.close()
+                except OSError:
+                    pass
+            return
+        if broken:
+            continue
+        if handle is None:
             try:
-                handle.write(str(item) + "\n")
-                handle.flush()
+                LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+                handle = LOG_PATH.open("a", encoding="utf-8")
+                written = handle.tell()
+                if written == 0:
+                    handle.write(_HEADER)
+                    written = len(_HEADER.encode("utf-8"))
             except OSError:
-                return
+                # 写不了就静默丢弃：探针绝不能反过来影响取流
+                handle = None
+                broken = True
+                continue
+        if isinstance(item, tuple):
+            item = _format_mark(*item)  # type: ignore[arg-type]
+        text = str(item) + "\n"
+        try:
+            handle.write(text)
+            handle.flush()
+        except OSError:
+            try:
+                handle.close()
+            except OSError:
+                pass
+            handle = None
+            broken = True
+            continue
+        written += len(text.encode("utf-8"))
+        if written >= MAX_BYTES:
+            try:
+                handle.close()
+            except OSError:
+                pass
+            handle = None
+            _rotate()
 
 
 def _format_mark(rid: int, ms: int, ts: float, stage: str, detail: str) -> str:
@@ -581,6 +643,7 @@ atexit.register(_shutdown)
 
 __all__ = [
     "LOG_PATH",
+    "MAX_BYTES",
     "begin",
     "bind",
     "current",

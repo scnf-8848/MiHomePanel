@@ -61,6 +61,12 @@ class FakePlayer:
 
     def __init__(self) -> None:
         self.calls: list[str] = []
+        #: 假的音轨状态：真实播放器要到 LoadedMedia 之后 hasAudio() 才为真，
+        #: 这里默认 False，需要测喇叭的用例自己打开
+        self.has_audio = False
+
+    def hasAudio(self) -> bool:  # noqa: N802
+        return self.has_audio
 
     def play(self) -> None:
         self.calls.append("play")
@@ -103,9 +109,15 @@ def test_buttons(app: QApplication) -> None:
     detail = make_view()
     check_true("详情页有独立窗口键", detail._pop_btn is not None)
     check("IDLE 时不可见", detail._pop_btn.isVisible(), False)
+    detail._hover = True
     detail._set_state(CameraView.PLAYING)
     app.processEvents()
-    check("播放时可见", detail._pop_btn.isVisible(), True)
+    check("播放 + 悬停时可见", detail._pop_btn.isVisible(), True)
+    detail._hover = False
+    detail._refresh_buttons()
+    check("播放但没悬停 → 隐藏（与暂停/喇叭同一条规则）",
+          detail._pop_btn.isVisible(), False)
+    detail._hover = True
     detail._set_state(CameraView.PAUSED)
     app.processEvents()
     check("暂停时仍可见", detail._pop_btn.isVisible(), True)

@@ -8,6 +8,8 @@
 * **16ms** —— 从工作队列取回调（``worker.drain``）。这是参考项目验证过的
   "子线程不碰 UI"方案：worker 只负责把结果塞队列，主线程高频取走执行。
 * **3s** —— 发起一轮轮询。轮询本身在后台线程，所以 UI 不会卡。
+  看不见的时候（收进托盘 / 最小化）降到 15s，切回前台立刻补一轮，
+  见 ``_apply_poll_mode``。
 * **5min** —— 重拉拓扑，新增设备不用手动刷新。
 
 网络慢的时候不做堆叠：``Store.poll`` 看到上一轮没回来直接跳过。
@@ -27,6 +29,7 @@ from PySide6.QtCore import (
 )
 from PySide6.QtGui import QColor, QKeySequence, QPainter, QPainterPath, QShortcut
 from PySide6.QtWidgets import (
+    QApplication,
     QHBoxLayout,
     QLineEdit,
     QMainWindow,
@@ -43,11 +46,17 @@ from . import theme, tooltip
 from .chrome import DimOverlay, TitleBar, WindowFrame, exec_with_dim_click
 from .home_tabs import HomeTabs
 from .side_nav import SideNav
+from .tray import TrayController
 from .wall import WallView
 from .widgets import HLine, IconProvider, StatusChip
 
 DRAIN_MS = 16
 POLL_MS = 3000
+#: 看不见的时候（收进托盘 / 最小化 / 开机直接进托盘）把轮询降到这个间隔。
+#: 不加这一档，托盘里待一整天等于对着云端按 3 秒一次敲：1200 次/小时。
+#: 15 秒是比较出来的折中——再降（30/60 秒）每小时只少几十次请求，但"从托盘点开"
+#: 的第一眼更容易看到旧值（点开会立刻补一轮，可那一轮也得几百毫秒才回来）。
+POLL_HIDDEN_MS = 15_000
 TOPOLOGY_MS = 5 * 60 * 1000  # 设备列表低频刷新：新增设备不用手动点刷新
 
 
@@ -159,7 +168,12 @@ class RoundButton(QWidget):
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, palette: theme.Palette | None = None) -> None:
+    def __init__(
+        self,
+        palette: theme.Palette | None = None,
+        *,
+        tray_available: bool | None = None,
+    ) -> None:
         super().__init__()
         self.palette_ref = palette or theme.LIGHT
         self.prefs = Prefs()
@@ -282,8 +296,22 @@ class MainWindow(QMainWindow):
 
         self._known_dids: set[str] = set()
         self._pending_maximize = False
+        #: 窗口是否至少显示过一次。开机直接进托盘（从没 show 过）时不能把几何落盘，
+        #: 否则退出时存下的是"没显示过的窗口"，把用户上次调好的大小覆盖掉
+        self._ever_shown = False
         self._load_settings()
         self._apply_theme()
+
+        # 托盘放在最后：它要写状态提示、要判"能不能用"，前面这些都得先就位
+        self._quitting = False
+        self._shutdown_done = False
+        self._tray_hint_shown = False
+        self.tray = TrayController(self.palette_ref, self, available=tray_available)
+        self.tray.open_requested.connect(self.show_from_tray)
+        self.tray.quit_requested.connect(self.quit_app)
+        self.tray.install()
+        self.tray.set_status(self.status.text())
+        self._apply_poll_mode()
 
     # -- 设置持久化 ------------------------------------------------------
     def _settings(self) -> QSettings:
@@ -305,13 +333,21 @@ class MainWindow(QMainWindow):
 
     def showEvent(self, event) -> None:  # noqa: N802
         super().showEvent(event)
+        self._ever_shown = True
         if self._pending_maximize:
             self._pending_maximize = False
             self._frame.set_maximized(True)
+        self._apply_poll_mode()
+
+    def hideEvent(self, event) -> None:  # noqa: N802
+        super().hideEvent(event)
+        self._apply_poll_mode()
 
     def _save_settings(self) -> None:
         s = self._settings()
-        s.setValue("window/geometry", self.saveGeometry())
+        # 从没显示过的窗口（开机直接进托盘）没有"用户调过的大小"，别拿默认值去盖
+        if self._ever_shown:
+            s.setValue("window/geometry", self.saveGeometry())
         s.setValue("ui/theme", "dark" if self.palette_ref is theme.DARK else "light")
         s.setValue("ui/active_home", self.store.active_home)
         s.sync()
@@ -319,12 +355,18 @@ class MainWindow(QMainWindow):
     def _set_status(self, text: str) -> None:
         # 悬停提示走 tooltip.watch 注册的 provider，这里只要更新文字
         self.status.setText(text)
+        tray = getattr(self, "tray", None)
+        if tray is not None:
+            tray.set_status(text)
 
     def changeEvent(self, event) -> None:  # noqa: N802
         super().changeEvent(event)
-        if event.type() == QEvent.WindowStateChange and self.isMinimized():
-            # 最小化后画面完全不可见，暂停等于继续占着观看位
-            self._release_camera_sessions("窗口最小化")
+        if event.type() == QEvent.WindowStateChange:
+            if self.isMinimized():
+                # 最小化后画面完全不可见，暂停等于继续占着观看位
+                self._release_camera_sessions("窗口最小化")
+            # 最小化 / 还原都改轮询频率（还原那一支顺带立刻补一轮）
+            self._apply_poll_mode()
 
     def _release_camera_sessions(self, reason: str) -> None:
         """最小化/退出：连独立窗口一起收掉，确保没有会话还占着观看位。"""
@@ -336,12 +378,96 @@ class MainWindow(QMainWindow):
         playbacks().release(None, reason)
 
     def closeEvent(self, event) -> None:  # noqa: N802
+        if self._should_hide_to_tray():
+            # 必须 ignore：接受关闭事件之后窗口就真的被销毁了，托盘图标还在，
+            # 点它只会崩（"窗口对象已删除"）。收进托盘是"藏起来"，不是"关掉"。
+            event.ignore()
+            self.hide_to_tray()
+            return
+        # 有托盘时 `quitOnLastWindowClosed` 是关掉的（见 `tray.install`，否则
+        # `hide()` 会把整个程序带走），所以这里**接受关闭并不等于退出**：只
+        # ``shutdown()`` + accept，窗口会被销毁而进程和托盘图标都还在，用户看到
+        # 的就是"选了退出程序，结果还是缩到托盘"，再去点那个图标又因为窗口对象
+        # 已删而没反应。要退出就必须显式走 ``quit_app``（它摘图标 + `app.quit()`）。
+        self.quit_app()
+        super().closeEvent(event)
+
+    # -- 托盘 ------------------------------------------------------------
+    def _should_hide_to_tray(self) -> bool:
+        if self._quitting or not self.tray.active or not self.prefs.close_to_tray:
+            return False
+        app = QApplication.instance()
+        # 注销 / 关机时 Qt 也会来要一次 close。这时候收进托盘会让关机卡在我们
+        # 这一格上——Windows 会先等所有程序退出，再强杀。宁可干净地退。
+        if app is not None and app.isSavingSession():
+            return False
+        return True
+
+    def start_in_tray(self) -> bool:
+        """开机自启时**不显示窗口**，直接待在托盘里。返回是否真的待进去了。
+
+        进不去（这个环境没有托盘、或者用户把这一项关了）就返回 False，让
+        ``app.present_window`` 退回"最小化到任务栏"。宁可多占一格任务栏，也不要
+        程序在哪都看不见——Win11 默认把新图标塞进折叠区，不提示一句很容易被当成
+        没启动，所以进来时弹一次气泡。
+        """
+        if not (self.tray.active and self.prefs.start_in_tray):
+            return False
+        # 已经用气泡交代过"在后台"，第一次点关闭时不必再弹一次
+        self._tray_hint_shown = True
+        self.tray.show_message(
+            "米家控制台已在后台运行",
+            "单击右下角的图标打开面板；右键菜单里可以退出。",
+        )
+        return True
+
+    def hide_to_tray(self) -> None:
+        """收进托盘：窗口藏起来，轮询降频（``hide()`` 的 hideEvent 里自己会调）。"""
+        # 藏起来之后画面完全不可见，继续取流只是白占一个观看位（设备侧上限 3 路）
+        self._release_camera_sessions("收进托盘")
+        # 几何要在 hide() 之前存：隐藏后 saveGeometry 记的是隐藏时的状态
+        self._save_settings()
+        self.prefs.save()
+        self.hide()
+        if not self._tray_hint_shown:
+            # 只提示一次：每次关窗都弹气泡是骚扰，而第一次不知道"程序去哪了"
+            # 是真会让人以为关掉了
+            self._tray_hint_shown = True
+            self.tray.show_message(
+                "米家控制台还在后台运行",
+                "单击右下角的图标可以重新打开；右键菜单里可以退出。",
+            )
+
+    def show_from_tray(self) -> None:
+        from ..core.single_instance import focus_window
+
+        try:
+            focus_window(self)
+        except RuntimeError:  # 窗口已经销毁（正在退出）
+            pass
+
+    def quit_app(self) -> None:
+        """真退出：托盘菜单里那一条，也是所有"确实要结束"的唯一入口。"""
+        self._quitting = True
+        self.shutdown()
+        # 先摘图标再退：Windows 不会因为进程结束就清掉通知区域那一格，
+        # 留一个空图标要等鼠标划过去才消失
+        self.tray.remove()
+        self.hide()
+        app = QApplication.instance()
+        if app is not None:
+            app.quit()
+
+    def shutdown(self) -> None:
+        """收尾（幂等）：释放会话、落盘、停线程。"""
+        if self._shutdown_done:
+            return
+        self._shutdown_done = True
         self._release_camera_sessions("关闭窗口")
         self._save_settings()
         self.prefs.save()
         self.client.flush()
         self.worker.stop()
-        super().closeEvent(event)
 
     # -- 启动 ------------------------------------------------------------
     def start(self) -> None:
@@ -392,6 +518,26 @@ class MainWindow(QMainWindow):
     def _poll(self) -> None:
         if not self.store.loading and self.store.devices:
             self.store.poll()
+
+    def _apply_poll_mode(self) -> None:
+        """按"看不看得见"选轮询频率，回到前台时立刻补一轮。
+
+        判据是 ``isVisible() and not isMinimized()``：收进托盘（``hide()``）和
+        最小化到任务栏都是"看不见"，开机直接进托盘（从没 show 过）同样走降频档。
+        降频只动 ``_poll_timer`` 的间隔，3 秒那套请求/失败退避逻辑一行没改。
+
+        ``setInterval`` 会把正在跑的定时器重新计时——正是想要的：切到后台时从
+        头数 15 秒，切回前台时立刻归零并补一次 ``poll``，所以第一眼不会看到旧值。
+        """
+        timer = getattr(self, "_poll_timer", None)
+        if timer is None:  # 构造期间（窗口标志变化会先来一次 changeEvent）
+            return
+        active = self.isVisible() and not self.isMinimized()
+        ms = POLL_MS if active else POLL_HIDDEN_MS
+        if timer.interval() != ms:
+            timer.setInterval(ms)
+        if active:
+            self._poll()
 
     def _refresh_topology(self) -> None:
         if not self.store.loading and self.store.devices:
@@ -526,6 +672,8 @@ class MainWindow(QMainWindow):
         # 接不过去（没在播 / 播的是别的设备 / 目标控件不可用）才退回原路。
         if not self.wall.hand_off_active_to(dlg.camera_view, st.did):
             self.wall.stop_playback("打开详情")
+        # 关页面时反过来：还看得见就收回去继续播（同一个播放器），不再重新取流
+        dlg.about_to_stop.connect(self.wall.adopt_back)
         dlg.adopt_playing_camera()
         self._run_dialog(dlg)
 
@@ -539,7 +687,8 @@ class MainWindow(QMainWindow):
         from .settings import SettingsDialog
 
         dlg = SettingsDialog(self.store, self.palette_ref, self,
-                             account=self.client.account_info())
+                             account=self.client.account_info(),
+                             tray_available=self.tray.active)
         dlg.theme_selected.connect(self.set_theme)
         # 账号动作（退出登录 / 扫码登录）不能在设置窗口还开着的时候做：
         # 登录窗口是另一个模态窗口，套在设置里面会把模态栈搞乱。
@@ -610,6 +759,9 @@ class MainWindow(QMainWindow):
         self._dim.set_palette(pal)
         self.status.set_palette(pal)
         tooltip.set_palette(pal)
+        tray = getattr(self, "tray", None)
+        if tray is not None:
+            tray.set_palette(pal)
         self.search.setStyleSheet(
             f"QLineEdit{{background:{pal.bg_soft};color:{pal.text};"
             f"border:1px solid {pal.border};border-radius:16px;padding:0 14px;font-size:13px;"

@@ -46,6 +46,20 @@ START_TIMEOUT = 12.0
 PIDFILE = "runtime.json"
 # go2rtc 日志里代表"这条流被对端掐了"的片段
 _FAILURE_MARKS = ("cs2: EOF", "read media")
+# `MIHOME_CAMERA_AUDIO` 取这些值时整条音轨都不要（排障用，不是静音开关）
+_AUDIO_OFF = ("0", "off", "false", "no")
+
+
+def audio_enabled() -> bool:
+    """这次取的流要不要带音轨（默认要；``MIHOME_CAMERA_AUDIO=0`` 关掉）。
+
+    注意它和"静音"不是一回事：静音由界面上的 ``QAudioOutput.setMuted()`` 完成，
+    音轨照常收、点一下就能出声；这里关的是**整条音轨**，关掉之后界面上的喇叭
+    会因为 ``hasAudio()`` 为假自动消失。只在排障时用（怀疑音频拖慢首帧、或跨网
+    带宽紧张），不做成设置项——它不该是日常操作。
+    """
+    flag = os.environ.get("MIHOME_CAMERA_AUDIO", "").strip().lower()
+    return flag not in _AUDIO_OFF
 
 
 class CameraError(RuntimeError):
@@ -428,23 +442,30 @@ class Go2rtcRuntime:
         # 关键帧从 ~177KB 降到 ~21KB，解码也便宜，代价是清晰度明显下降。
         # 注意它**消不掉等 GOP 的那 3–4 秒**——那是摄像头编码器决定的。
         subtype = os.environ.get("MIHOME_CAMERA_SUBTYPE", "").strip() or "0"
+        # 声音：`xiaomi://` 的 `audio` 参数**不写就是开**（go2rtc 默认 "1"，直接拼进
+        # MISS 的 enableaudio）。以前跨网分支写死 `audio=0`，现在要出声就得让设备发。
+        # 静音是客户端 `QAudioOutput.setMuted()`，**不是**关掉这条音轨——关轨要重建
+        # producer，点一下喇叭就得重新等 GOP。所以只有排障才用环境变量关：
+        # `MIHOME_CAMERA_AUDIO=0`（音频疑似拖慢首帧 / 跨网带宽不够时）。
+        audio = "" if audio_enabled() else "&audio=0"
         if src.remote:
             # 指向本机 relay 代理。必须显式 transport=udp：代理只搬 UDP，
             # go2rtc 默认会先 UDP 再 TCP，TCP 那一轮只会白等。
             return (
                 f"xiaomi://{self.user_id}:{self.region}@{src.host}:{src.port}"
                 f"?did={src.did}&model={src.model}&channel=0&subtype={subtype}"
-                f"&audio=0&transport=udp"
+                f"{audio}&transport=udp"
             )
         return (
             f"xiaomi://{self.user_id}:{self.region}@{src.localip}"
-            f"?did={src.did}&model={src.model}&channel=0&subtype={subtype}"
+            f"?did={src.did}&model={src.model}&channel=0&subtype={subtype}{audio}"
         )
 
     def _write_config(self) -> Path:
         self._workdir.mkdir(parents=True, exist_ok=True)
-        # 排障时可以 MIHOME_GO2RTC_LOG=debug 打开完整日志。探针开着时默认用 trace：
+        # 取流计时开着（MIHOME_CAMERA_TIMING=1）时默认用 trace：
         # LoadingMedia 那几秒只能靠 go2rtc 的 RTSP 请求行（DESCRIBE/SETUP/PLAY）拆开。
+        # 平时（计时关闭）是 warn；只想看 go2rtc 自己的日志可单独 MIHOME_GO2RTC_LOG=debug。
         level = os.environ.get("MIHOME_GO2RTC_LOG", "").strip()
         if not level:
             level = "trace" if timing.on else "warn"

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -11,6 +12,8 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import QApplication
 
+from .core import autostart
+from .core.single_instance import SingleInstance, focus_window
 from .ui import theme
 from .ui.main_window import MainWindow
 
@@ -131,6 +134,10 @@ def probe_camera(*, rounds: int = 1, lane: str = "", timeout: float = 25.0) -> i
     import traceback
 
     from .core import paths
+
+    # 冒烟要的是"窗口开了又关"的确定行为：留着托盘，close() 会把窗口收起来、
+    # 图标在通知区域一闪，量出来的时间线反而不好对上
+    os.environ.setdefault("MIHOME_NO_TRAY", "1")
 
     report = paths.log_dir() / "probe-camera.txt"
     lines: list[str] = []
@@ -280,6 +287,31 @@ def _finish(lines: list[str], *, ok: bool, report: Path) -> int:
     return 0 if ok else 1
 
 
+def autostart_requested(argv: list[str] | None = None) -> bool:
+    """这次是不是被系统「启动项」拉起来的。
+
+    开机时最不该做的就是抢焦点：用户可能正在看别的东西，一个全屏窗口弹出来
+    会直接把他的工作顶掉。所以自启时窗口最小化出现，设备列表照常温热。
+    """
+    return autostart.FLAG in (sys.argv[1:] if argv is None else argv)
+
+
+def present_window(window, autostart_mode: bool) -> None:
+    """把主窗口摆出来。
+
+    开机自启有两种形态，见设置页「常规 → 启动设置」：默认**直接进托盘**（登录后
+    桌面上什么都不弹，托盘里有个图标）；用户把「启动时最小化到系统托盘」关掉，
+    就退回最小化到任务栏。托盘不可用的环境（远程会话、精简系统）也只能退回
+    最小化——不能"藏"成一个点不开的程序。
+    """
+    if autostart_mode:
+        if window.start_in_tray():
+            return
+        window.showMinimized()
+    else:
+        window.show()
+
+
 def main() -> int:
     args = sys.argv[1:]
     if "--self-check" in args:
@@ -311,8 +343,27 @@ def main() -> int:
     font.setPixelSize(13)
     app.setFont(font)
 
+    # 同一份数据目录只允许一个窗口：第二个进程"叫醒"第一个然后自己退出。
+    # 放在 MainWindow 之前——先抢令牌再建窗口，否则两个进程会各刷一轮设备列表。
+    guard = SingleInstance()
+    if not guard.acquire():
+        guard.notify_existing()
+        return 0
+
+    # 启动项里存的是绝对路径，重新打包 / 挪目录之后会指向旧 exe（下次登录弹
+    # "找不到文件"）。只在该功能本来就开着的时候改写，绝不顺手帮人打开。
+    autostart.heal()
+
     window = MainWindow(theme.LIGHT)
-    window.show()
+
+    def bring_forward() -> None:
+        try:
+            focus_window(window)
+        except RuntimeError:  # 窗口已经销毁（正在退出）
+            pass
+
+    guard.activated.connect(bring_forward)
+    present_window(window, autostart_requested())
     window.start()
     return app.exec()
 

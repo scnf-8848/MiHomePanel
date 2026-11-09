@@ -7,7 +7,9 @@
 
 from __future__ import annotations
 
+import os
 import sys
+
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -15,6 +17,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from PySide6.QtCore import QTimer  # noqa: E402
 from PySide6.QtGui import QFont  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
+
+# 这些脚本自己驱动窗口（建 → 截 → close → 退）：让托盘接管 close 的话，
+# 关闭只会把窗口藏起来，脚本等的是一个不会结束的事件循环。
+os.environ.setdefault("MIHOME_NO_TRAY", "1")
 
 from mihome.ui import theme  # noqa: E402
 from mihome.ui.main_window import MainWindow  # noqa: E402

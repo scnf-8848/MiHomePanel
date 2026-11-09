@@ -15,7 +15,9 @@ go2rtc + Qt 那一段；这里从 ``DetailDialog`` 点播放开始计时，把�
 from __future__ import annotations
 
 import argparse
+import os
 import sys
+
 import time
 from pathlib import Path
 
@@ -24,6 +26,13 @@ sys.path.insert(0, str(ROOT))
 
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import QApplication
+
+# 这些脚本自己驱动窗口（建 → 截 → close → 退）：让托盘接管 close 的话，
+# 关闭只会把窗口藏起来，脚本等的是一个不会结束的事件循环。
+os.environ.setdefault("MIHOME_NO_TRAY", "1")
+# 取流计时默认关闭（发布版零开销），诊断脚本自己要明细，这里兜个默认值；
+# 外部显式设了 0 仍然尊重
+os.environ.setdefault("MIHOME_CAMERA_TIMING", "1")
 
 from mihome.ui import theme
 from mihome.ui.detail import DetailDialog

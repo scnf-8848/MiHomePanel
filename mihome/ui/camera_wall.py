@@ -152,6 +152,22 @@ class WallCameraController(QObject):
         self._url = ""
         return True
 
+    def take_back(self, card: CameraCard) -> None:
+        """会话从详情页 / 独立窗口还回某张卡：重新登记成活动卡。
+
+        只补登记，不重开、不动播放器——画面已经在播了。要让"滚出视野就停"
+        继续管着它，否则卡片会变成一条没人看管的会话一直占着观看位。
+        """
+        self._active = card
+        self._token += 1
+        self._pending = None
+        self._watchdog.stop()  # 不是新开播，不需要首帧看门狗
+        self._live = False
+        self._url = playbacks().url
+        self._remote = playbacks().remote
+        self._started = time.monotonic()
+        self._error_at = 0.0
+
     # -- 通道选择（与详情页同一套判断，不写计时日志）---------------------
     def _pref(self) -> str:
         return str(self._store.camera_network or "")

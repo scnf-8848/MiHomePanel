@@ -35,10 +35,11 @@ from .prefs import HIDDEN_ROOM, Prefs
 from .spec import DeviceSpec, PropertySpec, SpecRepository, localize
 from .tree import DeviceNode
 
-# 轮询时按"这个属性会不会主动上报"排序，但实测云端不区分，先只做去重。
-POLL_INTERVAL_OK = 3.0  # 正常轮询间隔（秒）
-POLL_INTERVAL_FAST = 1.5  # 用户刚操作过时的追帧间隔
-POLL_BACKOFF = 6.0  # 连续失败后的退避
+# 轮询的**频率**不在这里：它由"谁在看"决定（`ui/main_window.py` 的 `POLL_MS` /
+# `POLL_HIDDEN_MS`），Store 只负责"该发的时候发、上一轮没回来就跳过"。
+# 曾经这里还放着 POLL_INTERVAL_OK/FAST 两个数值常量，没有任何人读——留着等于第二份
+# 事实来源，改频率时容易只改一处。删掉（2026-11-10）。
+POLL_BACKOFF = 6.0  # 连续失败后的退避基数
 
 
 @dataclass

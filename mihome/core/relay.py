@@ -356,7 +356,7 @@ class RelaySession:
         self._recoveries = 0
         self._last_rx = 0.0
         self._preferred_port = bind_port
-        # 【临时探针】start() 所在线程的计时记录；后台重连时沿用它
+        # 【取流计时】start() 所在线程的计时记录；后台重连时沿用它
         self._timing = 0
 
     # -- 状态 ------------------------------------------------------------
@@ -378,7 +378,7 @@ class RelaySession:
 
     # -- 启动 ------------------------------------------------------------
     def start(self, timeout: float = DEFAULT_TIMEOUT) -> None:
-        # 【临时探针】只打时间点，不参与任何判断
+        # 【取流计时】只打时间点，不参与任何判断
         timing.mark("relay 绑定本机 UDP 端口")
         self.sock, self.port = _bind_udp(self._preferred_port)
         timing.mark("relay 代理端口就绪", f"port={self.port}")

@@ -33,7 +33,7 @@ from ..core.camera import is_camera
 from ..core.store import DeviceState, RoomView, Store
 from . import theme
 from .camera_card import CameraCard
-from .camera_view import CameraView
+from .camera_view import CameraView, playbacks
 from .camera_wall import WallCameraController
 from .card_grid import CardGridLayout
 from .card_templates import available_styles, resolve_card_style
@@ -435,6 +435,8 @@ class WallView(QScrollArea):
         self._camera_ctl = WallCameraController(store, self)
         # 滚出可视区域就停播（滚动条动一下就检查，成本只是一次矩形相交）
         self.verticalScrollBar().valueChanged.connect(self._check_active_visible)
+        # 会话结束（详情页 / 独立窗口关掉、设备离线）时叫醒停在 MOVED 的卡片
+        playbacks().on_finish(self._on_session_finished)
 
         # 拖动排序的状态。事件在每张卡片上过滤，真正移动的是布局里的项顺序。
         self._drag_gesture = DragGesture()
@@ -695,6 +697,57 @@ class WallView(QScrollArea):
         和 ``stop_playback`` 一样开个门——主窗口拿的是 ``WallView``，不持有 controller。
         """
         return self._camera_ctl.hand_off_active_to(target, did)
+
+    def adopt_back(self, did: str) -> bool:
+        """把会话从详情页 / 独立窗口收回到墙上那张卡（同一个播放器，不重连）。
+
+        只在卡片**还看得见**时收回：滚出视野 / 当前有搜索过滤时收回来等于留下
+        一条看不见的会话，既占观看位又让"滚出去就停"的规矩失效，这时宁可结束它。
+        """
+        owner = playbacks()
+        if not owner.active or owner.did != did:
+            return False
+        for card in self._cards.values():
+            view = getattr(card, "view", None)
+            if view is None or view.state != CameraView.MOVED:
+                continue
+            if card.state.did != did or not self._card_on_screen(card):
+                continue
+            if owner.move(view, "wall"):
+                self._camera_ctl.take_back(card)
+                return True
+        return False
+
+    def _on_session_finished(self) -> None:
+        """会话真的结束之后，把还停在 MOVED 的卡片放回空闲态。
+
+        ``MOVED`` 的卡片已经不是"活动卡"，会话搬走时也没人通知它；它自己的
+        ``refresh`` 只在 store 推新状态时才跑。少了这一步，关掉详情页后卡片会
+        永远停在"画面已在其他窗口中播放"（2026-11-10 实测的 bug）。
+        """
+        if playbacks().active:
+            return  # 还在别处播（独立窗口），提示是对的
+        for card in tuple(self._cards.values()):
+            # 墙上不只是摄像头卡：只有 CameraCard 才有画面控件
+            view = getattr(card, "view", None)
+            if view is None:
+                continue
+            try:
+                if view.state == CameraView.MOVED:
+                    view.show_idle()
+            except RuntimeError:
+                # 卡片已经被 deleteLater：忽略即可
+                continue
+
+    def _card_on_screen(self, card: DeviceCard) -> bool:
+        """卡片现在是不是真在可视区域里（隐藏 / 被搜索过滤掉都算不在）。"""
+        try:
+            if not card.isVisible() or self._filter:
+                return False
+            top_left = card.mapTo(self.viewport(), QPoint(0, 0))
+            return self.viewport().rect().intersects(QRect(top_left, card.size()))
+        except RuntimeError:
+            return False
 
     def _check_active_visible(self) -> None:
         card = self._camera_ctl.active_card

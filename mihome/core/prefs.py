@@ -58,8 +58,21 @@ HOME_STYLE_DEFAULT = "size"
 #   remote_only  —— 始终走远程中继，绝不碰局域网（只想走中继时用）
 CAMERA_NETWORKS = ("lan_first", "remote_first", "remote_only")
 CAMERA_NETWORK_DEFAULT = "lan_first"
+
+# 摄像头声音**不进偏好文件**（2026-11-10 用户实测后定）：每次开一路新的播放都从
+# 静音开始，只在这一次观看里由用户决定要不要出声。理由与实现见
+# ``core/camera_view.py`` 顶部"静音不跨会话保留"。
 #: 旧版只有 "lan_first"/"remote" 两档，读到 "remote" 按「仅远程」处理
 CAMERA_NETWORK_ALIASES = {"remote": "remote_only"}
+
+#: 点关闭按钮时收进托盘（而不是退出）。默认开：不这样的话"看一眼设备"每次都要
+#: 重新启动、重新读凭据、重新拉设备列表。托盘不可用的环境会自动退回退出。
+CLOSE_TO_TRAY_DEFAULT = True
+
+#: 开机自启时**不进桌面、直接进托盘**。默认开：这一项本来就是给"登录后静默常驻"
+#: 用的，关掉它自启就只能最小化到任务栏，登录后照样占一格任务栏。托盘不可用
+#: （远程会话、精简系统）时自动退回"最小化到任务栏"，见 ``app.present_window``。
+START_IN_TRAY_DEFAULT = True
 
 #: 卡片样式的默认 id（= 1×1 标准小卡）。样式自带宽度，所以这里不再有
 #: 「大小」这个独立偏好。id 只做词法校验；哪些 id 真的存在由
@@ -147,6 +160,10 @@ class Prefs:
         self.home_active_style = HOME_STYLE_DEFAULT
         #: 摄像头取流方式，见 ``CAMERA_NETWORKS``
         self.camera_network = CAMERA_NETWORK_DEFAULT
+        #: 点关闭按钮时收进托盘，见 ``CLOSE_TO_TRAY_DEFAULT``
+        self.close_to_tray = CLOSE_TO_TRAY_DEFAULT
+        #: 开机自启时直接进托盘、不显示窗口，见 ``START_IN_TRAY_DEFAULT``
+        self.start_in_tray = START_IN_TRAY_DEFAULT
         #: did → 样式 id，只存显式改过的设备（默认 standard 不落盘）
         self.card_styles: dict[str, str] = {}
         #: 首页末尾「已隐藏设备」分组是否收起（只留标题行）
@@ -187,6 +204,18 @@ class Prefs:
         network = CAMERA_NETWORK_ALIASES.get(network, network)
         if network in CAMERA_NETWORKS:
             self.camera_network = network
+        # 摄像头声音不落盘（v8 起取消；老文件里那个键读到时直接忽略）。每次开播
+        # 从静音开始，见 ``core/camera_view.py``。
+        # 同上：只认真正的 bool。坏数据时"关窗就退出"是更安全的那个方向——
+        # 用户以为关掉了，程序却还在后台跑，是比"多启动一次"严重得多的问题
+        close_to_tray = data.get("close_to_tray")
+        if isinstance(close_to_tray, bool):
+            self.close_to_tray = close_to_tray
+        # 同上，只认真正的 bool：坏数据时"进托盘"也是更轻的方向——大不了窗口没
+        # 按预期出现，点一下图标就回来了；反过来把用户的偏好读成 False 更莫名
+        start_in_tray = data.get("start_in_tray")
+        if isinstance(start_in_tray, bool):
+            self.start_in_tray = start_in_tray
         layout = data.get("layout")
         if isinstance(layout, dict):
             placement = str(layout.get("home_placement") or "")
@@ -198,7 +227,7 @@ class Prefs:
 
     def save(self) -> None:
         payload = {
-            "version": 4,
+            "version": 8,
             "card_styles": self.card_styles,
             "home_order": self.home_order,
             "room_order": self.room_order,
@@ -208,6 +237,8 @@ class Prefs:
             "hidden_scenes": self.hidden_scenes,
             "hidden_collapsed": self.hidden_collapsed,
             "camera_network": self.camera_network,
+            "close_to_tray": self.close_to_tray,
+            "start_in_tray": self.start_in_tray,
             "layout": {
                 "home_placement": self.home_placement,
                 "home_active_style": self.home_active_style,

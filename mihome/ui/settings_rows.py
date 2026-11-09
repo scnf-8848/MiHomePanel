@@ -55,15 +55,21 @@ class SettingsRow(QWidget):
         col = QVBoxLayout()
         col.setContentsMargins(0, 0, 0, 0)
         col.setSpacing(2)
-        self.title = QLabel(title)
+        # **两个 QLabel 必须带 parent=self**：不带父控件的 QLabel 自己就是一个顶层
+        # 窗口，``setVisible(True)`` 会当场在屏幕左上角弹出一个几十像素的小窗。设置页
+        # 十几行一起建，用户看到的就是"许多小窗口闪一下才打开设置页"。
+        # 只把 ``setVisible`` 挪到 ``col.addWidget`` 之后也不够：那时 ``col`` 还没挂到
+        # 任何 widget 上，父控件仍然是 None。
+        self.title = QLabel(title, self)
         self.title.setObjectName("RowTitle")
         col.addWidget(self.title)
-        self.sub: QLabel | None = None
-        if sub:
-            self.sub = QLabel(sub)
-            self.sub.setObjectName("RowSub")
-            self.sub.setWordWrap(True)
-            col.addWidget(self.sub)
+        self.sub: QLabel = QLabel(sub, self)
+        self.sub.setObjectName("RowSub")
+        self.sub.setWordWrap(True)
+        # 说明文字总是建出来但按需显示：状态是活的（注册表指向变了、托盘没了），
+        # 后面要能改文字。空着时不占高度
+        self.sub.setVisible(bool(sub))
+        col.addWidget(self.sub)
 
         # expand 的行（比如"凭据文件"这种长文本）让控件吃掉右边剩余宽度，
         # 文字自己右对齐并打省略号；否则控件只占自己的 sizeHint，贴着右边。
@@ -80,6 +86,11 @@ class SettingsRow(QWidget):
                 lay.addWidget(control, 0, Qt.AlignVCenter)
         self.setMinimumHeight(ROW_MIN_H)
 
+    def set_sub(self, text: str) -> None:
+        """改/清副标题。传空串就整行收起来，不留一段空高。"""
+        self.sub.setText(text)
+        self.sub.setVisible(bool(text))
+
 
 def _divider(parent: QWidget) -> QFrame:
     line = QFrame(parent)
@@ -95,6 +106,9 @@ class SettingsCard(QFrame):
     分隔线是**布局里的一个 1px 子控件**而不是 ``border-top``：QSS 的 border 只会
     画在控件自己的边上，卡内部分行得靠自己插线；插线还能让它跟着卡的左右内边距
     自动缩进——QQ 那几条线也不是顶到卡片边缘的。
+
+    卡片自己没有标题：这一组叫什么写在卡片**上面**那行
+    :func:`section_header` 里，和设置页其它页面一个格式。
     """
 
     def __init__(
@@ -158,4 +172,10 @@ def link_button(text: str) -> QPushButton:
     return btn
 
 
-__all__ = ["ROW_MIN_H", "SettingsCard", "SettingsRow", "link_button", "section_header"]
+__all__ = [
+    "ROW_MIN_H",
+    "SettingsCard",
+    "SettingsRow",
+    "link_button",
+    "section_header",
+]

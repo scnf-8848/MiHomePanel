@@ -22,6 +22,20 @@
 而一台摄像头只允许 3 路并发，所以暂停久了要主动放掉连接——否则关着不看的详情页
 也占着一个观看位。闲置阈值见 ``IDLE_RELEASE_SECONDS``（测试可用环境变量
 ``MIHOME_CAMERA_IDLE_SECONDS`` 调小）。
+
+**声音**（2026-11-10 接入）：go2rtc 取的流里本来就有音轨（局域网实测
+``audio, recvonly, OPUS/48000/2``），Qt 侧只要给 ``QMediaPlayer`` 配一个
+``QAudioOutput`` 就能出声。所以这里只做两件事：建播放器时配上输出设备、右下角
+给一个喇叭键。**静音不重建流**——``QAudioOutput.setMuted()`` 只是把声音关掉，
+音轨照收，点一下立刻有声，不用再等一个 GOP。喇叭的显隐看 ``hasAudio()``，
+而它要到 ``LoadedMedia`` 之后才为真（加载期恒为 False），所以显隐必须挂在
+``mediaStatusChanged`` 上，不能建播放器时判一次。
+
+**静音不跨会话保留**（2026-11-10 用户实测后定）：每次调 :meth:`CameraView.play`
+（也就是真的新开一路）都回到静音；而**暂停/继续**和**换承载面**（卡片 ↔ 详情页 ↔
+独立窗口，见 :meth:`CameraView.hand_off_to`）都保持当前状态。理由是不写进偏好文件，
+程序重启、换设备、隔天再开都不会突然把家里的声音放出来——"我刚才开了声音"只对
+那一次观看成立。
 """
 
 from __future__ import annotations
@@ -39,9 +53,10 @@ from PySide6.QtGui import (
     QImage,
     QPainter,
     QPainterPath,
+    QPen,
     QPolygonF,
 )
-from PySide6.QtMultimedia import QMediaPlayer, QVideoSink
+from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer, QVideoSink
 from PySide6.QtWidgets import QPushButton, QSizePolicy, QWidget
 
 from ..core import timing
@@ -77,6 +92,17 @@ if _LOG_CATEGORY not in _rules:
 # 闲置多久放掉连接。一台摄像头最多 3 路并发，挂着不看的详情页不该一直占位
 IDLE_RELEASE_SECONDS = 180
 
+# -- 声音 ---------------------------------------------------------------
+# 静音状态**按控件、按会话**存在：每次 ``play()`` 都回到静音，只在这一次观看里由
+# 用户决定要不要出声。所以它没有"全局默认值"也不落盘——上一个会话开过声音，
+# 下次打开不该继承（家里/店里的声音不该因为昨天点过一次就自己响起来）。
+_MUTED_DEFAULT = True
+
+#: 右下角操作键的边长。三个键（暂停 / 喇叭 / 独立窗口）必须同尺寸——大小不一
+#: 会让人以为它们权重不同，也让这一排像随手摆的。中央播放键是主操作，故意大一号。
+_SIDE_BTN = 34
+_SIDE_BTN_COMPACT = 30
+
 _VIDEO_BG = "#0E1013"
 _FG = "#F5F7FA"
 _FG_SOFT = "#B9C0CC"
@@ -85,7 +111,7 @@ _FG_SOFT = "#B9C0CC"
 _PROGRESS_CYCLE_MS = 1300
 _PROGRESS_FRAME_MS = 40
 
-# 【临时探针】Qt 媒体状态 → 日志里的阶段名，只用于 core/timing.py
+# 【取流计时】Qt 媒体状态 → 日志里的阶段名，只用于 core/timing.py
 _MEDIA_STATUS_NAMES = {
     QMediaPlayer.NoMedia: "NoMedia",
     QMediaPlayer.LoadingMedia: "LoadingMedia",
@@ -102,7 +128,7 @@ _PLAYBACK_NAMES = {
     QMediaPlayer.PausedState: "Paused",
 }
 
-# 【临时探针】错误类型：区分"资源打不开"和"网络瞬断"，排查时很有用
+# 【取流计时】错误类型：区分"资源打不开"和"网络瞬断"，排查时很有用
 _ERROR_NAMES = {
     QMediaPlayer.NoError: "NoError",
     QMediaPlayer.ResourceError: "ResourceError",
@@ -114,7 +140,7 @@ _ERROR_NAMES = {
 
 @dataclass
 class PlaybackHandoff:
-    """一次"换渲染面"要带走的东西：播放器、sink 和全部播放状态。
+    """一次"换渲染面"要带走的东西：播放器、音频输出、sink 和全部播放状态。
 
     它**不包含 URL 之外的会话信息**：RTSP 连接、relay、go2rtc 都由
     ``QMediaPlayer`` / ``core.camera`` 持有，这里只把同一个 player 交给下一个
@@ -135,10 +161,16 @@ class PlaybackHandoff:
     buf_bucket: int
     pos_logged: bool
     meta_logged: bool
+    #: 音频输出也是独立 QObject，**必须跟着 player 一起搬**：不搬的话声音还留在
+    #: 旧控件上，新控件按静音键改的却是自己那个没人用的输出设备。
+    #: 老会话没有音频（``MIHOME_CAMERA_AUDIO=0``）时是 ``None``。
+    audio_out: QAudioOutput | None = None
+    #: 静音状态跟着会话走，换承载面时不该突然出声或突然静音
+    muted: bool = True
 
 
 class _RoundButton(QWidget):
-    """画面上的圆形按钮：播放画三角，暂停画两道竖线。"""
+    """画面上的圆形按钮：播放画三角，暂停画两道竖线，喇叭键画音箱。"""
 
     clicked = Signal()
 
@@ -146,6 +178,8 @@ class _RoundButton(QWidget):
         super().__init__(parent)
         self._paused_icon = False
         self._popout_icon = False
+        self._mute_icon = False
+        self._muted_icon = False
         self._alpha = alpha
         self._hover = False
         self.setFixedSize(size, size)
@@ -162,6 +196,17 @@ class _RoundButton(QWidget):
         """画一个"从方框里指出去"的箭头：在独立窗口中播放。"""
         self._popout_icon = True
         self.update()
+
+    def set_mute_icon(self, muted: bool) -> None:
+        """画喇叭；``muted=True`` 时加一道斜线。
+
+        静音态**不换图形**（还是那个喇叭），只加斜线：换成一个叉会让人以为
+        "声音坏了"，加斜线是"关掉了、还能开"。
+        """
+        self._mute_icon = True
+        if self._muted_icon != muted:
+            self._muted_icon = bool(muted)
+            self.update()
 
     def enterEvent(self, event) -> None:
         self._hover = True
@@ -213,6 +258,8 @@ class _RoundButton(QWidget):
                              QPointF(size * 0.74, size * 0.26))
             painter.drawLine(QPointF(size * 0.74, size * 0.26),
                              QPointF(size * 0.74, size * 0.43))
+        elif self._mute_icon:
+            self._paint_speaker(painter, size)
         elif self._paused_icon:
             bar_w = max(3.0, size * 0.09)
             bar_h = size * 0.34
@@ -236,6 +283,43 @@ class _RoundButton(QWidget):
             painter.fillPath(path, QColor("#FFFFFF"))
         painter.end()
 
+    def _paint_speaker(self, painter: QPainter, size: float) -> None:
+        """喇叭：方箱 + 张开的口；静音时把两道声波换成一道斜线。
+
+        尺寸都按按钮边长的比例算，卡片墙的 30px 与详情页的 34px 用同一套坐标，
+        不然小按钮上的喇叭会糊成一团白点。箱体别画太窄：窄了像一个"1"旁边挂了
+        两道弧，看不出是喇叭；斜线也别顶到圆的边缘，那样像"划掉了整个按钮"，
+        而这里要表达的是"这个喇叭关掉了"。
+        """
+        white = QColor("#FFFFFF")
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(white)
+        painter.drawRect(QRectF(size * 0.27, size * 0.41, size * 0.12, size * 0.18))
+        cone = QPolygonF(
+            [
+                QPointF(size * 0.39, size * 0.41),
+                QPointF(size * 0.53, size * 0.29),
+                QPointF(size * 0.53, size * 0.71),
+                QPointF(size * 0.39, size * 0.59),
+            ]
+        )
+        path = QPainterPath()
+        path.addPolygon(cone)
+        painter.fillPath(path, white)
+        painter.setBrush(Qt.NoBrush)
+        if self._muted_icon:
+            painter.setPen(QPen(white, max(1.4, size * 0.065), Qt.SolidLine, Qt.RoundCap))
+            painter.drawLine(QPointF(size * 0.30, size * 0.68),
+                             QPointF(size * 0.70, size * 0.30))
+            return
+        # 两道声波：圆心落在喇叭口**外侧**，只画朝右的那半边。圆心太靠左会跟
+        # 锥形口叠在一起，看着像"旗子加括号"。
+        painter.setPen(QPen(white, max(1.2, size * 0.055), Qt.SolidLine, Qt.RoundCap))
+        cx, cy = size * 0.60, size * 0.50
+        for radius in (0.115, 0.195):
+            r = size * radius
+            painter.drawArc(QRectF(cx - r, cy - r, r * 2, r * 2), -50 * 16, 100 * 16)
+
 
 class CameraView(QWidget):
     """自绘视频画面。``play_requested`` 由外层接到"准备地址并开播"的逻辑上。"""
@@ -254,7 +338,7 @@ class CameraView(QWidget):
     state_changed = Signal(str)
     #: 用户点了"在独立窗口中播放"（详情页接线；墙面 compact 卡没有这个按钮）
     popout_requested = Signal()
-    # 【临时探针】首帧真正画到控件上（发一次），外层用它结束取流计时
+    # 【取流计时】首帧真正画到控件上（发一次），外层用它结束取流计时
     first_frame_shown = Signal()
 
     def __init__(
@@ -314,6 +398,10 @@ class CameraView(QWidget):
         # ``release_player`` 彻底放掉。
         self._player: QMediaPlayer | None = None
         self._sink: QVideoSink | None = None
+        self._audio_out: QAudioOutput | None = None
+        #: 声音状态只属于**这次观看**：``play()`` 每次都会把它重置成静音，
+        #: 暂停/继续、换承载面（handoff）才保持。``_audio_out`` 是它的执行端。
+        self._muted = _MUTED_DEFAULT
         self._buf_bucket = -1
         self._pos_logged = False
         self._meta_logged = False
@@ -324,20 +412,32 @@ class CameraView(QWidget):
         self._play_btn.clicked.connect(self.toggle)
         self._play_btn.show()
 
-        # 右下角暂停键：播放中鼠标在画面上时出现
-        self._pause_btn = _RoundButton(self, 30 if self._compact else 34, 110)
+        # 右下角那一排（暂停 / 喇叭 / 独立窗口）**同尺寸**：大小不一会让人以为
+        # 它们的权重不同，也让这一排看起来像随手摆的。中央播放键是主操作，故意大一号。
+        side = _SIDE_BTN_COMPACT if self._compact else _SIDE_BTN
+
+        # 右下角暂停键
+        self._pause_btn = _RoundButton(self, side, 110)
         self._pause_btn.set_playing_icon(True)
         self._pause_btn.clicked.connect(self.toggle)
         self._pause_btn.hide()
 
-        # 详情页右下角的"独立窗口"键。墙面 2×2 卡不加（compact）。
+        # 详情页右下角的"独立窗口"键。墙面卡不加（compact）。
         self._pop_btn: _RoundButton | None = None
         if not self._compact:
-            self._pop_btn = _RoundButton(self, 30, 110)
+            self._pop_btn = _RoundButton(self, side, 110)
             self._pop_btn.set_popout_icon()
             self._pop_btn.setToolTip("在独立窗口中播放")
             self._pop_btn.clicked.connect(self._request_popout)
             self._pop_btn.hide()
+
+        # 右下角喇叭：只在流里真有音轨时出现。卡片墙也放一个——卡片上的画面同样会
+        # 出声，没有关掉的地方就只能去关系统音量了。
+        self._mute_btn = _RoundButton(self, side, 110)
+        self._mute_btn.set_mute_icon(self._muted)
+        self._mute_btn.setToolTip("取消静音" if self._muted else "静音")
+        self._mute_btn.clicked.connect(self.toggle_mute)
+        self._mute_btn.hide()
 
         # 错误态的重试按钮，文案型
         self._btn = QPushButton("重试", self)
@@ -360,9 +460,16 @@ class CameraView(QWidget):
         self._sink = QVideoSink(self)
         self._player = QMediaPlayer(self)
         self._player.setVideoSink(self._sink)
+        # 音频输出：Qt6 不给 QMediaPlayer 设 audioOutput 就是**无声**（不是"有声音但
+        # 被系统静音"），所以必须显式配一个。音量固定 100%——这一版只做"有没有声"，
+        # 不做音量滑杆，设置音量反而多一个要解释的旋钮。
+        self._audio_out = QAudioOutput(self)
+        self._audio_out.setVolume(1.0)
+        self._apply_mute()
+        self._player.setAudioOutput(self._audio_out)
         self._sink.videoFrameChanged.connect(self._on_frame)
         self._player.errorOccurred.connect(self._on_error)
-        # 【临时探针】只记录 Qt 的握手/缓冲阶段，不改变播放行为
+        # 【取流计时】只记录 Qt 的握手/缓冲阶段，不改变播放行为
         self._player.mediaStatusChanged.connect(self._on_media_status)
         self._player.playbackStateChanged.connect(self._on_playback_state)
         self._player.bufferProgressChanged.connect(self._on_buffer_progress)
@@ -385,6 +492,9 @@ class CameraView(QWidget):
             try:
                 player.stop()
                 player.setSource(QUrl())
+                # 先断开对音频输出的引用，再两个一起丢；否则 deleteLater 的先后
+                # 顺序没人保证，播放器可能短暂指向一个已经析构的输出设备
+                player.setAudioOutput(None)
             except RuntimeError:
                 pass
             player.deleteLater()
@@ -392,6 +502,14 @@ class CameraView(QWidget):
         self._sink = None
         if sink is not None:
             sink.deleteLater()
+        audio = self._audio_out
+        self._audio_out = None
+        if audio is not None:
+            try:
+                audio.setMuted(True)  # 别在销毁的空隙里漏出半秒声音
+            except RuntimeError:
+                pass
+            audio.deleteLater()
         self._stopping = False
         self._image = None
         self._frames = 0
@@ -440,6 +558,7 @@ class CameraView(QWidget):
             # 画面已经交给别的承载面：这里再放播放键会误导用户开第二路
             self._play_btn.hide()
             self._pause_btn.hide()
+            self._mute_btn.hide()
             self._btn.hide()
             if self._pop_btn is not None:
                 self._pop_btn.hide()
@@ -447,13 +566,21 @@ class CameraView(QWidget):
             self._place_buttons()
             return
         waiting = self._state in (CameraView.IDLE, CameraView.PAUSED, CameraView.RELEASED)
-        playing = self._state == CameraView.PLAYING
+        # 右下角那一排**共用一条规则**：有画面（播放 / 暂停）且鼠标在画面上才整排出现，
+        # 移开就整排消失。不给某个键单独开例外——只要有一个键常驻，用户就会以为
+        # "这里的按钮是常驻的"，然后在别处找不到暂停；而常驻的键还得一直挡着画面。
+        # 整排里再按语义各让一步：暂停键只在播放中出现（已暂停时中央已经是播放键，
+        # 再放一个"暂停"是无意义的）；喇叭只在流里真有音轨时出现。
+        has_audio = self._has_audio()
+        row = self._hover and self._state in (CameraView.PLAYING, CameraView.PAUSED)
         self._play_btn.setVisible(waiting)
-        self._pause_btn.setVisible(playing and self._hover)
+        self._pause_btn.setVisible(row and self._state == CameraView.PLAYING)
         self._btn.setVisible(self._state == CameraView.ERROR)
         if self._pop_btn is not None:
-            # 有画面（播放/暂停）才值得另开一扇窗；空态/加载/出错不出现
-            self._pop_btn.setVisible(self._state in (CameraView.PLAYING, CameraView.PAUSED))
+            self._pop_btn.setVisible(row)
+        self._mute_btn.setVisible(row and has_audio)
+        self._mute_btn.set_mute_icon(self._muted)
+        self._mute_btn.setToolTip("取消静音" if self._muted else "静音")
         self._place_buttons()
         self.setCursor(Qt.PointingHandCursor if waiting else Qt.ArrowCursor)
 
@@ -520,6 +647,7 @@ class CameraView(QWidget):
         player = self._player
         sink = self._sink
         assert player is not None and sink is not None
+        audio_out = self._audio_out
         handoff = PlaybackHandoff(
             player=player,
             sink=sink,
@@ -535,6 +663,8 @@ class CameraView(QWidget):
             buf_bucket=self._buf_bucket,
             pos_logged=self._pos_logged,
             meta_logged=self._meta_logged,
+            audio_out=audio_out,
+            muted=self._muted,
         )
         self._clock.stop()
         self._idle.stop()
@@ -542,8 +672,11 @@ class CameraView(QWidget):
         # 先脱离旧控件，目标接管时再挂上去；这一步不销毁任何东西
         player.setParent(None)
         sink.setParent(None)
+        if audio_out is not None:
+            audio_out.setParent(None)
         self._player = None
         self._sink = None
+        self._audio_out = None
         self._image = None
         self._frames = 0
         self._painted = False
@@ -563,6 +696,17 @@ class CameraView(QWidget):
         self._sink = handoff.sink
         self._player.setParent(self)
         self._sink.setParent(self)
+        # 音频输出跟着会话一起接管，并把静音状态按原样套回去
+        self._audio_out = handoff.audio_out
+        if self._audio_out is not None:
+            self._audio_out.setParent(self)
+        self._muted = handoff.muted
+        self._apply_mute()
+        if self._audio_out is not None:
+            try:
+                self._player.setAudioOutput(self._audio_out)
+            except RuntimeError:
+                pass
         self._attach_handlers(self._player, self._sink)
         self._url = handoff.url
         self._frames = handoff.frames
@@ -630,10 +774,55 @@ class CameraView(QWidget):
             (player.metaDataChanged, self._on_metadata),
         )
 
+    # -- 声音 ------------------------------------------------------------
+    @property
+    def muted(self) -> bool:
+        return self._muted
+
+    def toggle_mute(self) -> None:
+        """切声音。**只动输出设备，不碰播放器**：不用重建流、不用再等一个 GOP。"""
+        self.set_muted(not self._muted)
+
+    def set_muted(self, muted: bool) -> None:
+        """只改这一路的声音，不落盘、不影响别的控件或下一次播放。"""
+        self._muted = bool(muted)
+        self._apply_mute()
+        self._refresh_buttons()
+
+    def _apply_mute(self) -> None:
+        audio = self._audio_out
+        if audio is None:
+            return
+        try:
+            audio.setMuted(self._muted)
+        except RuntimeError:
+            pass
+
+    def _has_audio(self) -> bool:
+        """流里有没有可听的音轨。
+
+        实测它**要到 ``LoadedMedia`` 之后才为真**，加载期恒 ``False``——所以按钮
+        显隐必须挂 ``mediaStatusChanged``，建播放器时判一次会把按钮永久藏掉。
+        """
+        player = self._player
+        if player is None:
+            return False
+        try:
+            # 用 getattr：验证脚本用鸭子类型的假播放器，不该为它实现全部接口
+            query = getattr(player, "hasAudio", None)
+            return bool(query()) if callable(query) else False
+        except RuntimeError:
+            return False
+
     # -- 播放控制 --------------------------------------------------------
     def play(self, url: str) -> None:
         """建立 RTSP 会话并连续播放。只应在用户点过播放（或重试）之后调用。"""
+        # 新开一路就回到静音：上一次开过声音不继承。暂停/继续（``toggle``）和换承载面
+        # （``hand_off_to`` / ``adopt_playback``）都不经过这里，所以它们保持原状态。
+        self._muted = _MUTED_DEFAULT
         player = self._ensure_player()
+        self._apply_mute()
+        self._refresh_buttons()
         self._url = url
         self._retries = 1
         self._image = None
@@ -857,7 +1046,7 @@ class CameraView(QWidget):
         self.update()
 
     def _on_media_status(self, status: object) -> None:
-        """【临时探针】Qt 的媒体状态：DESCRIBE / 首包 / 缓冲。"""
+        """【取流计时】Qt 的媒体状态：DESCRIBE / 首包 / 缓冲。"""
         try:
             buffer = f" buffer={self._player.bufferProgress():.0%}"
         except (AttributeError, RuntimeError):
@@ -869,9 +1058,17 @@ class CameraView(QWidget):
             # 真正的通道切换交给 errorOccurred（它总会跟着来）；这里只标一下，
             # 免得两条信号各触发一次回落。万一只有状态没有报错，9 秒看门狗兜底。
             timing.mark("明确失败（InvalidMedia）", "等待报错后切远程")
+        # ``hasAudio()`` 要到 ``LoadedMedia`` 之后才为真，喇叭的显隐得跟着状态走；
+        # 建播放器时判一次会把有音轨的流上的按钮永久藏掉（实测确认）。
+        if status in (
+            QMediaPlayer.LoadedMedia,
+            QMediaPlayer.InvalidMedia,
+            QMediaPlayer.NoMedia,
+        ):
+            self._refresh_buttons()
 
     def _on_buffer_progress(self, value: float) -> None:
-        """【临时探针】按 25% 档记录缓冲进度，避免刷屏。"""
+        """【取流计时】按 25% 档记录缓冲进度，避免刷屏。"""
         pct = max(0, min(100, round(float(value) * 100)))
         bucket = min(100, (pct // 25) * 25)
         if bucket <= self._buf_bucket:
@@ -880,14 +1077,14 @@ class CameraView(QWidget):
         timing.mark("缓冲进度", f"{pct}%")
 
     def _on_position(self, ms: int) -> None:
-        """【临时探针】第一次出现非零播放位置 = 媒体时钟真的在走。"""
+        """【取流计时】第一次出现非零播放位置 = 媒体时钟真的在走。"""
         if self._pos_logged or ms <= 0:
             return
         self._pos_logged = True
         timing.mark("播放位置开始前进", f"{ms} ms")
 
     def _on_metadata(self) -> None:
-        """【临时探针】元数据就绪通常早于 LoadedMedia，用它定位 DESCRIBE 完成。"""
+        """【取流计时】元数据就绪通常早于 LoadedMedia，用它定位 DESCRIBE 完成。"""
         if self._meta_logged:
             return
         self._meta_logged = True
@@ -898,7 +1095,7 @@ class CameraView(QWidget):
         timing.mark("媒体元数据就绪", f"duration={duration}ms")
 
     def _on_playback_state(self, state: object) -> None:
-        """【临时探针】Qt 的播放状态：Stopped / Playing / Paused。"""
+        """【取流计时】Qt 的播放状态：Stopped / Playing / Paused。"""
         timing.mark("播放器状态", _PLAYBACK_NAMES.get(state, str(state)))
 
     def _reason(self) -> str:
@@ -946,19 +1143,22 @@ class CameraView(QWidget):
             (self.width() - size) // 2, (self.height() - size) // 2 - 6
         )
         pad = 12
-        if self._pop_btn is not None:
-            # 独立窗口键固定在最右下，暂停键让到它左边：位置不随播放/暂停跳
-            self._pop_btn.move(
-                self.width() - self._pop_btn.width() - pad,
-                self.height() - self._pop_btn.height() - pad,
-            )
-            pause_x = (self.width() - self._pop_btn.width() - pad - 8
-                       - self._pause_btn.width())
-        else:
-            pause_x = self.width() - self._pause_btn.width() - pad
-        self._pause_btn.move(
-            pause_x, self.height() - self._pause_btn.height() - pad
-        )
+        gap = 8
+        # 右下角从右往左排：独立窗口 → 喇叭 → 暂停。**按这套按钮里会出现哪些累加**，
+        # 不写死两段式坐标：加键不用重算，某个键不参与（没有音轨 / 卡片墙没有独立窗口）
+        # 时右边也不会留一个空槽。整排是同时出现、同时消失的，所以位置一旦定了就不跳。
+        row = [self._pop_btn]
+        if self._has_audio():
+            row.append(self._mute_btn)
+        row.append(self._pause_btn)
+        right = self.width() - pad
+        bottom = self.height() - pad
+        for btn in row:
+            if btn is None:
+                continue
+            right -= btn.width()
+            btn.move(right, bottom - btn.height())
+            right -= gap
         self._btn.adjustSize()
         bs = self._btn.size()
         self._btn.move((self.width() - bs.width()) // 2, self.height() // 2 + 40)
@@ -1091,6 +1291,9 @@ class PlaybackOwnership:
         self._url = ""
         self._remote = False
         self._surface = ""
+        #: 会话结束时通知谁（卡片墙用它把停在 MOVED 的卡放回空闲）。用回调而不是
+        #: Qt 信号：这里不是 QObject，也不想为了一个通知把整条链路改成 QObject。
+        self._listeners: list[Callable[[], None]] = []
 
     @property
     def active(self) -> bool:
@@ -1115,6 +1318,18 @@ class PlaybackOwnership:
     @property
     def surface(self) -> str:
         return self._surface
+
+    def on_finish(self, callback: Callable[[], None]) -> None:
+        """登记"会话结束"回调（``release`` / ``forget`` 之后调用一次）。
+
+        卡片墙靠它把停在 ``MOVED`` 的卡片放回空闲：会话被搬走后卡片已经不再是
+        "活动卡"，也不再有状态推送，没人叫醒它就会一直显示"画面已在其他窗口中播放"。
+        """
+        self._listeners.append(callback)
+
+    def _notify_finished(self) -> None:
+        for callback in tuple(self._listeners):
+            callback()
 
     def claim(
         self,
@@ -1176,6 +1391,7 @@ class PlaybackOwnership:
         self._url = ""
         self._remote = False
         self._surface = ""
+        self._notify_finished()
         return did
 
     def release(self, view: CameraView | None = None, reason: str = "") -> bool:
@@ -1198,6 +1414,7 @@ class PlaybackOwnership:
             from ..core.camera import shared as camera_service
 
             camera_service().release(did)
+        self._notify_finished()
         return True
 
 
@@ -1209,4 +1426,9 @@ def playbacks() -> PlaybackOwnership:
     return _OWNERSHIP
 
 
-__all__ = ["CameraView", "PlaybackHandoff", "PlaybackOwnership", "playbacks"]
+__all__ = [
+    "CameraView",
+    "PlaybackHandoff",
+    "PlaybackOwnership",
+    "playbacks",
+]

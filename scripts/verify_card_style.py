@@ -472,8 +472,8 @@ def main() -> int:
     check("坏数据 / v3 迁移只留合法项", loaded.card_styles,
           {"new": LIGHT_BRIGHT, "v3_dual": LIGHT_DUAL})
     check("v3 的 2×1 标准退回默认（记录被清掉）", loaded.card_style("v3_wide"), None)
-    check("落盘版本已升到 4",
-          json.loads((tmp / "p.json").read_text(encoding="utf-8"))["version"], 4)
+    check("落盘版本已升到 8（v8 加了托盘/自启两项、去掉了 camera_muted）",
+          json.loads((tmp / "p.json").read_text(encoding="utf-8"))["version"], 8)
 
     print("\n2) 样式解析：能力过滤 / 宽度由样式自带")
     check("灯的三个样式", [s.id for s in available_styles(light.card)],

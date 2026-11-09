@@ -23,9 +23,10 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import QRect, Qt, Signal
+from PySide6.QtCore import QRect, QSignalBlocker, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QPainter, QPen
 from PySide6.QtWidgets import (
+    QButtonGroup,
     QDialog,
     QFrame,
     QHBoxLayout,
@@ -38,10 +39,10 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
-
+from ..core import autostart
 from ..core.prefs import CAMERA_NETWORKS
 from ..core.store import Store
-from . import theme
+from . import theme, tray
 from .chrome import TitleBar, WindowFrame, surface_bg, surface_border
 from .combo import Combo
 from .home_tabs import (
@@ -52,15 +53,15 @@ from .home_tabs import (
     STYLE_WEIGHT,
     HomeTabs,
 )
+from .radio_dot import RadioDot
 from .settings_rows import SettingsCard, link_button, section_header
 from .tree import ReorderTree
-from .widgets import ElidedLabel, draw_text
+from .widgets import ElidedLabel, ToggleSwitch, draw_text
 
 PAGE_MARGIN = 26
 #: 下拉框统一宽度。QQ 的右对齐控件也是定宽的，宽窄随文字变会让同一张卡里的
 #: 控件边缘参差不齐。
 COMBO_W = 168
-
 
 
 def _dialog_qss(p: theme.Palette) -> str:
@@ -222,12 +223,15 @@ class SettingsDialog(QDialog):
         palette: theme.Palette,
         parent: QWidget | None = None,
         account: dict[str, str] | None = None,
+        tray_available: bool | None = None,
     ) -> None:
         super().__init__(parent)
         self.store = store
         self._p = palette
         self._account = account or {}
         self._loading = False
+        # 托盘能不能用由主窗口传：它那边真的装过一次，比这里再问一次系统可靠
+        self._tray_ok = tray_available if tray_available is not None else tray.tray_available()
 
         self.setWindowTitle("设置")
         self.setWindowFlags(Qt.Dialog | Qt.FramelessWindowHint)
@@ -259,7 +263,7 @@ class SettingsDialog(QDialog):
         self.nav.setObjectName("SettingsNav")
         self.nav.setFrameShape(QFrame.NoFrame)
         self.nav.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        for text in ("外观", "排序", "隐藏设备", "账号"):
+        for text in ("外观", "排序", "隐藏设备", "账号", "常规"):
             self.nav.addItem(QListWidgetItem(text))
 
         # 分类栏单独一块圆角底（``theme.rail_bg``）。不直接给 QListWidget 上底色：
@@ -283,6 +287,7 @@ class SettingsDialog(QDialog):
         self.pages.addWidget(self._build_order())
         self.pages.addWidget(self._build_hidden())
         self.pages.addWidget(self._build_account())
+        self.pages.addWidget(self._build_general())
 
         self.nav.currentRowChanged.connect(self.pages.setCurrentIndex)
         self.nav.setCurrentRow(0)
@@ -307,6 +312,11 @@ class SettingsDialog(QDialog):
                 box.set_palette(palette)
         for card in self._theme_cards:
             card.set_palette(palette)
+        # 常规页的圆点、开关是自绘的（颜色不走 QSS），逐个通知一遍。
+        # 用 findChildren 而不是列名字：以后再加一行不会再漏掉
+        for cls in (RadioDot, ToggleSwitch):
+            for widget in self.findChildren(cls):
+                widget.set_palette(palette)
         for tree in (self.tree_devices, self.tree_scenes, self.tree_hidden):
             tree.set_palette(palette)
         preview = getattr(self, "preview", None)
@@ -765,6 +775,130 @@ class SettingsDialog(QDialog):
         col.addLayout(row)
         return page
 
+    # -- 常规 ------------------------------------------------------------
+    def _build_general(self) -> QWidget:
+        page, col = self._page()
+        self._page_head(col, "常规", "程序自己的行为，和你的米家设备无关。")
+
+        self._section(col, "启动设置")
+        start = SettingsCard()
+        self.sw_autostart = ToggleSwitch(on=False, palette=self._p, size="sm")
+        self.sw_autostart.toggled.connect(self._on_autostart_toggled)
+        # 状态挂在副标题上而不是单开一行"当前状态"：这里是注册表的实际值，
+        # 用户在任务管理器里禁用了也得跟着变（不能只信 prefs）
+        self.row_autostart = start.add_row(
+            "开机自启动", self.sw_autostart, sub="未启用"
+        )
+
+        self.sw_start_in_tray = ToggleSwitch(
+            on=self.store.prefs.start_in_tray, palette=self._p, size="sm"
+        )
+        self.sw_start_in_tray.toggled.connect(self._on_start_in_tray_toggled)
+        self.row_start_in_tray = start.add_row(
+            "启动时最小化到系统托盘",
+            self.sw_start_in_tray,
+            sub="自启时直接待在托盘里，不弹窗口",
+        )
+        col.addWidget(start)
+
+        col.addSpacing(8)
+        self._section(col, "关闭面板时")
+        close = SettingsCard()
+        # 单选：名称在左（和设置页其它行一致），圆点在右
+        self.rb_quit = RadioDot(self._p)
+        self.rb_tray = RadioDot(self._p)
+        # 互斥交给 QButtonGroup——QAbstractButton 默认不互斥，那是 QRadioButton 的默认
+        self.close_group = QButtonGroup(self)
+        for dot in (self.rb_quit, self.rb_tray):
+            self.close_group.addButton(dot)
+            dot.toggled.connect(self._on_close_mode_toggled)
+        close.add_row("退出程序", self.rb_quit)
+        self.row_tray = close.add_row("最小化到托盘，不退出程序", self.rb_tray)
+        col.addWidget(close)
+
+        col.addStretch(1)
+        return page
+
+    # -- 常规页的三种状态 -------------------------------------------------
+    @staticmethod
+    def _set_checked(dot: RadioDot, checked: bool) -> None:
+        """改选中态但**不触发** toggled。
+
+        刷新时直接 ``setChecked`` 会仿真成"用户点了一下"：关闭行为那项会把偏好存
+        一遍——读一次界面就改一次设置，这种 bug 很难查。
+        """
+        blocker = QSignalBlocker(dot)
+        dot.setChecked(checked)
+        del blocker
+
+    def _refresh_general(self) -> None:
+        self._refresh_autostart()
+        self._refresh_close_mode()
+
+    def _refresh_autostart(self) -> None:
+        info = autostart.status()
+        usable = info.state != autostart.STATE_UNSUPPORTED
+        self.sw_autostart.set_on(info.is_on, animate=False)
+        # 源码运行时置灰而不是藏起来：藏起来这一页会只剩一个卡片标题，更让人困惑
+        self.sw_autostart.setEnabled(usable)
+        self.row_autostart.set_sub({
+            autostart.STATE_ON: "已写入系统启动项",
+            autostart.STATE_OFF: "未启用",
+            autostart.STATE_STALE:
+                f"指向的程序不是当前这个：{info.target or '（空）'}，下次启动会改回来",
+            autostart.STATE_UNSUPPORTED: "源码运行时不支持，打包成 exe 后才能用",
+        }.get(info.state, str(info.state)))
+
+        # 「启动时最小化到托盘」只管自启那一次：自启用不了、或这个环境没托盘，
+        # 这一项都没有落地的可能
+        self.sw_start_in_tray.set_on(self.store.prefs.start_in_tray, animate=False)
+        self.sw_start_in_tray.setEnabled(usable and self._tray_ok)
+        if not self._tray_ok:
+            self.row_start_in_tray.set_sub("这个环境下没有系统托盘，只能最小化到任务栏")
+        elif not info.is_on:
+            self.row_start_in_tray.set_sub("打开上面一项后才会生效")
+        else:
+            self.row_start_in_tray.set_sub("自启时直接待在托盘里，不弹窗口")
+
+    def _refresh_close_mode(self) -> None:
+        hide = self.store.prefs.close_to_tray
+        # 只设 True 那一个：QButtonGroup 互斥，另一个会被自动取消
+        self._set_checked(self.rb_tray if hide else self.rb_quit, True)
+        # 没有托盘就没有"最小化到托盘"这个选项，两个圆点都点不动
+        self.rb_quit.setEnabled(self._tray_ok)
+        self.rb_tray.setEnabled(self._tray_ok)
+        self.row_tray.set_sub(
+            "" if self._tray_ok else "这个环境下没有系统托盘，关窗一律退出程序"
+        )
+
+    def _on_close_mode_toggled(self, checked: bool) -> None:
+        # 一次点击会来两条（新的 True、旧的 False），只认 True 那条
+        if not checked or self._loading:
+            return
+        hide = self.rb_tray.isChecked()
+        if self.store.prefs.close_to_tray == hide:
+            return
+        self.store.prefs.close_to_tray = hide
+        self.store.prefs.save()
+
+    def _on_start_in_tray_toggled(self, on: bool) -> None:
+        if self._loading:
+            return
+        self.store.prefs.start_in_tray = on
+        self.store.prefs.save()
+
+    def _on_autostart_toggled(self, on: bool) -> None:
+        if self._loading:
+            return
+        try:
+            autostart.enable() if on else autostart.disable()
+        except autostart.AutostartError as exc:
+            # 失败就把开关拨回真实状态，再把原因写在副标题里——不要静默吞掉
+            self._refresh_autostart()
+            self.row_autostart.set_sub(f"设置失败：{exc}")
+            return
+        self._refresh_autostart()
+
     def _refresh_account(self) -> None:
         info = self._account
         signed = bool(info.get("signed_in"))
@@ -802,6 +936,7 @@ class SettingsDialog(QDialog):
             self._loading = False
         self._sync_layout_controls()
         self._refresh_account()
+        self._refresh_general()
 
     def _fill_order_trees_silently(self) -> None:
         self._loading = True

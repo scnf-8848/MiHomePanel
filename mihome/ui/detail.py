@@ -42,7 +42,7 @@ from ..core.spec import PropertySpec
 from ..core.store import DeviceState, Store
 from . import theme, tooltip
 from .camera_popout import CameraPopoutWindow
-from .camera_view import CameraView, playbacks
+from .camera_view import CameraView, PlaybackOwnership, playbacks
 from .card_controls import CardSlider, CardStepper
 from .chrome import TitleBar, WindowFrame, surface_bg, surface_border
 from .combo import Combo
@@ -50,7 +50,7 @@ from .widgets import ElidedLabel, IconProvider, ToggleSwitch, draw_text
 
 PAD = 22
 
-# 【临时探针】画面状态的中文名，只用于 core/timing.py 的日志
+# 【取流计时】画面状态的中文名，只用于 core/timing.py 的日志
 _CAM_STATE_NAMES = {
     CameraView.IDLE: "空闲",
     CameraView.LOADING: "加载中",
@@ -294,7 +294,23 @@ class ControlRow(QWidget):
             self.slider.set_unknown()
 
 
+def _session_taken_by_other(
+    owner: PlaybackOwnership, own: CameraView | None, did: str
+) -> bool:
+    """本页这台设备的会话是不是已经在别的承载面手里了。
+
+    两种来源：卡片墙刚把画面收回去（``about_to_stop`` 之后），或者独立窗口还在播。
+    这一支必须抢在兜底的 ``release(did)`` 之前——否则本页关窗会把别人的画面掐掉。
+    ``closeEvent`` 与 ``done`` 各调一次 ``_stop_camera``，第二次就落在这里。
+    """
+    return owner.active and owner.did == did and owner.active_view is not own
+
+
 class DetailDialog(QDialog):
+    #: 页面真的要关、会话还没结束时发出（参数是 did）：给卡片墙一次接管机会，
+    #: 它能不收尾就把画面收回去继续播。接过之后本页只清自己的界面。
+    about_to_stop = Signal(str)
+
     def __init__(
         self,
         state: DeviceState,
@@ -390,7 +406,7 @@ class DetailDialog(QDialog):
         self._cam_probe_failed = False
         #: 播放器报错的时刻，用来算"报错→回落"的间隔
         self._cam_error_at = 0.0
-        # 【临时探针】core/timing.py 的记录号，不参与取流逻辑
+        # 【取流计时】core/timing.py 的记录号，不参与取流逻辑
         self._cam_play_token = 0
         self._cam_prefetch_token = 0
         self._cam_job_token = 0
@@ -441,7 +457,7 @@ class DetailDialog(QDialog):
         self._camera.state_changed.connect(self._on_camera_state)
         # 独立窗口只搬控件，不重新取流（见 ui/camera_popout.py）
         self._camera.popout_requested.connect(self._toggle_camera_popout)
-        # 【临时探针】首帧真正画到控件上时结束一条计时记录
+        # 【取流计时】首帧真正画到控件上时结束一条计时记录
         self._camera.first_frame_shown.connect(self._on_camera_first_frame)
         # 断流时问一句 go2rtc 日志：观看位被占满和设备掉线在画面上长得一样，
         # 但用户能做的事完全不同（关掉别的查看端 vs 等等）
@@ -452,7 +468,7 @@ class DetailDialog(QDialog):
         QTimer.singleShot(0, self._prefetch_camera)
 
     def _cam_begin(self, label: str) -> int:
-        """【临时探针】开一条记录，顺带把摄像头地址和偏好交给「环境」行。"""
+        """【取流计时】开一条记录，顺带把摄像头地址和偏好交给「环境」行。"""
         return timing.begin(
             label,
             self.state.did,
@@ -512,7 +528,7 @@ class DetailDialog(QDialog):
         return not str(getattr(st.node, "localip", "") or "")
 
     def _lane_text(self, remote: bool) -> str:
-        """【临时探针】日志里的通道名；只读偏好与本次状态，不参与选择。"""
+        """【取流计时】日志里的通道名；只读偏好与本次状态，不参与选择。"""
         pref = self._pref()
         if remote:
             if pref == "remote_only":
@@ -529,7 +545,7 @@ class DetailDialog(QDialog):
         return "局域网直连"
 
     def _probe_text(self) -> str:
-        """【临时探针】把最近一次可达性探测结果写成一句话。"""
+        """【取流计时】把最近一次可达性探测结果写成一句话。"""
         probe = self._cam_probe
         if probe is None:
             return "无结果"
@@ -751,7 +767,7 @@ class DetailDialog(QDialog):
                 camera_service().release(did)
 
     def _on_camera_first_frame(self) -> None:
-        """【临时探针】首帧真正画到控件上：这条取流记录到这里算成功。"""
+        """【取流计时】首帧真正画到控件上：这条取流记录到这里算成功。"""
         if self._cam_play_token:
             timing.end_on(self._cam_play_token, "成功")
             self._cam_play_token = 0
@@ -921,9 +937,20 @@ class DetailDialog(QDialog):
         self._timer.stop()
         if hand_over:
             return
+        # 页面真要关了：先给卡片墙一次机会把画面收回去继续播（同一个播放器，
+        # 不重连）。它接走之后这条会话就不归本页了，下面必须放手。
+        if self._camera is not None and self._camera.has_live_playback:
+            self.about_to_stop.emit(self.state.did)
         if self._camera is not None:
+            owner = playbacks()
+            if _session_taken_by_other(owner, self._camera, self.state.did):
+                # 会话已经在别的承载面手里（卡片墙刚接回去 / 独立窗口还在播）：
+                # 只清本页界面。``closeEvent`` 与 ``done`` 各会调一次，第二次就
+                # 落在这一支上——绝不能走兜底的 release(did)，那会掐掉别人的画面。
+                self._camera.stop()
+                return
             # 有所有者登记时统一收尾；没有（例如只是预热过）就退回原路径
-            if not playbacks().release(self._camera, "关闭详情页"):
+            if not owner.release(self._camera, "关闭详情页"):
                 self._camera.stop()
                 camera_service().release(self.state.did)
         else:
