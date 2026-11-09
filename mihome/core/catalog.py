@@ -25,6 +25,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .adapters import MODEL_ADAPTERS, ModelAdapter, find_adapter
+from .enum_text import enum_short
 from .spec import ActionSpec, DeviceSpec, EventSpec, PropertySpec, squash, unit_symbol
 
 # ---------------------------------------------------------------------------
@@ -862,14 +863,14 @@ def _advanced(spec: DeviceSpec, card: CardSpec) -> list[PropertySpec]:
 
 def short_label(text: str, limit: int = 12) -> str:
     """规格里的 comment 常是一整句话（"0关闭待机息屏，待机时屏幕一直亮…"），
-    卡片上要截断到能放下的长度。"""
+    卡片上要截断到能放下的长度。
+
+    具体的映射与截断规则都在 ``core/enum_text.py``：先查人工映射表，再套有规律的
+    规则（``C1 CLEAR`` / ``Level3`` / ``Area 5``），最后才切分隔符或截断。
+    """
     if not text:
         return ""
-    for sep in ("，", "；", "。", "（", "(", "：", ":"):
-        idx = text.find(sep)
-        if 0 < idx <= limit:
-            return text[:idx]
-    return text if len(text) <= limit else text[:limit] + "…"
+    return enum_short(text, limit=limit)
 
 
 _GANG_PREFIX_RE = re.compile(r"^(左键|右键|中键|上键|下键|按键\s*\d+)\s*[-—·－]\s*")
@@ -904,7 +905,8 @@ def format_value(prop: PropertySpec | None, value: Any) -> str:
         return "开" if value else "关"
     if prop.value_list:
         opt = prop.option(value)
-        return opt.display if opt else str(value)
+        # 短名：云端原文常是整句或英文（见 core/enum_text.py），读数行只有 15px 一个字
+        return opt.display_short if opt else str(value)
     if isinstance(value, (int, float)):
         unit = prop.unit_text
         if prop.unit == "percentage":

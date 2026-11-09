@@ -128,7 +128,7 @@ class CardControl(QWidget):
         self.prop = prop
         self._p = palette
         self._accent = accent
-        self._label = label or prop.label
+        self._label = label or prop.display_label
         self._dimmed = False
         self._write = prop.writeable
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
@@ -225,13 +225,31 @@ class CardSlider(WheelSafe, CardControl):
         self.update()
 
     # -- 栅格 ------------------------------------------------------------
+    #: thumb 的最大半径（拖动时比静止大 1px）。轨道两端和「圆心可用范围」都按它算：
+    #: 圆点的**圆心**必须离控件边缘至少一个半径，否则圆心落在 x0 时圆有一半画到
+    #: 控件外面（详情页滑条最左端就是这么被裁的）。
+    _THUMB_R = THUMB_D / 2 + 1
+
     def _span(self) -> tuple[float, float]:
+        """thumb **圆心** 的可用范围（左右各内缩一个半径）。
+
+        注意这里返回的不是轨道两端：轨道要贴边画，见 :meth:`_track_span`。
+        点击 / 拖动换算也走这个范围，所以轨道最外侧那几像素会被 clamp 到端点值，
+        行为与「整条轨道可点」一致。
+        """
+        r = self._THUMB_R
         if self._compact:
-            x0 = 1.0
-            return x0, float(max(x0 + 40, self.width() - VALUE_W - 2))
-        x0 = float(LABEL_W + 8)
-        x1 = float(max(x0 + 40, self.width() - VALUE_W - 8))
+            x0 = 1.0 + r
+            return x0, float(max(x0 + 40, self.width() - VALUE_W - 2 - r))
+        x0 = float(LABEL_W + 8 + r)
+        x1 = float(max(x0 + 40, self.width() - VALUE_W - 8 - r))
         return x0, x1
+
+    def _track_span(self) -> tuple[float, float]:
+        """轨道左右端：由圆心范围外扩一个半径，回到原来的视觉位置（贴边）。"""
+        r = self._THUMB_R
+        x0, x1 = self._span()
+        return x0 - r, x1 + r
 
     def _ratio(self) -> float:
         return (self._value - self._lo) / (self._hi - self._lo)
@@ -258,7 +276,9 @@ class CardSlider(WheelSafe, CardControl):
             draw_text(p, QRect(0, 0, LABEL_W, h), self._label, size=12, color=self._ink())
 
         x0, x1 = self._span()
-        track = QRect(int(x0), int(cy - TRACK_H / 2), int(x1 - x0), TRACK_H)
+        # 轨道画到贴边位置，圆心范围已经从两端内缩过——两套坐标不要混用
+        tx0, tx1 = self._track_span()
+        track = QRect(int(tx0), int(cy - TRACK_H / 2), int(tx1 - tx0), TRACK_H)
         p.setPen(Qt.NoPen)
         p.setBrush(QColor(theme.blend(self._p.card, self._p.text, 0.13)))
         p.drawRoundedRect(track, TRACK_H / 2, TRACK_H / 2)
@@ -266,7 +286,7 @@ class CardSlider(WheelSafe, CardControl):
         ratio = max(0.0, min(1.0, self._ratio()))
         if not self._unknown:
             if self._gradient:
-                grad = QLinearGradient(x0, 0.0, x1, 0.0)
+                grad = QLinearGradient(tx0, 0.0, tx1, 0.0)
                 # 只插两端的话，中间会被线性插值拉成灰白（橙→淡蓝的中点没有色相）。
                 # 按色温本身取 5 个档，才是「橙→暖白→白→冷白」的真实过渡。
                 for i in range(5):
@@ -287,8 +307,8 @@ class CardSlider(WheelSafe, CardControl):
             thumb = QPointF(x0 + (x1 - x0) * ratio, cy)
             p.setBrush(QColor("#FFFFFF"))
             p.setPen(QPen(QColor(theme.blend(self._p.text, "#000000", 0.12 if not self._p.is_dark else 0.0)), 1))
-            r = THUMB_D / 2 + (1 if self._dragging else 0)
-            p.drawEllipse(thumb, r, r)
+            radius = THUMB_D / 2 + (1 if self._dragging else 0)
+            p.drawEllipse(thumb, radius, radius)
 
         draw_text(
             p,
@@ -576,7 +596,7 @@ class CardChips(CardControl):
     ) -> None:
         super().__init__(prop, palette, accent, label=label, parent=parent)
         self._items: list[tuple[int, str]] = [
-            (o.value, o.display) for o in prop.value_list
+            (o.value, o.display_short) for o in prop.value_list
         ]
         # 初始**不选中任何一项**：以前默认选中第一项，真实值还没同步到时第一帧
         # 会假高亮成"第一个模式已激活"。现在只有 ``set_value`` 收到真实值才点亮，

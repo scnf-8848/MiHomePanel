@@ -21,6 +21,11 @@
   .venv/Scripts/python.exe scripts/build_exe.py --console      # 带控制台，排障用
   .venv/Scripts/python.exe scripts/build_exe.py --onefile      # 单文件（启动慢些）
   .venv/Scripts/python.exe scripts/build_exe.py --go2rtc <path> --skip-check
+  .venv/Scripts/python.exe scripts/build_exe.py --no-slim      # 不裁剪，排障用
+
+体积：PyInstaller 收全量约 119 MB，裁剪后约 81 MB，压成 zip 约 45 MB。
+裁剪**只删文件、不改代码**，清单在 ``_TRIM`` 里，每条写明依据；删错了的表现是
+自检或冒烟失败，所以两者都在裁剪之后跑。
 
 产物：``dist/MiHomePanel/``（整个目录一起发，不是只发 exe）。
 """
@@ -247,6 +252,147 @@ def stage_go2rtc(app_dir: Path, go2rtc: Path) -> Path:
     return exe
 
 
+#: 打包后可以从产物里删掉的文件。每条都写**为什么能删**。
+#:
+#: 这一节最容易退化成迷信式清理：删错了不会在开发机上暴露，只在别人机器上白屏或
+#: 启动就崩，而且极难远程定位。所以删除依据统一是「读 PE 导入表，确认没有任何别的
+#: .dll / .pyd 引用它」，不是「看起来没用」。核对方法见 docs/DEVELOPMENT.md「体积」。
+_TRIM: tuple[tuple[tuple[str, ...], str], ...] = (
+    (
+        (
+            "_internal/PySide6/Qt6Qml.dll",
+            "_internal/PySide6/Qt6QmlModels.dll",
+            "_internal/PySide6/Qt6QmlMeta.dll",
+            "_internal/PySide6/Qt6QmlWorkerScript.dll",
+            "_internal/PySide6/Qt6Quick.dll",
+            "_internal/PySide6/Qt6OpenGL.dll",
+        ),
+        "QML / Quick / OpenGL 运行时（只用 Widgets，PE 导入表里没有上游）",
+    ),
+    (
+        ("_internal/PySide6/Qt6Pdf.dll", "_internal/PySide6/plugins/imageformats/qpdf.dll"),
+        "PDF：只被 qpdf 图片插件引用，插件一起删",
+    ),
+    (
+        (
+            "_internal/PySide6/Qt6VirtualKeyboard.dll",
+            "_internal/PySide6/plugins/platforminputcontexts/*.dll",
+        ),
+        "虚拟键盘：物理键盘输入，输入法插件一起删",
+    ),
+    (
+        (
+            "_internal/PySide6/plugins/imageformats/qtiff.dll",
+            "_internal/PySide6/plugins/imageformats/qwebp.dll",
+            "_internal/PySide6/plugins/imageformats/qicns.dll",
+            "_internal/PySide6/plugins/imageformats/qtga.dll",
+            "_internal/PySide6/plugins/imageformats/qwbmp.dll",
+        ),
+        "图片格式：设备图标是 PNG/JPEG，qpng 内建于 Qt6Gui",
+    ),
+    (
+        (
+            "_internal/PySide6/plugins/platforms/qdirect2d.dll",
+            "_internal/PySide6/plugins/platforms/qminimal.dll",
+            "_internal/PySide6/plugins/platforms/qoffscreen.dll",
+        ),
+        "平台插件：只用 qwindows（offscreen 只有开发机截图脚本会设）",
+    ),
+    (
+        ("_internal/PySide6/plugins/tls",),
+        "Qt 侧 TLS：云端走 Python 的 requests，Qt 只连本机 go2rtc",
+    ),
+    (
+        ("_internal/PySide6/plugins/generic/*.dll",),
+        "输入设备插件：触控板/触摸屏的 TUIO，桌面端不用",
+    ),
+    (
+        (
+            "_internal/PIL/_avif*.pyd",
+            "_internal/PIL/_webp*.pyd",
+            "_internal/PIL/_imagingcms*.pyd",
+            "_internal/PIL/_imagingtk*.pyd",
+        ),
+        "PIL 编解码扩展：只用来存设备图标 PNG（AVIF 一个就 1.8M）",
+    ),
+    (
+        ("_internal/tzdata",),
+        "时区数据库：Windows 上 tzlocal 走系统时区 API，不读 zoneinfo 数据",
+    ),
+)
+
+#: 软件 OpenGL 后备库单独列：它是**兼容性**保险，不是多余文件。
+#: 有显卡驱动的机器永远用不到它；虚拟机 / 远程桌面 / 老驱动才会走到这里。
+#: 默认删（省 5.3M），`--keep-sw-opengl` 保留。
+_SW_OPENGL = ("_internal/PySide6/opengl32sw.dll",)
+
+#: Qt 自带翻译只留这些。程序没有 QTranslator，理论上一份都不用留；
+#: 留着是给系统标准对话框（消息框按钮等）用的，以后接 QTranslator 也不用回改。
+_QT_TRANSLATIONS = ("qt_zh_CN.qm", "qtbase_zh_CN.qm", "qtmultimedia_zh_CN.qm", "qt_en.qm")
+
+
+def _expand(app_dir: Path, patterns: tuple[str, ...]) -> list[Path]:
+    """把清单里的路径 / glob 展开成实际存在的文件与目录。"""
+    found: list[Path] = []
+    for pattern in patterns:
+        if "*" in pattern:
+            found.extend(p for p in app_dir.glob(pattern) if p.is_file())
+        else:
+            p = app_dir / pattern
+            if p.is_file():
+                found.append(p)
+            elif p.is_dir():
+                found.extend(x for x in p.rglob("*") if x.is_file())
+    return found
+
+
+def _drop_translations(app_dir: Path) -> tuple[float, int]:
+    """只留中文与英文兜底，其余 120 多个 .qm 删掉。返回 (省下的字节, 文件数)。"""
+    folder = app_dir / "_internal/PySide6/translations"
+    if not folder.is_dir():
+        return 0.0, 0
+    keep = {n for n in _QT_TRANSLATIONS if (folder / n).is_file()}
+    if not keep:
+        # 白名单一个都没命中，说明这版布局改了；宁可不删，也不要删光
+        return 0.0, 0
+    saved, count = 0.0, 0
+    for qm in folder.glob("*.qm"):
+        if qm.name in keep:
+            continue
+        saved += qm.stat().st_size
+        qm.unlink()
+        count += 1
+    return saved, count
+
+
+def slim(app_dir: Path, *, keep_sw_opengl: bool = False) -> list[tuple[str, float]]:
+    """删掉产物里确定用不到的文件，返回 ``[(说明, 省下的 MB)]``（按省得多排前面）。"""
+    rows: list[tuple[str, float]] = []
+
+    saved, count = _drop_translations(app_dir)
+    if count:
+        rows.append((f"Qt 翻译：只留中文 + 英文，删掉 {count} 个 .qm", saved / 1048576))
+
+    entries = list(_TRIM)
+    if not keep_sw_opengl:
+        entries.append((_SW_OPENGL, "软件 OpenGL 后备库（--keep-sw-opengl 可留）"))
+    for patterns, reason in entries:
+        files = _expand(app_dir, patterns)
+        if not files:
+            continue
+        saved = sum(f.stat().st_size for f in files)
+        for f in files:
+            f.unlink(missing_ok=True)
+        rows.append((reason, saved / 1048576))
+
+    # 删完留下的空目录（比如整个 platforminputcontexts）对 Qt 无害，但看着脏
+    for folder in (app_dir / "_internal/PySide6/plugins").rglob("*"):
+        if folder.is_dir() and not any(folder.iterdir()):
+            folder.rmdir()
+
+    return sorted(rows, key=lambda r: -r[1])
+
+
 def _window_titles(pid: int) -> list[str]:
     """列出属于该进程的可见顶层窗口标题（Windows）。"""
     if sys.platform != "win32":
@@ -356,6 +502,16 @@ def main() -> int:
     parser.add_argument("--skip-check", action="store_true", help="跳过产物自检")
     parser.add_argument("--skip-smoke", action="store_true", help="跳过窗口冒烟（无控制台启动）")
     parser.add_argument(
+        "--no-slim",
+        action="store_true",
+        help="不裁剪用不到的文件（排障用：怀疑是裁剪搞坏的就用这个对比）",
+    )
+    parser.add_argument(
+        "--keep-sw-opengl",
+        action="store_true",
+        help="保留软件 OpenGL 后备库（虚拟机 / 远程桌面里才需要，多 5.3 MB）",
+    )
+    parser.add_argument(
         "--force-clean",
         action="store_true",
         help="让 PyInstaller 清掉它的缓存再编（有些环境会拦批量删除，默认不开）",
@@ -383,15 +539,34 @@ def main() -> int:
     app_dir = dist if args.onefile else dist / APP_NAME
     exe = stage_go2rtc(app_dir, go2rtc)
 
-    size = sum(f.stat().st_size for f in app_dir.rglob("*") if f.is_file()) / 1048576
-    log(f"\n产物：{app_dir}（{size:.0f} MB）")
+    def size_of() -> float:
+        return sum(f.stat().st_size for f in app_dir.rglob("*") if f.is_file()) / 1048576
+
+    raw = size_of()
+    if args.no_slim:
+        log("\n跳过裁剪（--no-slim）：产物保持 PyInstaller 收进来的原样")
+    else:
+        rows = slim(app_dir, keep_sw_opengl=args.keep_sw_opengl)
+        saved = sum(mb for _, mb in rows)
+        log(f"\n裁剪：{len(rows)} 组，省 {saved:.0f} MB（{raw:.0f} → {size_of():.0f} MB）")
+        for reason, mb in rows:
+            log(f"  -{mb:5.1f} MB  {reason}")
+        if not args.keep_sw_opengl:
+            log("  提醒：删了软件 OpenGL 后备库。虚拟机 / 远程桌面里可能没画面，")
+            log("        要发到那种环境请加 --keep-sw-opengl 重打（多 5.3 MB）。")
+
+    log(f"\n产物：{app_dir}（{size_of():.0f} MB）")
     log(f"  go2rtc：{exe}")
+    log("  分发：整个目录压成 zip（约 45 MB）。go2rtc 不要单独 UPX——")
+    log("        压完启动慢 400ms 还容易被杀软误报，而 zip 后只差 2 MB。")
 
     if args.skip_check:
         log("\n跳过自检（--skip-check）。发布前请手动跑一次 --self-check。")
         return 0
     if not run_self_check(app_dir):
-        log("\n打包完成但自检未通过，先别发。常见原因见 README「打包成 exe」。")
+        log("\n打包完成但自检未通过，先别发。常见原因见 docs/DEVELOPMENT.md「打包成 exe 的实现」。")
+        if not args.no_slim:
+            log("如果加裁剪之前是好的，先用 --no-slim 重打一份对比——可能是清单删过头了。")
         return 1
     if not args.skip_smoke and not run_window_smoke(app_dir):
         log(

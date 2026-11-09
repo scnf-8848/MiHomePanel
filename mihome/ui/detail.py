@@ -35,6 +35,7 @@ from ..core import timing
 from ..core.camera import CameraError, is_camera, probe_local
 from ..core.camera import shared as camera_service
 from ..core.catalog import format_value
+from ..core.enum_text import prop_short
 from ..core.freshness import stale_text
 from ..core.prefs import HIDDEN_ROOM
 from ..core.spec import PropertySpec
@@ -93,7 +94,7 @@ class ControlRow(QWidget):
         row.setContentsMargins(0, 0, 0, 0)
         row.setSpacing(12)
 
-        self.name = ElidedLabel(label)
+        self.name = ElidedLabel(prop_short(label))
         self.name.setStyleSheet(f"color:{palette.text}; font-size:14px;")
         row.addWidget(self.name, 1)
 
@@ -118,11 +119,11 @@ class ControlRow(QWidget):
             box.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
             box.setMaximumWidth(240)
             for o in prop.value_list:
-                # comment 常常是整句中文，在 200px 宽的下拉框里会被硬切；截短并把
-                # 完整说明放进 tooltip
-                label = o.display if len(o.display) <= 14 else o.display[:13] + "…"
-                box.addItem(label, o.value)
-                box.setItemData(box.count() - 1, o.display, Qt.ToolTipRole)
+                # 短名来自 core/enum_text.py 的人工映射（云端原文常是整句中文或英文）；
+                # 没映射过的由那一层截断。完整说明仍然挂在 tooltip 上，信息不丢。
+                box.addItem(o.display_short, o.value)
+                if o.display != o.display_short:
+                    box.setItemData(box.count() - 1, o.display, Qt.ToolTipRole)
             box.setEnabled(write)
             box.currentIndexChanged.connect(
                 lambda i: self.changed.emit(prop.siid, prop.piid, box.itemData(i))
@@ -229,7 +230,13 @@ class ControlRow(QWidget):
     def set_value(self, value: Any) -> None:
         ed = self.editor
         if isinstance(ed, QLabel):
-            ed.setText(format_value(self.prop, value))
+            text = format_value(self.prop, value)
+            ed.setText(text)
+            # 显示的是短名时，把云端原文（可能是整句告警，如"大电池电量耗尽…"）挂到
+            # tooltip：行宽放不下整句，但信息不该丢。
+            opt = self.prop.option(value) if self.prop is not None else None
+            full = opt.display if opt is not None else ""
+            ed.setToolTip(full if full and full != text else "")
             return
         if value is None:
             return
@@ -1025,7 +1032,10 @@ class DetailDialog(QDialog):
         lay = self._adv_body.layout()
         for prop in self._adv_props:
             role = "switch" if prop.kind == "bool" else ("select" if prop.kind == "enum" else "slider")
-            row = ControlRow(prop, prop.label[:24], self._p, self._accent, role)
+            # 行名用 ``display_label``：解析期/型号级已经算好短名（含 category 上下文），
+            # 这里再按字符数硬切会把「内屏显示视频位置(7档)」这种名字切坏；
+            # 放不下由 ElidedLabel 自己省略，原文在 tooltip 里。
+            row = ControlRow(prop, prop.display_label, self._p, self._accent, role)
             row.changed.connect(self._on_change)
             self._rows.append(row)
             self._adv_rows.append(row)

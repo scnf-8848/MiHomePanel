@@ -243,7 +243,7 @@ def main() -> int:
             shutil.rmtree(workdir, ignore_errors=True)
 
     log("\n许可证：go2rtc 为 MIT，源码 https://github.com/AlexxIT/go2rtc")
-    log(f"本版本附带了 {PATCH.name} 的改动，说明见 README「摄像头实时画面」。")
+    log(f"本版本附带了 {PATCH.name} 的改动，说明见 docs/DEVELOPMENT.md「摄像头画面」。")
     return 0
 
 

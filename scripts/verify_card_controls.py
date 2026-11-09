@@ -27,6 +27,7 @@ from PySide6.QtWidgets import QApplication, QFrame, QLabel, QVBoxLayout  # noqa:
 from mihome.core.spec import PropertySpec, ValueOption  # noqa: E402
 from mihome.ui import theme  # noqa: E402
 from mihome.ui.card_controls import (  # noqa: E402
+    VALUE_W,
     CardChips,
     CardSlider,
     CardStepper,
@@ -179,8 +180,12 @@ def test_slider(app: QApplication) -> None:
     c.set_value(40)
     app.processEvents()
     x0, x1 = c._span()
-    check("compact 轨道从最左开始", round(x0), 1)
-    check_true("compact 轨道右端留给数值", c.width() - x1 >= 40, f"{c.width() - x1:.0f}px")
+    tx0, tx1 = c._track_span()
+    check("compact 轨道从最左开始", round(tx0), 1)
+    check_true("compact 轨道右端留给数值", c.width() - tx1 >= 40, f"{c.width() - tx1:.0f}px")
+    # 圆心范围必须比轨道两端各内缩一个半径，否则圆点在最左 / 最右会被控件边缘裁掉
+    check_true("thumb 在最左端不出界", x0 - c._THUMB_R >= 0, f"x0={x0:.1f} r={c._THUMB_R}")
+    check_true("thumb 在最右端不出界", x1 + c._THUMB_R <= c.width() - VALUE_W, f"x1={x1:.1f}")
 
     commits: list[int] = []
     c.committed.connect(commits.append)

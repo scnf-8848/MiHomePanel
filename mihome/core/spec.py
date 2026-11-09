@@ -42,11 +42,12 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
-from . import paths
+from . import enum_text, paths
+from .adapters import find_adapter
 
 SPEC_ENDPOINT = "https://miot-spec.org/miot-spec-v2/instance?type={urn}"
 DEFAULT_TTL = 30 * 24 * 3600  # 规格极少变，缓存 30 天
@@ -144,12 +145,19 @@ def unit_symbol(unit: str | None) -> str:
 @dataclass(frozen=True, slots=True)
 class ValueOption:
     value: int
-    label: str  # 中文优先
+    label: str  # 云端原话（comment 优先，可能是整句中文或英文）
     name: str  # 官方英文描述
+    #: 界面短名（``core/enum_text.py`` 的映射结果）。原文不丢，tooltip 用 ``display``。
+    short: str = ""
 
     @property
     def display(self) -> str:
         return self.label or self.name or str(self.value)
+
+    @property
+    def display_short(self) -> str:
+        """下拉框 / 读数用的短名；没映射过就是 ``display`` 的截断版。"""
+        return self.short or self.display
 
 
 @dataclass(frozen=True, slots=True)
@@ -167,6 +175,9 @@ class PropertySpec:
     value_list: tuple[ValueOption, ...]
     service: str
     service_label: str
+    #: 界面行名（``core/enum_text.py`` 的结果）。类别级在解析期算；
+    #: 型号级要等知道设备型号，由 :func:`localize` 补 —— 见那里为什么不能在解析期做。
+    label_short: str = ""
 
     # -- 寻址 ------------------------------------------------------------
     @property
@@ -181,6 +192,11 @@ class PropertySpec:
     @property
     def label(self) -> str:
         return self.comment or self.description or self.name
+
+    @property
+    def display_label(self) -> str:
+        """界面行名：英文属性名换成中文，其余原样（映射表见 ``core/enum_text.py``）。"""
+        return self.label_short or enum_text.prop_short(self.label)
 
     @property
     def unit_text(self) -> str:
@@ -488,11 +504,16 @@ def parse_raw(raw: dict[str, Any], source: str = "cloud", fetched_at: int = 0) -
         props: list[PropertySpec] = []
         for p in s.get("properties") or []:
             rng = p.get("value-range")
+            # 枚举项短名要用属性做上下文（少数词在不同属性下含义不同：Dry 在空调
+            # 是除湿、在洗衣流程是烘干），所以先算出这一行属性自己的两个标识：
+            # ``pname`` 是 URN 名（查表用的稳定键），``plabel`` 是云端中文名（给人看的）。
+            pname = _urn_name(p.get("type", ""), p.get("description", ""))
+            plabel = p.get("comment") or p.get("description") or ""
             props.append(
                 PropertySpec(
                     siid=int(s.get("iid", 0)),
                     piid=int(p.get("iid", 0)),
-                    name=_urn_name(p.get("type", ""), p.get("description", "")),
+                    name=pname,
                     urn=p.get("type", ""),
                     description=p.get("description", "") or "",
                     comment=p.get("comment", "") or "",
@@ -507,11 +528,17 @@ def parse_raw(raw: dict[str, Any], source: str = "cloud", fetched_at: int = 0) -
                             value=int(o.get("value", 0)),
                             label=(o.get("comment") or o.get("description") or ""),
                             name=o.get("description", "") or "",
+                            short=enum_text.enum_short(
+                                o.get("comment") or o.get("description") or "",
+                                pname,
+                                category=parts.category,
+                            ),
                         )
                         for o in (p.get("value-list") or [])
                     ),
                     service=sname,
                     service_label=slabel,
+                    label_short=enum_text.prop_short(plabel, category=parts.category),
                 )
             )
         acts = [
@@ -560,6 +587,60 @@ def parse_raw(raw: dict[str, Any], source: str = "cloud", fetched_at: int = 0) -
         services=services,
         source=source,
         fetched_at=fetched_at,
+    )
+
+
+def localize(spec: DeviceSpec, model: str | None) -> DeviceSpec:
+    """把**型号级**文案覆盖应用到一份规格上，返回新的规格；没登记就原样返回。
+
+    为什么不能在 :func:`parse_raw` 里做：规格缓存的键是 URN，URN 里的型号段是
+    ``yeelink-lamp22``（``spec.model``），不是设备节点上报的 ``yeelink.light.lamp22``。
+    把"这台设备"的文案烤进"这个 URN"的缓存，同 URN 的第二台设备就会串味。
+    URN 自带 category，所以类别级在解析期做是安全的，只有型号级要等到这里。
+
+    **没登记文案时返回原对象**（不是副本）：``Store.apply_topology`` 用
+    ``prev.spec is not spec`` 判断要不要重建卡片，副本会让每次拓扑刷新都把卡片
+    重建一遍。store 那边还会把结果按 (URN, 型号) 记住，保证同一输入同一对象。
+    """
+    adapter = find_adapter(model)
+    if adapter is None or adapter.text.empty:
+        return spec
+    services = []
+    for svc in spec.services:
+        props = []
+        for prop in svc.properties:
+            options = tuple(
+                replace(
+                    o,
+                    short=enum_text.enum_short(
+                        o.label or o.name,
+                        prop.name,
+                        category=spec.category,
+                        model=model or "",
+                    ),
+                )
+                for o in prop.value_list
+            )
+            props.append(
+                replace(
+                    prop,
+                    value_list=options,
+                    label_short=enum_text.prop_short(
+                        prop.label, category=spec.category, model=model or ""
+                    ),
+                )
+            )
+        services.append(replace(svc, properties=tuple(props)))
+    return DeviceSpec(
+        urn=spec.urn,
+        category=spec.category,
+        category_id=spec.category_id,
+        model=spec.model,
+        version=spec.version,
+        description=spec.description,
+        services=services,
+        source=spec.source,
+        fetched_at=spec.fetched_at,
     )
 
 

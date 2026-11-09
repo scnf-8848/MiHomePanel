@@ -78,7 +78,7 @@ def self_check() -> int:
             ]
             say(f"       开播补丁：{patch[0][6:] if patch else '（BUILD.txt 里没写）'}")
         else:
-            say("       开播补丁：没有 → 首帧会是 4.8–6.3 秒（见 README「开播补丁」）")
+            say("       开播补丁：没有 → 首帧会是 4.8–6.3 秒（见 docs/DEVELOPMENT.md「开播补丁」）")
 
     app = QCoreApplication.instance() or QCoreApplication([])
     try:

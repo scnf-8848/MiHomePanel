@@ -32,7 +32,7 @@ from .api import Client, HomeNode, PropRef, ReadValue, Topology, classify
 from .catalog import CardSpec, build_card, summary_line
 from .jobs import PRIORITY_CONTROL, PRIORITY_DATA, SerialWorker
 from .prefs import HIDDEN_ROOM, Prefs
-from .spec import DeviceSpec, PropertySpec, SpecRepository
+from .spec import DeviceSpec, PropertySpec, SpecRepository, localize
 from .tree import DeviceNode
 
 # 轮询时按"这个属性会不会主动上报"排序，但实测云端不区分，先只做去重。
@@ -165,6 +165,10 @@ class Store:
         self.on_tabs_changed: Callable[[], None] | None = None
         self._poll_generation = 0
         self._last_topology_change: set[str] = set()
+        # (URN, 型号) → (源规格, 套了型号级文案的规格)。规格对象换了就重算；
+        # 没换就复用同一个对象，否则 ``prev.spec is not spec`` 每次都为真，
+        # 一次拓扑刷新会把所有卡片重建成一遍。
+        self._text_specs: dict[tuple[str, str], tuple[DeviceSpec, DeviceSpec]] = {}
         self._fail_streak = 0
         self._next_poll_at = 0.0
 
@@ -223,13 +227,34 @@ class Store:
         if self.on_loaded:
             self.on_loaded()
 
+    def _text_spec(self, node: DeviceNode, specs: Mapping[str, DeviceSpec]) -> DeviceSpec | None:
+        """这台设备的规格，套上**型号级**文案覆盖；没登记就是原对象。
+
+        类别级文案在解析期就进了短名（URN 自带 category，缓存天然隔离），只有型号级
+        要在这里补：规格缓存按 URN 共享，而 URN 里的型号段（``yeelink-lamp22``）和
+        ``DeviceNode.model``（``yeelink.light.lamp22``）不是一个东西。
+
+        结果按 (URN, 型号) 记住：源规格没换就复用同一个对象，``apply_topology`` 里
+        ``prev.spec is not spec`` 才不会每次都为真（否则一次拓扑刷新会把所有卡片重建）。
+        """
+        spec = specs.get(node.spec_type) if node.spec_type else None
+        if spec is None:
+            return None
+        key = (node.spec_type or "", node.model or "")
+        cached = self._text_specs.get(key)
+        if cached is not None and cached[0] is spec:
+            return cached[1]
+        localized = localize(spec, node.model)
+        self._text_specs[key] = (spec, localized)
+        return localized
+
     def apply_topology(self, topo: Topology, specs: Mapping[str, DeviceSpec]) -> None:
         """用新拓扑重建设备表，尽量保留旧读数避免界面闪白。"""
         old = self.devices
         self.topology = topo
         devices: dict[str, DeviceState] = {}
         for node in topo.devices:
-            spec = specs.get(node.spec_type) if node.spec_type else None
+            spec = self._text_spec(node, specs)
             prev = old.get(node.did)
             # 设备集合没变时复用同一个 DeviceState，界面就不用重建卡片
             if prev is not None and prev.node.spec_type == node.spec_type:
