@@ -15,7 +15,6 @@
 from __future__ import annotations
 
 from PySide6.QtCore import QEvent, QPoint, Qt, Signal
-from PySide6.QtWidgets import QWidget
 
 from ..core.store import DeviceState
 from . import theme

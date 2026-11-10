@@ -160,6 +160,12 @@ class Prefs:
         self.home_active_style = HOME_STYLE_DEFAULT
         #: 摄像头取流方式，见 ``CAMERA_NETWORKS``
         self.camera_network = CAMERA_NETWORK_DEFAULT
+        #: 顶栏指令条上次选中的音箱 did。只记 did：名字会变、型号会换，
+        #: 下次启动只要这台还在"支持执行文本指令"的列表里就沿用（见 ``ui/speaker_bar.py``）
+        self.speaker_command_did = ""
+        #: 顶栏指令条「静默执行」开关。默认**关**：米家实测开着问「现在几点」
+        #: 音箱一声不出，用户会以为指令没发出去（2026-11-11 定案）
+        self.speaker_silent = False
         #: 点关闭按钮时收进托盘，见 ``CLOSE_TO_TRAY_DEFAULT``
         self.close_to_tray = CLOSE_TO_TRAY_DEFAULT
         #: 开机自启时直接进托盘、不显示窗口，见 ``START_IN_TRAY_DEFAULT``
@@ -204,6 +210,12 @@ class Prefs:
         network = CAMERA_NETWORK_ALIASES.get(network, network)
         if network in CAMERA_NETWORKS:
             self.camera_network = network
+        self.speaker_command_did = str(data.get("speaker_command_did") or "")
+        # 只认真正的 bool：坏数据时"出声回答"是更安全的方向——把静默读成 True 会
+        # 让用户以为指令根本没发出去（音箱一声不出），比"多响一次"难查得多
+        speaker_silent = data.get("speaker_silent")
+        if isinstance(speaker_silent, bool):
+            self.speaker_silent = speaker_silent
         # 摄像头声音不落盘（v8 起取消；老文件里那个键读到时直接忽略）。每次开播
         # 从静音开始，见 ``core/camera_view.py``。
         # 同上：只认真正的 bool。坏数据时"关窗就退出"是更安全的那个方向——
@@ -227,7 +239,7 @@ class Prefs:
 
     def save(self) -> None:
         payload = {
-            "version": 8,
+            "version": 10,
             "card_styles": self.card_styles,
             "home_order": self.home_order,
             "room_order": self.room_order,
@@ -237,6 +249,8 @@ class Prefs:
             "hidden_scenes": self.hidden_scenes,
             "hidden_collapsed": self.hidden_collapsed,
             "camera_network": self.camera_network,
+            "speaker_command_did": self.speaker_command_did,
+            "speaker_silent": self.speaker_silent,
             "close_to_tray": self.close_to_tray,
             "start_in_tray": self.start_in_tray,
             "layout": {
@@ -340,6 +354,23 @@ class Prefs:
         if value not in CAMERA_NETWORKS or value == self.camera_network:
             return False
         self.camera_network = value
+        self.save()
+        return True
+
+    # -- 顶栏指令条的目标音箱 --------------------------------------------
+    def set_speaker_command_did(self, did: str) -> bool:
+        if did == self.speaker_command_did:
+            return False
+        self.speaker_command_did = did
+        self.save()
+        return True
+
+    def set_speaker_silent(self, on: bool) -> bool:
+        """静默执行开关。返回是否真的变了（没变就不落盘）。"""
+        on = bool(on)
+        if on == self.speaker_silent:
+            return False
+        self.speaker_silent = on
         self.save()
         return True
 

@@ -54,7 +54,8 @@ def main() -> int:
 
     print("\n3) 接线：云端 updateTime 真的落进 DeviceState.stamps")
     check("DeviceState 有 stamps 且默认空", DeviceState.__dataclass_fields__["stamps"].default_factory(), {})
-    poll_src = inspect.getsource(Store._on_polled)
+    # 落 stamps 的循环在 ``_apply_poll`` 里（``_on_polled`` 只负责收尾与健康快照）
+    poll_src = inspect.getsource(Store._apply_poll)
     adv_src = inspect.getsource(Store.read_props)
     check("轮询路径记 stamps", "st.stamps[key] = rv.update_time" in poll_src, True)
     check("「更多功能」按需读也记 stamps", "st.stamps[key] = rv.update_time" in adv_src, True)

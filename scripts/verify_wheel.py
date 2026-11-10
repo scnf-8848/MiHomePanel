@@ -37,7 +37,7 @@ from mihome.core.spec import PropertySpec  # noqa: E402
 from mihome.core.store import DeviceState  # noqa: E402
 from mihome.core.tree import DeviceNode  # noqa: E402
 from mihome.ui import theme  # noqa: E402
-from mihome.ui.card_controls import CardSlider, CardStepper  # noqa: E402
+from mihome.ui.card_controls import CardStepper  # noqa: E402
 from mihome.ui.card_templates import LIGHT_DUAL, style_by_id  # noqa: E402
 from mihome.ui.device_card import DeviceCard  # noqa: E402
 from mihome.ui.wheel_guard import SafeSlider  # noqa: E402

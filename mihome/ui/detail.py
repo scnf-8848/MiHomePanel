@@ -46,6 +46,7 @@ from .camera_view import CameraView, PlaybackOwnership, playbacks
 from .card_controls import CardSlider, CardStepper
 from .chrome import TitleBar, WindowFrame, surface_bg, surface_border
 from .combo import Combo
+from .ptz_pad import PtzPad
 from .widgets import ElidedLabel, IconProvider, ToggleSwitch, draw_text
 
 PAD = 22
@@ -389,6 +390,12 @@ class DetailDialog(QDialog):
 
         self._col.addWidget(_Header(state, palette, self._accent, icons))
         self._camera: CameraView | None = None
+        #: 云台方向盘；只有自建 go2rtc（带 /api/xiaomi/ptz）才有
+        self._ptz: PtzPad | None = None
+        #: 包住方向盘的那层（自带 10px 上边距），跟着方向盘一起显隐
+        self._ptz_host: QWidget | None = None
+        #: None = 还没问过 go2rtc 这个构建支不支持云台
+        self._cam_ptz_ok: bool | None = None
         self._cam_popout: CameraPopoutWindow | None = None
         self._cam_live = False
         #: 卡片墙已经把一条正在播的会话交给了本页：不再预热、不再重新 open
@@ -465,6 +472,24 @@ class DetailDialog(QDialog):
         # 状态提示都画在画面里（加载 / 错误），外面再加一行说明只会重复，
         # 而且显隐切换会让下面整块内容上下跳
         lay.addWidget(self._camera)
+        # 云台方向盘：画面下方居中的一个圆。**能不能转要先问 go2rtc**——云台指令
+        # 走的是取流那条 MISS 连接，只有自建构建暴露了 /api/xiaomi/ptz；官方构建
+        # 直接 404，这时整块不出现（而不是给一个点了没反应的灰圆）。
+        # 探测在后台取流线程里做（_camera_open_worker），这里先建好藏起来。
+        #
+        # 圆盘与画面之间要和「圆盘到卡片下沿」一样宽（`_group` 的下边距 14）。
+        # 用一个带 10px 上边距的容器包住圆盘：布局 spacing 4 + 容器上边距 10 = 14。
+        # 不能直接把 addSpacing 塞进 lay——官方构建里圆盘不建，那段空白会留在
+        # 卡片底部；容器整体显隐，间隔就跟着一起消失。
+        self._ptz_host = QWidget()
+        host = QVBoxLayout(self._ptz_host)
+        host.setContentsMargins(0, 10, 0, 0)
+        host.setSpacing(0)
+        self._ptz = PtzPad(self.state.did, self._p, self._accent)
+        self._ptz.hide()
+        host.addWidget(self._ptz, 0, Qt.AlignHCenter)
+        self._ptz_host.hide()
+        lay.addWidget(self._ptz_host, 0, Qt.AlignHCenter)
         QTimer.singleShot(0, self._prefetch_camera)
 
     def _cam_begin(self, label: str) -> int:
@@ -668,6 +693,8 @@ class DetailDialog(QDialog):
             self._cam_results.put((did, "", f"取流失败：{exc}", remote, probe))
         else:
             timing.mark("后台取流完成", url)
+            # 顺手问一次这个构建支不支持云台（本机 HTTP，几毫秒；官方构建 404）
+            self._cam_ptz_ok = camera_service().ptz_supported()
             self._cam_results.put((did, url, "", remote, probe))
 
     @staticmethod
@@ -727,6 +754,7 @@ class DetailDialog(QDialog):
                 self._start_playback()
 
     def _on_camera_state(self, state: str) -> None:
+        self._sync_ptz(state)
         if state != CameraView.LOADING:
             self._cam_watchdog.stop()
         timing.mark("画面状态", _CAM_STATE_NAMES.get(state, state))
@@ -765,6 +793,34 @@ class DetailDialog(QDialog):
             did = playbacks().forget(self._camera)
             if did:
                 camera_service().release(did)
+
+    def _probe_ptz(self) -> None:
+        """后台线程：问一次 go2rtc 支不支持云台，结果由主线程 ``_sync_ptz`` 应用。"""
+        self._cam_ptz_ok = camera_service().ptz_supported()
+
+    def _sync_ptz(self, state: str | None = None) -> None:
+        """方向盘的可见性与可用性。
+
+        两条独立的判断：**构建支不支持**（官方 go2rtc 没有这条路由，整块不出现）
+        和**现在能不能转**（没在播时 go2rtc 那边没有 producer，指令会被拒，置灰）。
+        """
+        pad = self._ptz
+        if pad is None:
+            return
+        supported = self._cam_ptz_ok is True
+        cur = state if state is not None else (
+            self._camera.state if self._camera is not None else ""
+        )
+        playing = cur in (CameraView.LOADING, CameraView.PLAYING, CameraView.PAUSED)
+        # 显隐挂在外层容器上：容器里还有"和画面之间的间隔"，不能只藏圆盘
+        host = getattr(self, "_ptz_host", None)
+        if host is not None:
+            host.setVisible(supported)
+        pad.setVisible(supported)
+        ready = supported and playing
+        if not ready:
+            pad.stop()
+        pad.set_ready(ready)
 
     def _on_camera_first_frame(self) -> None:
         """【取流计时】首帧真正画到控件上：这条取流记录到这里算成功。"""
@@ -862,6 +918,11 @@ class DetailDialog(QDialog):
         self._cam_wants_play = False
         self._cam_url = playbacks().url
         self._cam_remote = playbacks().remote
+        # 会话是从卡片接过来的，说明 go2rtc 已经在跑：后台确认一下云台能力
+        # （不在此处调，接口第一次要发本机 HTTP，别卡在打开页面的那一下）
+        threading.Thread(
+            target=self._probe_ptz, name="mihome-ptz-probe", daemon=True
+        ).start()
         self._cam_started = time.monotonic()
         self._cam_watchdog.stop()
         # 预热的计时记录不再有用（如果已经被调度起来，结果是空操作）
@@ -901,6 +962,9 @@ class DetailDialog(QDialog):
         self._cam_popout.present()
 
     def _stop_camera(self) -> None:
+        if self._ptz is not None:
+            # 页面要关了（或画面停了）：立刻停止连转，别让定时器继续发指令
+            self._ptz.stop()
         if self._cam_popout is not None and self._cam_popout.is_standalone:
             # 第一次 _stop_camera 已经把会话交给独立窗口了（closeEvent/done 会
             # 各调一次），重复调用不能再把窗口关掉。
@@ -1141,6 +1205,7 @@ class DetailDialog(QDialog):
         if st is None:
             return
         self.state = st
+        self._sync_ptz()
         if self._camera is not None and self._cam_live and not st.online:
             # 设备掉线时 P2P 会先断流再超时，主动收掉比等播放器报错快。
             # 先结束会话（含独立窗口），再画错误，避免又触发一次通道切换。

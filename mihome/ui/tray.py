@@ -158,11 +158,33 @@ class TrayController(QObject):
             tip = f"{tip}\n{text}"
         self._icon.setToolTip(tip)
 
-    def show_message(self, title: str, body: str, msecs: int = 4000) -> None:
-        """气泡提示。系统不支持时静默跳过——它只是提示，不是功能。"""
-        if not self._shown or not QSystemTrayIcon.supportsMessages():
-            return
-        self._icon.showMessage(title, body, QSystemTrayIcon.Information, msecs)
+    def can_notify(self) -> bool:
+        """这条运行路径上系统通知到底能不能弹。
+
+        Windows 上 ``showMessage`` 走的是老式气泡接口：只要托盘图标真的 ``show()``
+        过就能弹，窗口是否最小化无所谓。两种弹不出来的情况——系统托盘不可用
+        （``MIHOME_NO_TRAY=1`` 或没有通知区域）、以及用户在系统里关掉了本程序的
+        通知——后者 Qt 探测不到，所以顶部横幅才是主通道，这里只是加强。
+        """
+        return self._shown and QSystemTrayIcon.supportsMessages()
+
+    def show_message(
+        self,
+        title: str,
+        body: str,
+        msecs: int = 4000,
+        *,
+        warning: bool = False,
+    ) -> bool:
+        """气泡提示。系统不支持时静默跳过——它只是提示，不是功能。
+
+        返回是否真的提交给了系统（提交了也可能被系统静默吞掉，见 ``can_notify``）。
+        """
+        if not self.can_notify():
+            return False
+        icon = QSystemTrayIcon.Warning if warning else QSystemTrayIcon.Information
+        self._icon.showMessage(title, body, icon, msecs)
+        return True
 
     # -- 菜单 ------------------------------------------------------------
     def _build_menu(self) -> None:

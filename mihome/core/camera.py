@@ -30,6 +30,7 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -48,6 +49,10 @@ PIDFILE = "runtime.json"
 _FAILURE_MARKS = ("cs2: EOF", "read media")
 # `MIHOME_CAMERA_AUDIO` 取这些值时整条音轨都不要（排障用，不是静音开关）
 _AUDIO_OFF = ("0", "off", "false", "no")
+
+#: 云台指令编号，和自建 go2rtc 的 ``/api/xiaomi/ptz`` 对齐（MISS 0x112 的 operation）
+PTZ_LEFT, PTZ_RIGHT, PTZ_UP, PTZ_DOWN, PTZ_CALIBRATE = 1, 2, 3, 4, 5
+PTZ_OPS = frozenset({PTZ_LEFT, PTZ_RIGHT, PTZ_UP, PTZ_DOWN, PTZ_CALIBRATE})
 
 
 def audio_enabled() -> bool:
@@ -667,6 +672,8 @@ class CameraService:
         # ``open`` 可能阻塞数秒，串行是预期——宁可让墙面多等一会儿，也不能让
         # 两条会话同时改 go2rtc 的源、互相把 relay 抢掉。
         self._lock = threading.RLock()
+        #: 这个 go2rtc 构建带不带云台接口；None = 还没问过
+        self._ptz_ok: bool | None = None
 
     @property
     def available(self) -> bool:
@@ -853,6 +860,65 @@ class CameraService:
             return "画面中断：观看位可能已满（最多 3 路）"
         return ""
 
+    # -- 云台 ------------------------------------------------------------
+    def ptz_supported(self) -> bool:
+        """这个 go2rtc 构建带不带云台接口。
+
+        只有**自建版**有（``go2rtc-ptz.patch``）：这台机型的 MIoT 规格里没有 ptz
+        服务，云台只能走取流那条 MISS 连接的 ``0x112``，得由 go2rtc 发。官方构建
+        没有这条路由（404），界面据此把方向键整块隐藏。
+
+        结论按构建缓存一次（同一个二进制不会中途变），但**连不上不缓存**——
+        go2rtc 可能刚重启，下次进页面再问。
+        """
+        if self._ptz_ok is not None:
+            return self._ptz_ok
+        rt = self._runtime
+        if rt is None or not rt.running or not rt.api_port:
+            return False
+        url = f"http://127.0.0.1:{rt.api_port}/api/xiaomi/ptz"
+        try:
+            with urllib.request.urlopen(url, timeout=0.8) as resp:
+                reply = json.loads(resp.read().decode("utf-8") or "{}")
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                # 官方构建：根本没有这条路由，不必每次进页面再问一遍
+                self._ptz_ok = False
+            return False
+        except (urllib.error.URLError, TimeoutError, ValueError, OSError):
+            return False
+        self._ptz_ok = bool(reply.get("ok"))
+        return self._ptz_ok
+
+    def ptz(self, did: str, op: int) -> bool:
+        """发一条云台指令（1 左 / 2 右 / 3 上 / 4 下 / 5 校准），返回是否受理。
+
+        一次一条、单步：连续转动由界面按 220ms 补发，这里不做队列。
+        指令走的是**正在取流的那条连接**，所以没在播放时会被 go2rtc 拒
+        （``stream has no ptz producer``）——那是预期，不是错误。
+        """
+        rt = self._runtime
+        if rt is None or not rt.running or not rt.api_port or not did:
+            return False
+        if op not in PTZ_OPS:
+            return False
+        name = Go2rtcRuntime.stream_name(did)
+        url = (
+            f"http://127.0.0.1:{rt.api_port}/api/xiaomi/ptz"
+            f"?name={urllib.parse.quote(name)}&op={op}"
+        )
+        try:
+            with urllib.request.urlopen(url, timeout=2.0) as resp:
+                reply = json.loads(resp.read().decode("utf-8") or "{}")
+        except (urllib.error.URLError, TimeoutError, ValueError, OSError) as exc:
+            timing.mark("云台指令失败", f"op={op} {exc}")
+            return False
+        if not reply.get("ok"):
+            timing.mark("云台指令被拒", f"op={op} {reply.get('error', '')}")
+            return False
+        timing.mark("云台指令", f"op={op}")
+        return True
+
 
 _SERVICE: CameraService | None = None
 
@@ -873,6 +939,11 @@ atexit.register(_shutdown_all)
 
 __all__ = [
     "PROBE_PORT",
+    "PTZ_DOWN",
+    "PTZ_LEFT",
+    "PTZ_OPS",
+    "PTZ_RIGHT",
+    "PTZ_UP",
     "CameraError",
     "CameraService",
     "CameraSource",

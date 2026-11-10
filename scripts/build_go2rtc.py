@@ -1,14 +1,26 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""自己编一版带「开播补丁」的 go2rtc（MIT），装到用户数据目录。
+"""自己编一版带补丁的 go2rtc（MIT），装到用户数据目录。
 
-**为什么需要它**：go2rtc 的米家源在 ``pkg/xiaomi/miss/producer.go::Dial()`` 里先
-``StartMedia()`` 再 ``probe()``。probe 为了拿到 VPS/SPS/PPS 会把开播那一包读走，
-而 IDR 切片和参数集在同一个 access unit 里——于是消费者永远得等满一个 GOP 才有可解
-码的帧。实测官方版首帧 4.8–6.3 秒，其中约 3 秒就是这一项，而且随 GOP 相位抖动。
+**为什么需要它**：有两件事官方构建做不到。
 
-``scripts/patches/go2rtc-keyframe.patch`` 在 probe 之后把流停掉重起一次（摄像头每次
-video start 都从 IDR 开头），首帧降到 1.85–3.15 秒（均值 2.18），抖动也几乎没了。
-补丁只有 12 行；**上游哪天修了这个问题，删掉本脚本和补丁即可**，程序照旧用官方构建。
+1. **开播补丁（首帧 5 秒 → 2 秒）**：go2rtc 的米家源在
+   ``pkg/xiaomi/miss/producer.go::Dial()`` 里先 ``StartMedia()`` 再 ``probe()``。
+   probe 为了拿到 VPS/SPS/PPS 会把开播那一包读走，而 IDR 切片和参数集在同一个
+   access unit 里——于是消费者永远得等满一个 GOP 才有可解码的帧。实测官方版首帧
+   4.8–6.3 秒，其中约 3 秒就是这一项，而且随 GOP 相位抖动。
+   ``scripts/patches/go2rtc-keyframe.patch`` 在 probe 之后把流停掉重起一次
+   （摄像头每次 video start 都从 IDR 开头），首帧降到 1.85–3.15 秒
+   （均值 2.18），抖动也几乎没了。
+
+2. **云台接口（``/api/xiaomi/ptz``）**：``chuangmi.camera.069a01`` 这类机型的
+   MIoT 规格里**没有 ptz 服务**，云台只能走和取流同一条 MISS 连接的 ``0x112``
+   指令。上游 ``pkg/xiaomi/miss/client.go`` 只定义了常量（``cmdMotorReq``），
+   没实现、也没有 API 入口。``go2rtc-ptz.patch`` 补上 ``Client.Motor()``、
+   把命令通道的回包常驻丢掉（缓冲只有 10 格，连发会撑爆并断流），再挂一个
+   ``GET /api/xiaomi/ptz?name=<流名>&op=<1-5>``。没打这个补丁的构建里这条路由
+   直接 404，程序据此把方向键隐藏掉——也就是官方构建照旧能看画面。
+
+补丁都不大；**上游哪天自己实现了，删掉对应补丁即可**，程序会按能力探测自动退化。
 
 用法：
   .venv/Scripts/python.exe scripts/build_go2rtc.py
@@ -46,7 +58,16 @@ from mihome.core import paths
 REPO = "AlexxIT/go2rtc"
 #: 打过补丁并被实测验证过的上游快照。换它之前先跑一遍 scripts/out/measure_patch.py。
 REF = "990f4de"
-PATCH = ROOT / "scripts" / "patches" / "go2rtc-keyframe.patch"
+#: 按顺序应用；后面的补丁的上下文按"前面的已打上"来算
+PATCHES = (
+    ROOT / "scripts" / "patches" / "go2rtc-keyframe.patch",
+    ROOT / "scripts" / "patches" / "go2rtc-ptz.patch",
+)
+#: 每个补丁打完后必须能在源码里看到的关键点（防止"补丁说成功、其实没生效"）
+PATCH_MARKS = {
+    "go2rtc-keyframe.patch": ("pkg/xiaomi/miss/producer.go", "StopMedia()"),
+    "go2rtc-ptz.patch": ("pkg/xiaomi/miss/client.go", "func (c *Client) Motor("),
+}
 GO_VERSION = "1.27.3"
 UA = "MiHomePanel-builder"
 #: go2rtc 的 go.mod 要求 1.26+；goproxy.cn 在本机网络下可用，官方代理常超时。
@@ -127,28 +148,31 @@ def _flatten_go(cache: Path) -> Path:
 
 
 def apply_patch(src: Path) -> None:
-    """用 git apply 打补丁，再核对补丁点确实生效。"""
+    """依次用 git apply 打补丁，再逐个核对补丁点确实生效。"""
     git = shutil.which("git")
     if git is None:
-        raise SystemExit("没找到 git：打补丁需要它（或手工改 pkg/xiaomi/miss/producer.go）")
-    log(f"打补丁 {PATCH.name}…")
-    proc = subprocess.run(
-        [git, "apply", "-p1", "--whitespace=nowarn", str(PATCH)],
-        cwd=src,
-        check=False,
-        capture_output=True,
-        text=True,
-        errors="replace",
-    )
-    if proc.returncode != 0:
-        raise SystemExit(
-            "补丁打不上（上游这段代码变过了）。\n"
-            f"  git apply 说：{(proc.stderr or proc.stdout).strip()}\n"
-            f"  先打开 {PATCH} 对照 pkg/xiaomi/miss/producer.go 手工改，或换 --ref。"
+        raise SystemExit("没找到 git：打补丁需要它（或按 patch 文件手工改）")
+    for patch in PATCHES:
+        log(f"打补丁 {patch.name}…")
+        proc = subprocess.run(
+            [git, "apply", "-p1", "--whitespace=nowarn", str(patch)],
+            cwd=src,
+            check=False,
+            capture_output=True,
+            text=True,
+            errors="replace",
         )
-    text = (src / "pkg" / "xiaomi" / "miss" / "producer.go").read_text(encoding="utf-8")
-    if "StopMedia()" not in text:
-        raise SystemExit("补丁应用后没看到 StopMedia()，拒绝继续")
+        if proc.returncode != 0:
+            raise SystemExit(
+                "补丁打不上（上游这段代码变过了）。\n"
+                f"  {patch.name}\n"
+                f"  git apply 说：{(proc.stderr or proc.stdout).strip()}\n"
+                "  先打开它对照源码手工改，或换 --ref。"
+            )
+        rel, mark = PATCH_MARKS[patch.name]
+        text = (src / rel).read_text(encoding="utf-8")
+        if mark not in text:
+            raise SystemExit(f"{patch.name} 应用后 {rel} 里没看到 {mark}，拒绝继续")
 
 
 def build(src: Path, go: Path, out: Path) -> None:
@@ -192,9 +216,10 @@ def install(exe: Path, target: Path) -> Path:
         shutil.copy2(exe, dest)
     except PermissionError as exc:
         raise SystemExit(f"写不进去（程序是不是正在跑？先退出再编译）：{exc}") from exc
-    digest = hashlib.sha1(PATCH.read_bytes()).hexdigest()[:12]
+    digest = ":".join(hashlib.sha1(p.read_bytes()).hexdigest()[:8] for p in PATCHES)
     (target / "BUILD.txt").write_text(
-        f"ref={REF}\npatch={PATCH.name} sha1:{digest}\n"
+        f"ref={REF}\n"
+        f"patches={','.join(p.name for p in PATCHES)} sha1:{digest}\n"
         f"go={GO_VERSION}\nbuilt={datetime.now().isoformat(timespec='seconds')}\n",
         encoding="utf-8",
     )
@@ -243,7 +268,10 @@ def main() -> int:
             shutil.rmtree(workdir, ignore_errors=True)
 
     log("\n许可证：go2rtc 为 MIT，源码 https://github.com/AlexxIT/go2rtc")
-    log(f"本版本附带了 {PATCH.name} 的改动，说明见 docs/DEVELOPMENT.md「摄像头画面」。")
+    log(
+        f"本版本附带 {len(PATCHES)} 个改动（{', '.join(p.name for p in PATCHES)}），"
+        "说明见 docs/DEVELOPMENT.md「摄像头画面」。"
+    )
     return 0
 
 

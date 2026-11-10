@@ -47,6 +47,9 @@ PAD_Y = 7
 MAX_W = 340  # 超过就折行，不然长名字会横穿半个屏幕
 LINE_GAP = 2
 RADIUS = 10
+#: 一次性提示（toast）默认停留多久。2.6 秒：够读完一句"已发送：把客厅灯关掉"，
+#: 又不至于在下一条指令输入时还挂着。
+TOAST_MS = 2600
 
 
 def _wrap(text: str, fm: QFontMetrics, max_w: int) -> list[str]:
@@ -83,17 +86,20 @@ class TipBubble(QWidget):
         self._lines: list[str] = []
         self._font = QFont()
         self._font.setPixelSize(12)
+        #: 一次性提示的自动收起。和悬停提示共用同一个窗口，但计时归 toast 自己管：
+        #: 悬停那条链（TipManager）只负责"光标停多久出提示"，不碰这里。
+        self._toast_timer = QTimer(self)
+        self._toast_timer.setSingleShot(True)
+        self._toast_timer.timeout.connect(self.hide)
 
     def set_palette(self, palette: theme.Palette) -> None:
         self._p = palette
         self.update()
 
-    def show_for(self, text: str, at: QPoint, palette: theme.Palette | None = None) -> None:
-        if palette is not None:
-            self._p = palette
+    def _measure(self, text: str) -> tuple[int, int]:
+        """按 ``text`` 折行并算出气泡尺寸（顺便把行填进 ``self._lines``）。"""
         self._font = QFont(QApplication.font())
         self._font.setPixelSize(12)
-
         fm = QFontMetrics(self._font)
         lines = _wrap(text, fm, MAX_W) or [""]
         self._lines = lines
@@ -101,6 +107,13 @@ class TipBubble(QWidget):
         line_h = fm.height()
         w = text_w + PAD_X * 2 + 2
         h = len(lines) * line_h + (len(lines) - 1) * LINE_GAP + PAD_Y * 2 + 2
+        return w, h
+
+    def show_for(self, text: str, at: QPoint, palette: theme.Palette | None = None) -> None:
+        if palette is not None:
+            self._p = palette
+        self._toast_timer.stop()
+        w, h = self._measure(text)
         self.resize(w, h)
 
         # 贴屏幕边时翻到光标另一侧，别让提示跑出可视区
@@ -116,6 +129,39 @@ class TipBubble(QWidget):
         self.show()
         self.raise_()
         self.update()
+
+    def show_toast(
+        self,
+        text: str,
+        anchor: QRect,
+        palette: theme.Palette | None = None,
+        *,
+        ms: int = TOAST_MS,
+    ) -> None:
+        """一次性提示：锚在一个**控件矩形**下方居中，``ms`` 后自己消失。
+
+        和悬停提示共用同一个窗口，但驱动方式相反——这里不看鼠标、不重计时，
+        调用方给位置、给时长，到点就收。``anchor`` 是全局坐标矩形。
+        """
+        if palette is not None:
+            self._p = palette
+        w, h = self._measure(text)
+        self.resize(w, h)
+
+        screen = QGuiApplication.screenAt(anchor.center()) or QGuiApplication.primaryScreen()
+        area = screen.availableGeometry() if screen else QRect(0, 0, 1920, 1080)
+        x = anchor.center().x() - w // 2
+        # 先试锚点下方；下方放不下（贴近屏幕底）就翻到上方
+        y = anchor.bottom() + 8
+        if y + h > area.bottom() + 1:
+            y = anchor.top() - h - 8
+        x = max(area.left(), min(x, area.right() + 1 - w))
+        y = max(area.top(), y)
+        self.move(x, y)
+        self.show()
+        self.raise_()
+        self.update()
+        self._toast_timer.start(ms)
 
     def paintEvent(self, event) -> None:  # noqa: N802
         p = QPainter(self)
@@ -178,6 +224,18 @@ class TipManager(QObject):
     def set_palette(self, palette: theme.Palette) -> None:
         self._p = palette
         self._bubble.set_palette(palette)
+
+    def show_toast(
+        self,
+        text: str,
+        anchor: QRect,
+        palette: theme.Palette | None = None,
+        *,
+        ms: int = TOAST_MS,
+    ) -> None:
+        """一次性提示（见 ``TipBubble.show_toast``）。与悬停提示互不影响。"""
+        self._dismiss()
+        self._bubble.show_toast(text, anchor, palette or self._p, ms=ms)
 
     # -- 内部 ------------------------------------------------------------
     def _forget(self, widget: QWidget) -> None:
@@ -316,4 +374,36 @@ def set_palette(palette: theme.Palette) -> None:
         _manager.set_palette(palette)
 
 
-__all__ = ["DELAY", "MAX_W", "RADIUS", "TipBubble", "TipManager", "manager", "set_palette", "watch"]
+def toast(
+    anchor: QWidget,
+    text: str,
+    palette: theme.Palette | None = None,
+    *,
+    ms: int = TOAST_MS,
+) -> None:
+    """在 ``anchor`` 控件**下方居中**弹一条一次性提示，``ms`` 后自己消失。
+
+    没有 QApplication（纯逻辑脚本）或控件已销毁时静默返回：提示是附赠信息，
+    绝不能因为它自己崩掉主流程。
+    """
+    if not text or QApplication.instance() is None:
+        return
+    try:
+        rect = QRect(anchor.mapToGlobal(QPoint(0, 0)), anchor.size())
+        manager().show_toast(text, rect, palette, ms=ms)
+    except RuntimeError:  # 底层 C++ 对象已经没了
+        return
+
+
+__all__ = [
+    "DELAY",
+    "MAX_W",
+    "RADIUS",
+    "TOAST_MS",
+    "TipBubble",
+    "TipManager",
+    "manager",
+    "set_palette",
+    "toast",
+    "watch",
+]

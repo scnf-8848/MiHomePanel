@@ -1,0 +1,150 @@
+--- a/pkg/xiaomi/miss/client.go
++++ b/pkg/xiaomi/miss/client.go
+@@ -72,7 +72,21 @@
+ 		return nil, err
+ 	}
+ 
+-	return &Client{Conn: conn, key: key, model: model}, nil
++	c := &Client{Conn: conn, key: key, model: model}
++	// 命令通道只有 10 格缓冲，没人读的话设备回一条少一格：连发 10 条云台指令
++	// 就会把队列撑爆，worker 直接关掉连接（表现为取流中断）。所以登录完就起一个
++	// 常驻读者，把命令回包（0x113 角度等）丢掉。取流走的是另一个通道，不受影响。
++	go c.drainCommands()
++	return c, nil
++}
++
++// drainCommands 常驻消费命令通道，防止设备回包把 10 格缓冲占满。
++func (c *Client) drainCommands() {
++	for {
++		if _, _, err := c.ReadCommand(); err != nil {
++			return
++		}
++	}
+ }
+ 
+ type Client struct {
+@@ -208,6 +222,15 @@
+ 	return c.WriteCommand(data)
+ }
+ 
++// Motor 发一条云台指令：1 左、2 右、3 上、4 下、5 校准。
++// 走的是和取流同一条 MISS 连接（cmdMotorReq），设备用 cmdMotorRes 回包，
++// 但回包只在读循环里被当成媒体包读走，这里不等它。
++func (c *Client) Motor(op int) error {
++	data := binary.BigEndian.AppendUint32(nil, cmdMotorReq)
++	data = fmt.Appendf(data, `{"operation":%d}`, op)
++	return c.WriteCommand(data)
++}
++
+ // SpeakerCodec if the camera model has a non-standard two-way codec.
+ func (c *Client) SpeakerCodec() uint32 {
+ 	switch c.model {
+--- a/pkg/xiaomi/miss/producer.go
++++ b/pkg/xiaomi/miss/producer.go
+@@ -210,6 +210,12 @@
+ 	return p.Connection.Stop()
+ }
+ 
++// Motor 把云台指令交给底层连接。API 那边用窄接口（Motor(int) error）断言，
++// 所以这里必须是导出方法。
++func (p *Producer) Motor(op int) error {
++	return p.client.Motor(op)
++}
++
+ // TimeToRTP convert time in milliseconds to RTP time
+ func TimeToRTP(timeMS, clockRate uint64) uint32 {
+ 	return uint32(timeMS * clockRate / 1000)
+--- a/internal/streams/api.go
++++ b/internal/streams/api.go
+@@ -2,6 +2,7 @@
+ 
+ import (
+ 	"net/http"
++	"strconv"
+ 
+ 	"github.com/AlexxIT/go2rtc/internal/api"
+ 	"github.com/AlexxIT/go2rtc/internal/app"
+@@ -179,3 +180,51 @@
+ func apiSchemes(w http.ResponseWriter, r *http.Request) {
+ 	api.ResponseJSON(w, SupportedSchemes())
+ }
++
++// motorSender 只认"能发云台指令"的 producer（目前是 pkg/xiaomi/miss.Producer）。
++// 用窄接口而不是直接 import miss：其它协议以后实现了 Motor 就自动可用。
++type motorSender interface {
++	Motor(op int) error
++}
++
++// apiPtz 下发一条云台指令：GET /api/xiaomi/ptz?name=cam_<did>&op=1
++//
++// op: 1 左、2 右、3 上、4 下、5 校准。
++// 不带 name/op 时只回显能力，调用方用它判断这个构建到底支不支持云台
++// —— 官方构建没有这段代码，路由不存在会直接 404。
++func apiPtz(w http.ResponseWriter, r *http.Request) {
++	query := r.URL.Query()
++	name := query.Get("name")
++	rawOp := query.Get("op")
++
++	if name == "" || rawOp == "" {
++		api.ResponseJSON(w, map[string]any{"ok": true, "ptz": true})
++		return
++	}
++
++	op, err := strconv.Atoi(rawOp)
++	if err != nil || op < 1 || op > 5 {
++		api.ResponseJSON(w, map[string]any{"ok": false, "error": "op must be 1..5"})
++		return
++	}
++
++	stream := Get(name)
++	if stream == nil {
++		api.ResponseJSON(w, map[string]any{"ok": false, "error": "unknown stream: " + name})
++		return
++	}
++
++	sender, ok := stream.ActiveProducer().(motorSender)
++	if !ok {
++		// 流还没连上，或者这条流不是小米协议（比如本地文件 / 别的摄像头）
++		api.ResponseJSON(w, map[string]any{"ok": false, "error": "stream has no ptz producer"})
++		return
++	}
++
++	if err = sender.Motor(op); err != nil {
++		api.ResponseJSON(w, map[string]any{"ok": false, "error": err.Error()})
++		return
++	}
++
++	api.ResponseJSON(w, map[string]any{"ok": true})
++}
+--- a/internal/streams/stream.go
++++ b/internal/streams/stream.go
+@@ -53,6 +53,19 @@
+ 		sources = append(sources, prod.url)
+ 	}
+ 	return sources
++}
++
++// ActiveProducer 返回第一个已经连上的 producer（都没连上时返回 nil）。
++// API 层用它拿到真正的协议对象，比如给小米摄像头发云台指令。
++func (s *Stream) ActiveProducer() core.Producer {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	for _, producer := range s.producers {
++		if producer.conn != nil {
++			return producer.conn
++		}
++	}
++	return nil
+ }
+ 
+ func (s *Stream) SetSource(source string) {
+--- a/internal/streams/streams.go
++++ b/internal/streams/streams.go
+@@ -30,6 +30,7 @@
+ 	api.HandleFunc("api/streams.dot", apiStreamsDOT)
+ 	api.HandleFunc("api/preload", apiPreload)
+ 	api.HandleFunc("api/schemes", apiSchemes)
++	api.HandleFunc("api/xiaomi/ptz", apiPtz)
+ 
+ 	if cfg.Publish == nil && cfg.Preload == nil {
+ 		return

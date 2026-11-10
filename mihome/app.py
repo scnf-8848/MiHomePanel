@@ -312,6 +312,50 @@ def present_window(window, autostart_mode: bool) -> None:
         window.show()
 
 
+def _report_instance_blocked() -> None:
+    """单实例挡下时把话说清楚。
+
+    以前这里直接 ``return 0``：命令行里看起来"什么都没发生"，用故障注入测试时
+    尤其容易被误判成"注入没生效"。这里只打印，不去动正在运行的实例。
+    """
+    from .core import dev_fault
+
+    raw = os.environ.get(dev_fault.ENV, "").strip()
+    injector = dev_fault.current() if raw else None
+    if not raw:
+        state = "本次没有设置故障注入。"
+    elif injector is None:
+        state = f"环境变量 {dev_fault.ENV}={raw!r} 已设置，但取值无效，注入未开启。"
+    else:
+        state = (
+            f"环境变量 {dev_fault.ENV}={raw!r} 已设置（{injector.summary}），"
+            "但它只对新启动的进程有效，没有作用到正在运行的这个实例。"
+        )
+    lines = [
+        "[MiHomePanel] 已有一个实例在运行，本次启动已取消。",
+        "[MiHomePanel] 要测试故障注入：请从托盘图标右键菜单选择「退出」"
+        "（点窗口的关闭按钮只是收进托盘），确认程序完全退出后再运行。",
+        f"[MiHomePanel] 注入状态：{state}",
+    ]
+    if sys.stderr is None:  # pythonw / 打包成 --windowed 时没有控制台
+        return
+    for line in lines:
+        print(line, file=sys.stderr)
+    sys.stderr.flush()
+
+
+def _mark_test_mode(window: MainWindow) -> None:
+    """注入开启时在标题栏留个标记，避免把假故障当成真故障。"""
+    from .core import dev_fault
+
+    injector = dev_fault.current()
+    if injector is None:
+        return
+    title = f"米家控制台 · 测试模式（{injector.kind} 故障注入）"
+    window.setWindowTitle(title)
+    window.titlebar.set_title(title)
+
+
 def main() -> int:
     args = sys.argv[1:]
     if "--self-check" in args:
@@ -348,6 +392,7 @@ def main() -> int:
     guard = SingleInstance()
     if not guard.acquire():
         guard.notify_existing()
+        _report_instance_blocked()
         return 0
 
     # 启动项里存的是绝对路径，重新打包 / 挪目录之后会指向旧 exe（下次登录弹
@@ -355,6 +400,7 @@ def main() -> int:
     autostart.heal()
 
     window = MainWindow(theme.LIGHT)
+    _mark_test_mode(window)
 
     def bring_forward() -> None:
         try:

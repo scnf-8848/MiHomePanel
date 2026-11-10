@@ -33,12 +33,21 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from mijiaAPI import mijiaAPI
-from mijiaAPI.errors import APIError
+from mijiaAPI.errors import APIError, ERROR_CODE
 
-from . import paths
+from . import dev_fault, paths
+from .health import (
+    NETWORK,
+    PROTOCOL,
+    RATE_LIMIT_TAIL,
+    SERVER,
+    Failure,
+    PollHealth,
+    classify_error,
+)
 from .tree import DeviceNode, group_devices, parse_virtual_did
 
 # 米家错误码格式：-70 + xxx(HTTP 状态码) + y(出错位置) + zzz(错误码)。
@@ -120,6 +129,34 @@ def classify(code: int) -> str:
     if tail in _TRANSIENT_TAILS:
         return "transient"
     return "unknown"
+
+
+#: 会直接弹给用户看的错误码释义。完整表在上游 ``mijiaAPI/errors.py``
+#: （注释里给了 ha_xiaomi_home 的 i18n 出处），这里只收本项目真碰得到的几条——
+#: 全抄一遍既没必要，也会随上游变动而失修。
+_CODE_TEXT: dict[int, str] = {
+    -704010000: "授权失效，设备可能已被删除",
+    -704014006: "没找到设备描述，先刷新设备列表",
+    -704040002: "这个型号没有该服务",
+    -704040005: "这个型号没有该动作",
+    -704042001: "设备不存在",
+    -704042011: "设备离线",
+    -704053036: "设备操作超时",
+    -704053100: "设备当前状态下不能做这个操作",
+    -704220008: "参数 ID 无效",
+    -704220025: "参数个数对不上（多半是参数没送到）",
+    -704220035: "参数值不合法",
+    -704222034: "动作返回值异常",
+    -705201015: "设备执行失败",
+}
+
+
+def explain(code: int) -> str:
+    """把错误码翻成一句人话，**始终带上原始码**，方便回头对文档。"""
+    if code in SUCCESS_CODES:
+        return ""
+    text = _CODE_TEXT.get(code)
+    return f"{text}（{code}）" if text else f"错误码 {code}"
 
 
 # ---------------------------------------------------------------------------
@@ -343,16 +380,24 @@ def _locate(homes_raw: Sequence[Mapping[str, Any]]) -> dict[str, tuple[str, str]
 class Client:
     """米家云端访问入口。"""
 
-    def __init__(self, *, api: mijiaAPI | None = None) -> None:
+    def __init__(self, *, api: mijiaAPI | None = None, health: PollHealth | None = None) -> None:
         self._lock = threading.RLock()
         self._api = api or mijiaAPI()
         # 中文界面就得用中文设备名。上游按系统 locale 猜，中文 Windows 上猜出来
         # 的是一个非法串，服务端回退英文（详见 apply_locale 的注释）。
         apply_locale(self._api)
         self.capabilities = CapabilityBook()
+        #: 轮询健康账本。记账点在请求层——只有这里拿得到原始错误码与异常文本，
+        #: 再往上（``Store``）异常已经变成空 dict 了。
+        self.health = health or PollHealth()
         self._mute: dict[PropRef, float] = {}
         self._mute_window = DEFAULT_MUTE
         self.last_error: str = ""
+        #: 最近一轮轮询到底读没读回来东西。``None`` = 上一次 ``read`` 不是轮询。
+        #: ``Store`` 判退避只能看这个，别再拿"返回值是不是 Mapping"当判据——失败时
+        #: ``read`` 返回的是空 dict，那也是 Mapping，会把整轮网络故障判成成功。
+        #: 正常空转（没有可读属性 / 全部确认不支持）算成功，见 ``_record_poll``。
+        self.last_poll_ok: bool | None = None
 
     # -- 认证 ------------------------------------------------------------
     @property
@@ -484,11 +529,21 @@ class Client:
         return Topology(homes=homes, devices=group_devices(rows))
 
     # -- 读 --------------------------------------------------------------
-    def read(self, refs: Iterable[PropRef], *, chunk: int = DEFAULT_CHUNK) -> dict[PropRef, ReadValue]:
+    def read(
+        self,
+        refs: Iterable[PropRef],
+        *,
+        chunk: int = DEFAULT_CHUNK,
+        source: str = "",
+    ) -> dict[PropRef, ReadValue]:
         """批量读属性。已确认不支持的、静默期内的会被跳过。
 
         返回的 dict 只包含"真的发了请求并且拿到响应"的条目；被跳过的不会出现，
         调用方据此保留旧值。
+
+        ``source="poll"`` 表示这是属性轮询（``Store.poll``），成功与失败都会记进
+        ``self.health``。详情页按需读、写后补读这些一次性请求传空串即可——它们不该
+        影响"轮询健康"的连续失败计数。
         """
         wanted: list[PropRef] = []
         seen: set[PropRef] = set()
@@ -504,30 +559,91 @@ class Client:
                 continue
             wanted.append(r)
         if not wanted:
+            if source == "poll":
+                # 这一轮没有任何属性要读（都被确认不支持 / 仍在静默期）。
+                # 这是正常空转，不能算失败，否则设备全掉线时会误报。
+                self.last_poll_ok = True
             return {}
 
         out: dict[PropRef, ReadValue] = {}
+        failure: Failure | None = None
+        # 开发用故障注入：按「轮询轮次」取一次异常工厂，只对 source="poll" 生效。
+        # 没设 MIHOME_DEV_FAULT 时 injector 为 None，这里等于什么都没做。
+        injector = dev_fault.current() if source == "poll" else None
+        injected = injector.next_poll_error() if injector is not None else None
         for i in range(0, len(wanted), chunk):
             batch = wanted[i : i + chunk]
-            out.update(self._read_batch(batch))
+            part, fail = self._read_batch(batch, injected)
+            out.update(part)
+            if fail is not None and failure is None:
+                # 一次 read 可能分多片，只按第一片的错误记一条，避免把
+                # "连续失败次数"按分片放大
+                failure = fail
+
+        if source == "poll":
+            self._record_poll(out, failure, len(wanted))
         return out
 
-    def _read_batch(self, batch: Sequence[PropRef]) -> dict[PropRef, ReadValue]:
+    def _record_poll(
+        self,
+        out: Mapping[PropRef, ReadValue],
+        failure: Failure | None,
+        wanted: int,
+    ) -> None:
+        """把这一轮轮询的结果记进健康账本，并给出"这轮到底成没成"的结论。"""
+        if failure is not None:
+            self.last_poll_ok = False
+            self.health.failure(failure)
+            return
+        good = sum(1 for rv in out.values() if rv.ok)
+        # 请求都回来了，但一条都没读到：整批属性都被服务端按错误码拒了
+        # （设备集体离线 / 网关掉线 / 属性集体不可读）。这不能算成功。
+        bad = [rv for rv in out.values() if not rv.ok and not rv.unsupported]
+        if not good and bad:
+            self.last_poll_ok = False
+            counts: dict[int, int] = {}
+            for rv in bad:
+                counts[rv.code] = counts.get(rv.code, 0) + 1
+            code = max(counts, key=lambda c: counts[c])
+            tail = abs(code) % 1000
+            kind = SERVER if tail == RATE_LIMIT_TAIL else NETWORK
+            detail = ERROR_CODE.get(str(code), "未知错误")
+            self.health.failure(
+                Failure(kind, str(code), f"{detail}（本轮 {len(bad)}/{wanted} 条全部失败）")
+            )
+            return
+        # 读到东西了，或压根没有"被拒绝"的条目（全是确认不支持）→ 这轮正常
+        self.last_poll_ok = True
+        self.health.success(items=good)
+
+    def _read_batch(
+        self,
+        batch: Sequence[PropRef],
+        injected: Callable[[], BaseException] | None = None,
+    ) -> tuple[dict[PropRef, ReadValue], Failure | None]:
+        """读一片属性。返回值第二项是请求层错误（用于健康记账），不改异常语义。
+
+        ``injected`` 只由开发用故障注入传入：在真正发请求的位置抛出，异常照样走
+        下面两个 ``except``，分类与真实故障一模一样。
+        """
         payload, remap = _wire_batch(batch)
         with self._lock:
             try:
+                if injected is not None:
+                    raise injected()
                 resp = self._api.get_devices_prop(payload)
             except APIError as exc:
                 self.last_error = f"读取失败: {exc}"
-                return {}
+                return {}, classify_error(exc)
             except Exception as exc:  # noqa: BLE001  网络层什么都可能抛
                 self.last_error = f"读取异常: {exc}"
-                return {}
+                return {}, classify_error(exc)
 
         if isinstance(resp, Mapping):
             resp = [resp]
         if not isinstance(resp, list):
-            return {}
+            self.last_error = f"读取失败: 响应结构异常（{type(resp).__name__}）"
+            return {}, Failure(PROTOCOL, "", self.last_error)
 
         # 响应按 (did, siid, piid) 回填；缺的条目说明也没读成功
         out: dict[PropRef, ReadValue] = {}
@@ -563,7 +679,7 @@ class Client:
         for r in batch:
             if r not in out:
                 out[r] = ReadValue(ref=r, code=-1)
-        return out
+        return out, None
 
     # -- 写 --------------------------------------------------------------
     def write(
@@ -628,14 +744,22 @@ class Client:
 
     # -- 动作 / 场景 -----------------------------------------------------
     def run_action(self, ref: tuple[str, int, int], value: Sequence[Any] | None = None) -> int:
-        """执行一次设备方法，(did, siid, aiid) → 错误码。"""
+        """执行一次设备方法，(did, siid, aiid) → 错误码。
+
+        参数键是 ``in``，**不是** ``value``：``value`` 是属性（``prop/set``）的键，
+        action 上用它会静默失效——云端按 ``in`` 找参数，一个都找不到，于是报
+        ``-704220025 Action参数个数不匹配``，看起来像"设备不支持"，实际是键名错。
+        依据：虚拟事件 ``siid 4 / aiid 1`` 用 ``in:["事件名"]`` 实测 ``code 0``
+        （见 ``docs/reference/mijia-automation-events.md``）；``-704220025`` 的释义
+        见 ``mijiaAPI/errors.py``。
+        """
         did, siid, aiid = ref
         virt = parse_virtual_did(did)
         if virt is not None:  # 子设备 did 同样要换成父 did + 该路 siid
             did, siid = virt[0], virt[1]
         item: dict[str, Any] = {"did": did, "siid": siid, "aiid": aiid}
         if value is not None:
-            item["value"] = list(value)
+            item["in"] = list(value)
         with self._lock:
             try:
                 resp = self._api.run_action(item)

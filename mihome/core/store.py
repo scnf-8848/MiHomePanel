@@ -28,7 +28,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
-from .api import Client, HomeNode, PropRef, ReadValue, Topology, classify
+from .api import Client, HomeNode, PropRef, ReadValue, Topology, classify, explain
 from .catalog import CardSpec, build_card, summary_line
 from .jobs import PRIORITY_CONTROL, PRIORITY_DATA, SerialWorker
 from .prefs import HIDDEN_ROOM, Prefs
@@ -164,6 +164,9 @@ class Store:
         # 只影响顶部家庭标签外观的偏好（排列方式 / 激活样式）。单独一个回调，
         # 免得改个字号就把整面卡片墙重建一遍。
         self.on_tabs_changed: Callable[[], None] | None = None
+        # 每轮轮询结束后回调一次（主线程），参数是 `PollHealth.snapshot()`。
+        # 界面拿它决定要不要弹提醒——Store 自己不判断"该不该打扰用户"。
+        self.on_poll_health: Callable[[dict[str, Any]], None] | None = None
         self._poll_generation = 0
         self._last_topology_change: set[str] = set()
         # (URN, 型号) → (源规格, 套了型号级文案的规格)。规格对象换了就重算；
@@ -594,6 +597,8 @@ class Store:
         self.worker.submit(
             self.client.read,
             (refs,),
+            # 只有属性轮询进健康账本；写后补读、详情页按需读不传 source
+            kwargs={"source": "poll"},
             priority=PRIORITY_DATA,
             label="poll",
             callback=lambda res, err: self._on_polled(gen, res, err),
@@ -604,17 +609,37 @@ class Store:
         if gen != self._poll_generation:  # 拓扑已重建，这批结果作废
             return
         self.last_poll = time.monotonic()
-        if error is not None or not isinstance(result, Mapping):
+        try:
+            self._apply_poll(result, error)
+        finally:
+            # 每轮结束都把健康快照交给界面。放 finally 里，失败分支也不会漏。
+            if self.on_poll_health is not None:
+                self.on_poll_health(self.client.health.snapshot())
+
+    def _apply_poll(self, result: Any, error: BaseException | None) -> None:
+        # 判据是"这轮到底读回来东西没有"，不是"返回值是不是 Mapping"：
+        # 整轮网络失败时 ``read`` 返回的是空 dict，那也是 Mapping，以前会被判成功，
+        # 于是退避永远不触发、界面还显示"已重新连接"。空读（没有可读属性 /
+        # 全部确认不支持）由 ``Client.last_poll_ok`` 区分为正常。
+        if (
+            error is not None
+            or not isinstance(result, Mapping)
+            or self.client.last_poll_ok is False
+        ):
             self._fail_streak += 1
             backoff = min(POLL_BACKOFF * self._fail_streak, 30.0)
             self._next_poll_at = time.monotonic() + backoff
-            self.last_error = f"轮询失败：{error}"
+            reason = error or self.client.last_error or "本轮没有读回任何属性"
+            self.last_error = f"轮询失败：{reason}"
+            # 退避的起始时间与当前间隔一并记进健康账本（不改变退避本身的计算）
+            self.client.health.backoff(streak=self._fail_streak, seconds=backoff)
             if self._fail_streak == 1:
                 self._status(f"连接不稳定，{int(backoff)} 秒后重试…")
             return
         if self._fail_streak:
             self._fail_streak = 0
             self._next_poll_at = 0.0
+            self.client.health.backoff(streak=0, seconds=0.0)
             self._status("已重新连接")
         changed: set[str] = set()
         now = time.monotonic()
@@ -870,15 +895,35 @@ class Store:
         cur = st.values.get((siid, piid))
         self.set_value(did, (siid, piid), not bool(cur), mute=2.0)
 
-    def run_action(self, did: str, siid: int, aiid: int, value: Sequence[Any] | None = None) -> None:
+    def run_action(
+        self,
+        did: str,
+        siid: int,
+        aiid: int,
+        value: Sequence[Any] | None = None,
+        *,
+        on_done: Callable[[int, str], None] | None = None,
+    ) -> None:
+        """执行一次设备方法。``on_done`` 收到 ``(错误码, 失败原因)``，0 表示成功。
+
+        码与原因都是 ``Client.run_action`` 的既有契约（云端非 0 码会原样返回，
+        异常统一 -1 并在 ``last_error`` 里留一句话），这里只做搬运。
+        """
+
         def done(res: Any, err: BaseException | None) -> None:
             if err is not None:
                 st = self.devices.get(did)
                 if st:
                     st.error = f"动作失败：{err}"
                     self._changed({did})
+                code = -1
+                reason = str(err)
             else:
+                code = int(res) if isinstance(res, int) else 0
+                reason = "" if code == 0 else (self.client.last_error or explain(code))
                 self.reraise(did)
+            if on_done is not None:
+                on_done(code, reason)
 
         self.worker.submit(
             self.client.run_action,

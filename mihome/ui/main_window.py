@@ -17,6 +17,8 @@
 
 from __future__ import annotations
 
+import time
+
 from PySide6.QtCore import (
     QByteArray,
     QEvent,
@@ -37,16 +39,20 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ..core.api import Client
+from ..core import speaker
+from ..core.alerts import Alert, AlertPolicy
+from ..core.api import Client, explain
 from ..core.icons import IconCache
 from ..core.jobs import SerialWorker
-from ..core.prefs import Prefs
 from ..core.poll_demand import PollDemandBoard
+from ..core.prefs import Prefs
 from ..core.store import Store
 from . import theme, tooltip
+from .alert_bar import AlertBar
 from .chrome import DimOverlay, TitleBar, WindowFrame, exec_with_dim_click
 from .home_tabs import HomeTabs
 from .side_nav import SideNav
+from .speaker_bar import SpeakerBar
 from .tray import TrayController
 from .wall import WallView
 from .widgets import HLine, IconProvider, StatusChip
@@ -59,6 +65,12 @@ POLL_MS = 3000
 #: 的第一眼更容易看到旧值（点开会立刻补一轮，可那一轮也得几百毫秒才回来）。
 POLL_HIDDEN_MS = 15_000
 TOPOLOGY_MS = 5 * 60 * 1000  # 设备列表低频刷新：新增设备不用手动点刷新
+
+#: 顶部那条横带的边距（左 / 上 / 右）。指令条按这三个值摆，警告条浮层也按它
+#: 定位——两者叠在一起时轮廓必须重合。左右取 28 而不是 24：``WallView`` 的内容
+#: 边距就是 28，指令条要和下面第一张卡片左对齐，整列才不会差半格。
+ALERT_MARGIN_X = 28
+ALERT_MARGIN_TOP = 12
 
 
 def _refresh_path(c: QPointF, half: float) -> QPainterPath:
@@ -250,15 +262,57 @@ class MainWindow(QMainWindow):
         self.nav.room_selected.connect(self._on_room_selected)
         self.nav.settings_requested.connect(self.open_settings)
         body_row.addWidget(self.nav)
+
+        # 右侧：顶部指令条 + 卡片墙。指令条占的正是警告条浮层那条横带
+        # （同一个 ALERT_MARGIN_X / ALERT_MARGIN_TOP + AlertBar.H），所以警告条
+        # 一出现就正好压住它——这是定下的预期，不改浮层层级。
+        right = QWidget(body)
+        right_col = QVBoxLayout(right)
+        right_col.setContentsMargins(0, 0, 0, 0)
+        right_col.setSpacing(0)
+        band = QWidget(right)
+        band_row = QHBoxLayout(band)
+        band_row.setContentsMargins(ALERT_MARGIN_X, ALERT_MARGIN_TOP, ALERT_MARGIN_X, 8)
+        band_row.setSpacing(0)
+        self.speaker_bar = SpeakerBar(self.palette_ref, self.icon_provider, band)
+        self.speaker_bar.sent.connect(self._on_speaker_send)
+        self.speaker_bar.target_changed.connect(self._on_speaker_target)
+        self.speaker_bar.silent_changed.connect(self._on_speaker_silent)
+        # 启动时把上次的静默状态灌进去。放在 connect 之后：set_silent 会发
+        # silent_changed，回调里再回写一遍同样的值，set_speaker_silent 判等后不落盘
+        self.speaker_bar.set_silent(self.prefs.speaker_silent)
+        band_row.addWidget(self.speaker_bar)
+        right_col.addWidget(band)
+
         self.wall = WallView(self.store, self.icon_provider, self.palette_ref)
-        body_row.addWidget(self.wall, 1)
+        right_col.addWidget(self.wall, 1)
+        body_row.addWidget(right, 1)
         col.addWidget(body, 1)
+
+        # -- 顶部警告条：浮层，不参与布局 --------------------------------
+        # 父控件是 body（侧栏 + 卡片墙的容器）。几何完全手动给，只占卡片自身
+        # 矩形：出现/消失不引起任何重排，也不会盖住下方的滚轮与点击（那些坐标
+        # 根本不在浮层矩形里）。显示时 raise 到兄弟控件最上层，压在滚动区与
+        # 卡片之上；body 尺寸一变就跟着重新定位。
+        self._alerts = AlertPolicy()
+        self.alert_bar = AlertBar(self.palette_ref)
+        self.alert_bar.dismissed.connect(self._on_alert_dismissed)
+        self._alert_host = QWidget(body)
+        host_row = QVBoxLayout(self._alert_host)
+        host_row.setContentsMargins(0, 0, 0, 0)
+        host_row.setSpacing(0)
+        host_row.addWidget(self.alert_bar)
+        self._alert_host.hide()
+        self._body = body
+        body.installEventFilter(self)
 
         self.store.on_changed = self._on_changed
         self.store.on_loaded = self._on_loaded
         self.store.on_status = self._set_status
         self.store.on_layout_changed = self._on_layout_changed
         self.store.on_tabs_changed = self._refresh_tabs
+        # 每轮轮询结束后把健康快照交给界面，由 AlertPolicy 决定要不要提醒
+        self.store.on_poll_health = self._on_poll_health
 
         self.wall.card_toggled.connect(self._on_toggle)
         self.wall.card_value_committed.connect(self._on_card_value)
@@ -371,6 +425,56 @@ class MainWindow(QMainWindow):
         if tray is not None:
             tray.set_status(text)
 
+    # -- 轮询异常提醒 ----------------------------------------------------
+    def _place_alert(self) -> None:
+        """把浮层摆到卡片墙顶部。只改自己的几何，不碰任何布局。"""
+        body = getattr(self, "_body", None)
+        host = getattr(self, "_alert_host", None)
+        if body is None or host is None:
+            return
+        # 只盖卡片区，不压住左侧房间栏：左边从侧栏右缘算起，左右各留同样边距
+        left = self.nav.width() + ALERT_MARGIN_X
+        width = max(0, body.width() - left - ALERT_MARGIN_X)
+        host.setGeometry(left, ALERT_MARGIN_TOP, width, AlertBar.H)
+
+    def eventFilter(self, obj, event) -> bool:  # noqa: N802
+        # body 跟着窗口缩放时，浮层自己重新定位（它不在布局里，没人替它做）
+        if obj is getattr(self, "_body", None) and event.type() == QEvent.Resize:
+            self._place_alert()
+        return super().eventFilter(obj, event)
+
+    def _on_poll_health(self, snapshot: dict) -> None:
+        """每轮轮询结束后的提醒决策。全部在主线程，不需要跨线程处理。"""
+        update = self._alerts.observe(snapshot, time.monotonic())
+        if update.hide:
+            self._alert_host.hide()
+        if update.bar is not None:
+            self.alert_bar.set_alert(update.bar.level, update.bar.title, update.bar.detail)
+            self._place_alert()
+            self._alert_host.show()
+            # 后加的孩子默认就在上面，但卡片墙会随房间切换重建，显式抬一次最稳
+            self._alert_host.raise_()
+        if update.toast is not None:
+            self._notify(update.toast)
+
+    def _notify(self, alert: Alert) -> None:
+        """系统通知。弹不出来（没有托盘 / 系统关了通知）时什么都不发生，
+        顶部那条横幅已经是兜底通道。"""
+        tray = getattr(self, "tray", None)
+        if tray is None:
+            return
+        tray.show_message(
+            "米家控制台",
+            f"{alert.title} · {alert.detail}",
+            8000,
+            warning=alert.level != "success",
+        )
+
+    def _on_alert_dismissed(self) -> None:
+        # 关掉只是不再打扰，状态胶囊与日志照旧记录
+        self._alerts.dismiss()
+        self._alert_host.hide()
+
     def changeEvent(self, event) -> None:  # noqa: N802
         super().changeEvent(event)
         if event.type() == QEvent.WindowStateChange:
@@ -479,6 +583,8 @@ class MainWindow(QMainWindow):
         self._save_settings()
         self.prefs.save()
         self.client.flush()
+        # 把本次运行结束时的轮询健康状况落盘，下次启动能看出上次到底好不好
+        self.client.health.close()
         self.worker.stop()
 
     # -- 启动 ------------------------------------------------------------
@@ -585,6 +691,7 @@ class MainWindow(QMainWindow):
         self.nav.build(self.store, name)
         self._settings().setValue("ui/active_home", name)
         self._update_header()
+        self._refresh_speakers()
         self.store.poll()
 
     def _refresh_tabs(self) -> None:
@@ -600,6 +707,7 @@ class MainWindow(QMainWindow):
     def _on_changed(self, dids: set[str]) -> None:
         self.wall.update_cards(dids)
         self._update_header()
+        self._refresh_speakers()
 
     def _on_layout_changed(self) -> None:
         """排序或隐藏设备变了：墙和导航都要重建（顺序变了无法增量更新）。"""
@@ -649,7 +757,61 @@ class MainWindow(QMainWindow):
             # 设备集合没变：只刷新卡片，保住滚动位置和鼠标悬停
             self.wall.update_cards(set(self.store.devices))
         self._update_header()
+        self._refresh_speakers()
         self.store.poll()
+
+    # -- 顶栏音箱指令条 --------------------------------------------------
+    def _refresh_speakers(self) -> None:
+        """把"哪些设备能执行文本指令"重新灌给指令条。
+
+        每轮轮询后都会走一次（``_on_changed``）：在线状态一变，候选列表的置灰与
+        输入框的可用性就要跟着变。构造都是轻量 dataclass，三条五条不构成开销。
+
+        只取**当前家庭**的设备：指令条跟着这一屏的卡片墙走，跨家庭把别处的音箱列进来
+        会让人找不到是哪台（判据与 ``_update_header`` 的台数统计一致）。
+        """
+        bar = getattr(self, "speaker_bar", None)
+        if bar is None:  # 构造期间（store 回调早于指令条）
+            return
+        active = self.store.active_home
+        states = [
+            d for d in self.store.devices.values()
+            if not d.node.home or d.node.home == active
+        ]
+        bar.set_targets(speaker.collect(states), self.prefs.speaker_command_did)
+
+    def _on_speaker_target(self, did: str) -> None:
+        self.prefs.set_speaker_command_did(did)
+
+    def _on_speaker_silent(self, on: bool) -> None:
+        self.prefs.set_speaker_silent(on)
+
+    def _on_speaker_send(self, text: str) -> None:
+        target = self.speaker_bar.target()
+        if target is None or not target.online:
+            return
+        silent = self.speaker_bar.silent()
+        self.store.run_action(
+            target.did,
+            target.siid,
+            target.aiid,
+            speaker.directive(target, text, silent),
+            on_done=lambda code, reason: self._on_speaker_done(
+                target, text, code, reason, silent
+            ),
+        )
+
+    def _on_speaker_done(
+        self, target: speaker.Target, text: str, code: int, reason: str, silent: bool = False
+    ) -> None:
+        short = text if len(text) <= 18 else text[:18] + "…"
+        if code == 0:
+            # 静默时补一句：音箱此刻一声不出，不写清楚就像没发出去
+            tail = "（静默）" if silent else ""
+            self.speaker_bar.notice(f"{target.name} 已收到{tail}：{short}")
+        else:
+            # reason 由 store 备好（云端码已翻成人话，异常则带原文）
+            self.speaker_bar.notice(f"发送失败：{reason or explain(code)}")
 
     def _on_toggle(self, did: str, siid: int, piid: int) -> None:
         st = self.store.devices.get(did)
@@ -685,6 +847,18 @@ class MainWindow(QMainWindow):
         self.search.selectAll()
 
     def _clear_search(self) -> None:
+        """``Esc``：先照顾正在输入的那一格。
+
+        光标在指令条里时，按 Esc 却清掉顶栏搜索框是莫名其妙的——按"离光标最近的
+        输入框"来排序：指令条有字就清字，没字就交出焦点，然后才轮到搜索框。
+        """
+        bar = getattr(self, "speaker_bar", None)
+        if bar is not None and bar.input.hasFocus():
+            if bar.input.text():
+                bar.input.clear()
+            else:
+                bar.input.clearFocus()
+            return
         if self.search.text():
             self.search.clear()
         else:
@@ -710,6 +884,10 @@ class MainWindow(QMainWindow):
         for card in self.wall._cards.values():  # noqa: SLF001
             if card.state.node.model == model:
                 card.update()
+        # 指令条左侧那台音箱也在等图（产品图是异步抓的）
+        bar = getattr(self, "speaker_bar", None)
+        if bar is not None and bar.target() is not None and bar.target().model == model:
+            bar.update_icon()
 
     # -- 设置 ------------------------------------------------------------
     def open_settings(self) -> None:
@@ -756,6 +934,8 @@ class MainWindow(QMainWindow):
         finally:
             self._dim.cover(False)
         self.store.clear()
+        # 设备列表空了，指令条也别再挂着一台已经不认识的音箱
+        self.speaker_bar.set_targets([])
         self.wall.show_placeholder("已退出登录，扫码后可继续使用")
         self.tabs.set_homes([], "")
         self.nav.build(self.store, "")
@@ -787,6 +967,8 @@ class MainWindow(QMainWindow):
         self.wall.rebuild_palette(pal)
         self._dim.set_palette(pal)
         self.status.set_palette(pal)
+        self.alert_bar.set_palette(pal)
+        self.speaker_bar.set_palette(pal)
         tooltip.set_palette(pal)
         tray = getattr(self, "tray", None)
         if tray is not None:
