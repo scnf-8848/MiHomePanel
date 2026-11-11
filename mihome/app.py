@@ -72,16 +72,20 @@ def self_check() -> int:
         ok = ok and good
         say(f"[{'OK' if good else 'FAIL'}] go2rtc：{binary}")
         say(f"       版本：{version or '（没有输出）'}")
-        # 打了开播补丁的构建会留一份 BUILD.txt，用它区分"2 秒"和"5 秒"
+        # 打了补丁的构建会留一份 BUILD.txt，用它区分"2 秒"和"5 秒"、有没有云台
         build_txt = binary.parent / "BUILD.txt"
         if build_txt.is_file():
-            patch = [
-                ln for ln in build_txt.read_text(encoding="utf-8").splitlines()
-                if ln.startswith("patch=")
-            ]
-            say(f"       开播补丁：{patch[0][6:] if patch else '（BUILD.txt 里没写）'}")
+            # 老格式 `patch=<一个补丁>`，新格式 `patches=<a>,<b>`
+            line = next(
+                (
+                    ln for ln in build_txt.read_text(encoding="utf-8").splitlines()
+                    if ln.startswith(("patch=", "patches="))
+                ),
+                "",
+            )
+            say(f"       本地补丁：{line.split('=', 1)[1] if line else '（BUILD.txt 里没写）'}")
         else:
-            say("       开播补丁：没有 → 首帧会是 4.8–6.3 秒（见 docs/DEVELOPMENT.md「开播补丁」）")
+            say("       本地补丁：没有 → 首帧会是 4.8–6.3 秒、云台不可用（见 docs/DEVELOPMENT.md「开播补丁」）")
 
     app = QCoreApplication.instance() or QCoreApplication([])
     try:

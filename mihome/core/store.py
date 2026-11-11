@@ -109,6 +109,10 @@ class DeviceState:
                 v = self.values.get(c.prop.key)
                 return bool(v) if v is not None else None
         for g in card.gangs:
+            if g.is_wireless(self.values):
+                # 转无线的路继电器恒通，但那是"给灯供电"，不是"这盏灯开着"：
+                # 拿它算"已开启"，整块面板会永远显示开着，房间标题的台数也虚高。
+                continue
             v = self.values.get(g.power.key)
             if v:
                 return True
@@ -117,7 +121,12 @@ class DeviceState:
     @property
     def any_on(self) -> bool:
         if self.card.gangs:
-            return any(self.values.get(g.power.key) for g in self.card.gangs)
+            # 全部转无线的面板没有可切换的负载，不该被算成"开着"
+            return any(
+                self.values.get(g.power.key)
+                for g in self.card.gangs
+                if not g.is_wireless(self.values)
+            )
         return bool(self.power)
 
     @property
@@ -176,6 +185,14 @@ class Store:
         # 某台设备的「有没有极客版」探出来了（参数是 did）。界面拿它刷菜单提示，
         # Store 自己不改界面。
         self.on_geek_ability: Callable[[str], None] | None = None
+        #: 刚**发出**一条写请求（主线程，乐观值已经落到 ``st.values`` 里）。
+        #:
+        #: 界面拿它开"指令后高频轮询"窗口：写入是乐观的，屏幕上显示的就是目标值，
+        #: 真正要确认的是设备有没有照做——那必须靠回读。这个回调只说明"有事发生了"，
+        #: 具体多快、持续多久由界面决定（Store 不该知道轮询频率）。
+        #: 放在这里而不是各个 UI 入口：写入口有卡片、详情页、场景、批量、音箱指令
+        #: 好几处，逐处接线一定会漏。
+        self.on_write_sent: Callable[[], None] | None = None
         self._poll_generation = 0
         self._last_topology_change: set[str] = set()
         # (URN, 型号) → (源规格, 套了型号级文案的规格)。规格对象换了就重算；
@@ -787,7 +804,18 @@ class Store:
             label="write",
             callback=done,
         )
+        self._notify_write()
         return True
+
+    def _notify_write(self) -> None:
+        """告诉界面"刚发了一条写指令"。回调异常不许污染写入链路。"""
+        cb = self.on_write_sent
+        if cb is None:
+            return
+        try:
+            cb()
+        except Exception:  # noqa: BLE001
+            pass
 
     def _on_written(
         self,
@@ -835,6 +863,9 @@ class Store:
                 if ctl.slot == "power" and ctl.prop is not None:
                     targets.append((did, ctl.prop.key))
             for g in st.card.gangs:
+                if g.is_wireless(st.values):
+                    # 转无线那一路写 on/off 没有意义（固件不认），批量关灯时跳过
+                    continue
                 targets.append((did, g.power.key))
         return self.set_many(targets, value, mute=2.0)
 
@@ -901,6 +932,7 @@ class Store:
             label="write-many",
             callback=done,
         )
+        self._notify_write()
         return len(pairs)
 
     def toggle(self, did: str, siid: int, piid: int) -> None:
@@ -947,6 +979,7 @@ class Store:
             label="action",
             callback=done,
         )
+        self._notify_write()
 
     # -- 极客版能力探测 ----------------------------------------------------
     #: 一次启动最多探几台。探测是"每台一次、结论落盘"的成本，但设备多的家里
@@ -1029,6 +1062,9 @@ class Store:
             label="scene",
             callback=self._on_scene_done,
         )
+        # 场景会改动一批设备，"刚发过指令"这件事对自动化的意义更大：接下来
+        # 那 5 秒要连着几轮才看得出一组设备各自变成了什么
+        self._notify_write()
 
     def _on_scene_done(self, result: Any, error: BaseException | None) -> None:
         self._status("场景执行失败" if error or result is False else "场景已执行")
@@ -1071,6 +1107,10 @@ def _card_props(card: CardSpec) -> list[tuple[tuple[int, int], Any]]:
             out.append((m.prop.key, m.prop))
     for g in card.gangs:
         out.append((g.power.key, g.power))
+        # 每一路的"有线 / 转无线"必须跟着轮询走：它决定这一路能不能点。
+        # 单独读 mode 的属性名和 on 同服务，寻址不冲突（(siid,2) vs (siid,1)）。
+        if g.mode is not None and g.wireless_value is not None:
+            out.append((g.mode.key, g.mode))
     # 型号级轮询扩展（CardSpec.extra）：只读状态，不渲染，但要跟着轮询走。
     # 未适配的机型这里是空列表，所以轮询集合完全不变。
     for p in card.extra:

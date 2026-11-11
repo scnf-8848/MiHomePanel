@@ -83,10 +83,18 @@ def resolve_go2rtc(explicit: str) -> Path:
             "或 scripts/install_go2rtc.py（官方版，首帧 5 秒），或用 --go2rtc 指过去。"
         )
     binary = Path(binary)
-    patched = (binary.parent / "BUILD.txt").is_file()
+    record = binary.parent / "BUILD.txt"
+    patched = record.is_file()
     log(f"go2rtc：{binary}")
-    log(f"  开播补丁：{'有（首帧约 2 秒）' if patched else '没有（首帧 4.8–6.3 秒）'}")
-    if not patched:
+    if patched:
+        text = record.read_text(encoding="utf-8", errors="replace")
+        has_ptz = "ptz" in text
+        log(
+            "  本地补丁：有（首帧约 2 秒"
+            + ("，含云台）" if has_ptz else "；**没有云台补丁**，详情页不会建方向盘）")
+        )
+    else:
+        log("  本地补丁：没有（首帧 4.8–6.3 秒，也没有云台）")
         log("  提醒：装的是官方构建，打出去别人也是 5 秒。要 2 秒先跑 build_go2rtc.py。")
     return binary
 
@@ -127,8 +135,11 @@ def write_notice(dest: Path, go2rtc: Path) -> None:
         f"同目录的 go2rtc/go2rtc.exe 是第三方组件 {GO2RTC_REPO}（MIT），\n"
         "用于把小米摄像头的 P2P 码流转成本机 RTSP。它是独立进程，由本程序启动。\n"
         + (
-            "本发行包内的这一份带有本地补丁（pkg/xiaomi/miss/producer.go::Dial()：\n"
-            "probe 之后重起一次视频流，消掉「等一个 GOP」的首帧延迟）。\n"
+            "本发行包内的这一份带有本地补丁：\n"
+            "  · pkg/xiaomi/miss/producer.go::Dial()：probe 之后重起一次视频流，\n"
+            "    消掉「等一个 GOP」的首帧延迟；\n"
+            "  · pkg/xiaomi/miss/client.go：云台控制（0x112 帧 + 命令通道常驻消费），\n"
+            "    对外暴露 GET /api/xiaomi/ptz。\n"
             f"构建信息：\n{build}\n" if build else "本发行包内的是上游官方构建。\n"
         )
         + "\n许可证原文：go2rtc/LICENSE；本项目：LICENSE。\n",

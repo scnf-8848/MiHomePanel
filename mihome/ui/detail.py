@@ -43,13 +43,17 @@ from ..core.store import DeviceState, Store
 from . import theme, tooltip
 from .camera_popout import CameraPopoutWindow
 from .camera_view import CameraView, PlaybackOwnership, playbacks
-from .card_controls import CardSlider, CardStepper
+from .card_controls import MAX_SEGMENTS, CardSeg, CardSlider, CardStepper
 from .chrome import TitleBar, WindowFrame, surface_bg, surface_border
 from .combo import Combo
 from .ptz_pad import PtzPad
 from .widgets import ElidedLabel, IconProvider, ToggleSwitch, draw_text
 
 PAD = 22
+#: 枚举行用轨道时允许的最大自然宽度。窗口 480、两侧各 22 的边距，左侧属性名
+#: 还要留出四五个字（约 110），再减去行内间距 12 —— 剩下 260 上下。
+#: 超过就退回下拉：轨道放不下只能截字，而下拉能把二十项列清楚。
+SEG_MAX_W = 260
 
 # 【取流计时】画面状态的中文名，只用于 core/timing.py 的日志
 _CAM_STATE_NAMES = {
@@ -108,28 +112,34 @@ class ControlRow(QWidget):
             sw.toggled.connect(lambda v: self.changed.emit(prop.siid, prop.piid, v))
             self.editor = sw
         elif role == "select" and prop.value_list:
-            # 下拉框走全局 Combo：箭头、弹出层圆角、禁滚轮都和设置页一致，
-            # 样式表也在那一处维护，这里不再各自写一份（曾经常年漏改深色）。
-            box = Combo(palette)
-            # 没有值可显示时（未读到 / 客户端"无激活项"）由 placeholder 兜底，
-            # 不往列表里塞假选项：假选项既能被写出去，也会被当成枚举值回读。
-            box.setPlaceholderText(_PLACEHOLDER)
-            # 枚举项的 comment 常常是一整句中文（"空场景（灯不在任何情况模式时…）"），
-            # 按内容撑宽会顶出卡片，所以固定按 10 个字宽度算，多余部分由控件自己截。
-            box.setMinimumContentsLength(10)
-            box.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
-            box.setMaximumWidth(240)
-            for o in prop.value_list:
-                # 短名来自 core/enum_text.py 的人工映射（云端原文常是整句中文或英文）；
-                # 没映射过的由那一层截断。完整说明仍然挂在 tooltip 上，信息不丢。
-                box.addItem(o.display_short, o.value)
-                if o.display != o.display_short:
-                    box.setItemData(box.count() - 1, o.display, Qt.ToolTipRole)
-            box.setEnabled(write)
-            box.currentIndexChanged.connect(
-                lambda i: self.changed.emit(prop.siid, prop.piid, box.itemData(i))
-            )
-            self.editor = box
+            seg = self._build_seg(prop, palette, accent, write)
+            if seg is not None:
+                self.editor = seg
+            else:
+                # 退回下拉框。**不是降级体验**：轨道放不下（枚举项多、文案长）时
+                # 下拉才是对的——它能把二十项都列出来，轨道只能截字。
+                # 下拉框走全局 Combo：箭头、弹出层圆角、禁滚轮都和设置页一致，
+                # 样式表也在那一处维护，这里不再各自写一份（曾经常年漏改深色）。
+                box = Combo(palette)
+                # 没有值可显示时（未读到 / 客户端"无激活项"）由 placeholder 兜底，
+                # 不往列表里塞假选项：假选项既能被写出去，也会被当成枚举值回读。
+                box.setPlaceholderText(_PLACEHOLDER)
+                # 枚举项的 comment 常常是一整句中文（"空场景（灯不在任何情况模式时…）"），
+                # 按内容撑宽会顶出卡片，所以固定按 10 个字宽度算，多余部分由控件自己截。
+                box.setMinimumContentsLength(10)
+                box.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+                box.setMaximumWidth(240)
+                for o in prop.value_list:
+                    # 短名来自 core/enum_text.py 的人工映射（云端原文常是整句中文或英文）；
+                    # 没映射过的由那一层截断。完整说明仍然挂在 tooltip 上，信息不丢。
+                    box.addItem(o.display_short, o.value)
+                    if o.display != o.display_short:
+                        box.setItemData(box.count() - 1, o.display, Qt.ToolTipRole)
+                box.setEnabled(write)
+                box.currentIndexChanged.connect(
+                    lambda i: self.changed.emit(prop.siid, prop.piid, box.itemData(i))
+                )
+                self.editor = box
         elif role == "stepper" and prop.value_range:
             self.editor = self._build_stepper(prop, palette, accent, write)
         elif role == "slider" and prop.value_range:
@@ -150,6 +160,34 @@ class ControlRow(QWidget):
 
         if self.editor is not None:
             row.addWidget(self.editor, 0, Qt.AlignRight)
+
+    def _build_seg(self, prop: PropertySpec, palette: theme.Palette, accent: str, write: bool) -> QWidget | None:
+        """单选枚举用卡片同款轨道分段（``CardSeg``），放不下返回 ``None``。
+
+        为什么详情页也换：同一个属性在卡片上是轨道、在详情页是下拉，两处手感
+        不一致，用户得记两套。而且轨道的"选中段实心染色 + 反色字"比下拉框那
+        一行小字更容易一眼看出当前是哪一档。
+
+        判据是 ``sizeHint()``（按 12px 字号量的自然宽度）不超过 ``SEG_MAX_W``：
+        超了就是"段里的字要截"，那还不如让下拉把所有项列清楚。**不试字号**——
+        详情页和卡片的字号必须一样，为了塞下而在详情页缩到 10px 只会显得没做完。
+        """
+        if len(prop.value_list) > MAX_SEGMENTS:
+            return None
+        seg = CardSeg(prop, palette, accent, label="", parent=self)
+        if seg.sizeHint().width() > SEG_MAX_W:
+            seg.deleteLater()
+            return None
+        # 按量出来的宽度钉死：``CardControl`` 的 size policy 是 Expanding，
+        # 交给布局分配的话会被左侧属性名挤窄（实测 254 → 159，段里的字就开始截），
+        # 而这一行的语义是"名字让位给控件"——名字本来就有省略号（``ElidedLabel``）
+        seg.setFixedWidth(seg.sizeHint().width())
+        seg.setEnabled(write)
+        seg.committed.connect(
+            lambda v: self.changed.emit(prop.siid, prop.piid, v)
+        )
+        self.seg = seg
+        return seg
 
     def _build_stepper(self, prop: PropertySpec, palette: theme.Palette, accent: str, write: bool) -> QWidget:
         """温度这类精确刻度用卡片 body 同款步进器：``− 数值 +``。
@@ -188,12 +226,20 @@ class ControlRow(QWidget):
         return slider
 
     def select_value(self, value: Any) -> bool:
-        """下拉框按值选中；``value`` 不在列表里返回 ``False``（不改变显示）。
+        """按值选中；``value`` 不在列表里返回 ``False``（不改变显示）。
 
         给"客户端语义值"用：例如挂灯的 scene-mode=0 在 ``mode`` 的枚举里没有
-        对应项，这时不能伪造一个选项，只能让下拉显示占位文案。
+        对应项，这时不能伪造一个选项，只能让控件显示占位文案。
         """
         ed = self.editor
+        if isinstance(ed, CardSeg):
+            # 轨道没有"占位项"，只能"一段都不点亮"；值不在枚举里就什么都不动
+            # （保留上一次的选择），由调用方决定要不要提示
+            for o in self.prop.value_list:
+                if o.value == value:
+                    ed.set_value(value)
+                    return True
+            return False
         if not isinstance(ed, QComboBox):
             return False
         idx = ed.findData(value)
@@ -206,12 +252,21 @@ class ControlRow(QWidget):
         return True
 
     def set_no_selection(self, text: str) -> None:
-        """下拉框显示一段**客户端**占位文案，且不选中任何真实枚举项。
+        """显示一段**客户端**占位文案，且不选中任何真实枚举项。
 
         ``text`` 只是"当前值不属于这个枚举"的说明（如"无"），不能被写出去：
         下拉停在 ``currentIndex() == -1``，选任何一项仍然是正常写请求。
+
+        **轨道上没有能放一行小字的地方**，所以只能"一段都不点亮 + 把说明挂
+        tooltip"。宁可空着，也不要"保留上一次的选中"——那会显示一个设备其实现
+        在不在的状态，比不显示更糟。闪烁由 ``_refresh_mode`` 的 ``_mode_pending``
+        挡住（刚点完的那几百毫秒不去动它）。
         """
         ed = self.editor
+        if isinstance(ed, CardSeg):
+            ed.set_unknown()
+            ed.setToolTip(text)
+            return
         if not isinstance(ed, QComboBox):
             return
         ed.blockSignals(True)
@@ -219,14 +274,19 @@ class ControlRow(QWidget):
         ed.setCurrentIndex(-1)
         ed.blockSignals(False)
 
-    def set_enabled(self, online: bool) -> None:
-        """离线时控件不可操作；只读读数（QLabel）不受影响。"""
+    def set_enabled(self, online: bool, *, locked: bool = False) -> None:
+        """离线时控件不可操作；只读读数（QLabel）不受影响。
+
+        ``locked`` 是"设备在线但这一行本来就不该操作"（多键面板转无线的那一路）：
+        和离线一样变灰、关掉编辑器，区别只在这不是故障。
+        """
+        active = online and not locked
         self.name.setStyleSheet(
-            f"color:{self._p.text if online else self._p.text_mute}; font-size:14px;"
+            f"color:{self._p.text if active else self._p.text_mute}; font-size:14px;"
         )
         if self.editor is None or isinstance(self.editor, QLabel):
             return
-        self.editor.setEnabled(online and self._write)
+        self.editor.setEnabled(active and self._write)
 
     def set_value(self, value: Any) -> None:
         ed = self.editor
@@ -245,6 +305,8 @@ class ControlRow(QWidget):
             ed.blockSignals(True)
             ed.set_on(bool(value), animate=False)
             ed.blockSignals(False)
+        elif isinstance(ed, CardSeg):
+            ed.set_value(value)
         elif isinstance(ed, QComboBox):
             idx = ed.findData(value)
             if idx >= 0:
@@ -286,6 +348,8 @@ class ControlRow(QWidget):
             ed.blockSignals(True)
             ed.set_on(False, animate=False)
             ed.blockSignals(False)
+        elif isinstance(ed, CardSeg):
+            ed.set_unknown()
         elif isinstance(ed, QComboBox):
             ed.blockSignals(True)
             ed.setPlaceholderText(_PLACEHOLDER)  # 清掉上一轮可能留下的"无"等客户端文案
@@ -330,6 +394,12 @@ class DetailDialog(QDialog):
         self._readout_rows: list[ControlRow] = []
         #: 挂灯这类机型的"模式"行：激活项看 scene-mode(3,9)，见 ``_sync_mode_row``
         self._mode_row: ControlRow | None = None
+        #: 多键面板：siid → 那一行的控件。转无线的那一路要随时能改回"不可操作"，
+        #: 所以行要留下来按 siid 找（模式在设备侧改了，轮询会读到新值）。
+        self._gang_rows: dict[int, ControlRow] = {}
+        #: 同一功能两套属性的行（风扇的风速/档位）：槽位 → 行。按当前模式只留一行，
+        #: 规则来自 ``CardSpec.speed_by_mode``（型号级），没有规则的设备这里是空的。
+        self._speed_rows: dict[str, ControlRow] = {}
         #: 用户刚点过模式、设备还没把 scene-mode 改过来的过渡态
         self._mode_pending = False
         self.setWindowTitle(state.name)
@@ -439,6 +509,11 @@ class DetailDialog(QDialog):
         self._build_advanced()
         self._col.addStretch(1)
         self._sync_hide_button()
+        # 建完立刻按 store 里的当前值填一遍。只靠下面那个 600ms 的定时器，第一帧
+        # 会是控件的"出厂态"——滑条停在最左、轨道一段都不亮、开关默认关着——用户
+        # 看到的是"先空一下才变成真实值"（2026-11-12 用户报）。而 store 里明明
+        # 已经有这些数了：轮询一直在跑，卡片上也是对的，没道理进详情页先空一帧。
+        self._sync()
 
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._sync)
@@ -1044,6 +1119,11 @@ class DetailDialog(QDialog):
         self._col.addWidget(box)
         return lay
 
+    @staticmethod
+    def _gang_text(gang, wireless: bool) -> str:
+        """多键面板的行名。转无线那一路在后面标一句，否则用户会以为开关坏了。"""
+        return f"{gang.label}（转无线）" if wireless else gang.label
+
     def _build_controls(self) -> None:
         card = self.state.card
         if not card.controls and not card.gangs:
@@ -1051,9 +1131,16 @@ class DetailDialog(QDialog):
         lay = self._group("")
         if card.gangs:
             for g in card.gangs:
-                row = ControlRow(g.power, g.label, self._p, self._accent, "switch")
+                wireless = g.is_wireless(self.state.values)
+                # 不给 ``write=False``：这个属性本身是可写的，**是 mode 不让写**。
+                # 两者混用会让"设备侧改成有线"之后这一行永远解不开（write 定死）。
+                row = ControlRow(
+                    g.power, self._gang_text(g, wireless), self._p, self._accent, "switch"
+                )
                 row.changed.connect(self._on_change)
+                row.set_enabled(self.state.online, locked=wireless)
                 self._rows.append(row)
+                self._gang_rows[g.siid] = row
                 lay.addWidget(row)
             return
         for ctl in card.controls:
@@ -1065,6 +1152,35 @@ class DetailDialog(QDialog):
             lay.addWidget(row)
             if ctl.slot == "mode":
                 self._mode_row = row
+            # ``getattr``：验证脚本用 ``SimpleNamespace`` 鸭子类型喂过卡片
+            if getattr(card, "speed_by_mode", None) and (
+                ctl.slot in card.speed_by_mode.values()
+            ):
+                self._speed_rows[ctl.slot] = row
+        self._sync_speed_rows()
+
+    def _sync_speed_rows(self) -> None:
+        """按当前模式只留一行风速（直吹风 = 0–100 连续量，自然风 = 档位）。
+
+        规则来自 ``CardSpec.speed_by_mode``（型号级，见 ``adapters/dmaker.py``）：
+        两个属性在规格里**同时存在、都可写**，谁生效是固件语义，猜不出来。
+        没登记规则的设备（``speed_by_mode`` 为空）两行都留着——宁可多一行，
+        也别把用户真能用的属性藏掉。
+
+        模式值读不到（刚打开、设备离线）时 ``speed_slot`` 返回 ``None``，
+        同样两行都留：先让人看见有什么，等值到了再收。
+        """
+        if not self._speed_rows:
+            return
+        card = self.state.card
+        mode_ctl = card.bound("mode")
+        mode_value = (
+            self.state.get_prop(mode_ctl.prop) if mode_ctl is not None else None
+        )
+        rule = getattr(card, "speed_slot", None)
+        want = rule(mode_value) if callable(rule) else None
+        for slot, row in self._speed_rows.items():
+            row.setVisible(want is None or slot == want)
 
     def _build_metrics(self) -> None:
         card = self.state.card
@@ -1219,7 +1335,12 @@ class DetailDialog(QDialog):
                 camera_service().release(self.state.did)
             self._camera.show_error("设备离线，画面已断开")
         adv = set(self._adv_rows)
+        gang_rows = set(self._gang_rows.values())
+        # 模式变了就把另一条风速收起来（直吹风/自然风各管一个属性）
+        self._sync_speed_rows()
         for row in self._rows:
+            if row in gang_rows:
+                continue  # 多键行单独处理：转无线时要跟着 mode 变灰
             row.set_enabled(st.online)
             if row is self._mode_row and st.card.mode_active is not None:
                 self._sync_mode_row(st, row)
@@ -1230,6 +1351,17 @@ class DetailDialog(QDialog):
                 row.set_unknown()
             else:
                 row.set_value(value)
+        for g in st.card.gangs:
+            row = self._gang_rows.get(g.siid)
+            if row is None:
+                continue
+            # 模式可能在设备侧被改（米家 App 里点了转无线），每轮按最新值重算
+            wireless = g.is_wireless(st.values)
+            row.set_enabled(st.online, locked=wireless)
+            row.set_value(st.values.get(g.power.key))
+            want = prop_short(self._gang_text(g, wireless))
+            if row.name.text() != want:
+                row.name.setText(want)
         if self._adv_header is not None:
             self._collect_advanced()
         # 读数陈旧提示：只看 metrics（卡片上那几个数），用云端每个属性自己的

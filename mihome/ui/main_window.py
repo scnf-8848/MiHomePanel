@@ -64,6 +64,18 @@ POLL_MS = 3000
 #: 15 秒是比较出来的折中——再降（30/60 秒）每小时只少几十次请求，但"从托盘点开"
 #: 的第一眼更容易看到旧值（点开会立刻补一轮，可那一轮也得几百毫秒才回来）。
 POLL_HIDDEN_MS = 15_000
+#: 刚发过指令的那几秒，把轮询加到多快、维持多久。
+#:
+#: 为什么需要这一档：写入是乐观的——按下开关的瞬间屏幕上就是新值，可那是**我们
+#: 自己写的**，不是设备回读的。设备到底照做了没有，只有下一轮回读才知道。3 秒
+#: 一轮意味着"按了没反应"要等 3 秒才看得见，托盘里甚至要等 15 秒。
+#:
+#: 代价是可控的：0.5 秒 × 5 秒 = 最多 10 轮，而一轮就是一个批量包（≤300 个属性，
+#: 见 ``api.DEFAULT_CHUNK``）。连续点几下不叠加——窗口是"最后一次操作之后 5 秒"。
+#: 对比一下：OpenMexia 是每台设备每 5 秒一条，48 台就是 576 条/分钟，我们这 10 条
+#: 连它的零头都不算（见 ``docs/reference/openmexia-notes.md`` 第 8 节）。
+BURST_MS = 500
+BURST_HOLD_MS = 5000
 TOPOLOGY_MS = 5 * 60 * 1000  # 设备列表低频刷新：新增设备不用手动点刷新
 
 #: 顶部那条横带的边距（左 / 上 / 右）。指令条按这三个值摆，警告条浮层也按它
@@ -344,6 +356,14 @@ class MainWindow(QMainWindow):
         self.poll_demand.set("window", POLL_MS, "窗口可见")
         self._poll_timer.start(POLL_MS)
 
+        # 指令后的高频窗口。写请求一发出去就登记一条最严的需求，``BURST_HOLD_MS``
+        # 之后撤掉——窗口靠"最后一次操作"顺延（``start`` 会重置），连续点几下不会
+        # 叠加成十几秒。撤掉之后 ``poll_demand`` 自动回到窗口/托盘的常态间隔。
+        self._burst_timer = QTimer(self)
+        self._burst_timer.setSingleShot(True)
+        self._burst_timer.timeout.connect(self._end_burst)
+        self.store.on_write_sent = self._start_burst
+
         self._topo_timer = QTimer(self)
         self._topo_timer.timeout.connect(self._refresh_topology)
         self._topo_timer.start(TOPOLOGY_MS)
@@ -623,11 +643,37 @@ class MainWindow(QMainWindow):
         # 子窗口一盖上来，墙上的画面就看不见了；停播而不是暂停，
         # 把观看位让给详情页（墙面和详情页共用同一个 CameraService）。
         self.wall.stop_playback("打开子窗口")
-        self._dim.cover(True)
+        self._cover_dim(True)
         try:
             exec_with_dim_click(dlg)
         finally:
+            self._cover_dim(False)
+
+    def _cover_dim(self, on: bool) -> None:
+        """压暗层的开 / 关。
+
+        关的时候多一道**冻结更新**：关一个子窗口这一下会连着产生三处"整窗失效"
+        ——弹窗被销毁、它的点击层（``DimClickShield``，铺满主窗口）隐藏、压暗蒙版
+        隐藏。每一处都让系统要求主窗口重画整片区域；而主窗口是
+        ``WA_TranslucentBackground`` 的（圆角要用透明角），Qt 在这种窗口上是
+        **逐个控件分段提交**的，于是能看到"父控件画完了、卡片 body 这些子控件还
+        空着"的那一帧——用户 2026-11-12 报的关窗闪烁，截图里卡片全变矮、只剩标题。
+
+        这三处失效都发生在同一轮调用里（弹窗 hide 在 ``done()`` 里、exec 的
+        finally 紧接着跑，中间没有回到事件循环），所以在这里先把更新关掉，把积压
+        的失效合成**一次** paint 再放开。以后往"关窗时要恢复点什么"里加东西（比如
+        摄像头画面还回卡片），也写进这段冻结里，别在外面另起一段——那会变成第二次
+        整窗重绘。
+        """
+        if on:
+            self._dim.cover(True)
+            return
+        self.setUpdatesEnabled(False)
+        try:
             self._dim.cover(False)
+        finally:
+            self.setUpdatesEnabled(True)
+            self.update()
 
     # -- 定时器 ----------------------------------------------------------
     def _drain(self) -> None:
@@ -657,6 +703,29 @@ class MainWindow(QMainWindow):
         )
         if active:
             self._poll()
+
+    def _start_burst(self) -> None:
+        """刚发出一条写指令：接下来 ``BURST_HOLD_MS`` 按 ``BURST_MS`` 轮询。
+
+        只在**需求表**里多挂一条 ``burst``，不动 ``window`` 那条：窗口该是 3 秒
+        还是 15 秒由"看不看得见"决定，突发只是临时压在它上面的一档。撤掉之后
+        自然回到原来的档，不用在这里记住"刚才是什么间隔"。
+
+        失败也一样要快：写回包失败时 ``Store._on_written`` 会把乐观值还原并写
+        ``st.error``，界面立刻能看到"已还原"；随后这几轮高频回读是为了拿到设备
+        的**真实**状态——比如批量里成功了一半的情况，只看回包码是说不清的。
+        """
+        timer = getattr(self, "_burst_timer", None)
+        if timer is None:  # 构造期间就有写请求（例如自动登录后立刻补一轮）
+            return
+        self.poll_demand.set("burst", BURST_MS, "刚发过指令")
+        timer.start(BURST_HOLD_MS)
+
+    def _end_burst(self) -> None:
+        """窗口结束：撤掉那条需求，``poll_demand`` 会自己回到常态间隔。"""
+        board = getattr(self, "poll_demand", None)
+        if board is not None:
+            board.clear("burst")
 
     def _on_poll_interval(self, ms: int | None) -> None:
         """需求表算出新间隔时调这里。``None`` = 没人要，停表。"""
@@ -902,7 +971,11 @@ class MainWindow(QMainWindow):
         action = {"kind": ""}
         dlg.account_action.connect(lambda kind: action.update(kind=kind))
         self._run_dialog(dlg)
-        self._apply_theme()
+        # **不要再补一次 ``_apply_theme()``**（2026-11-12 删）。设置页里点主题时
+        # ``theme_selected`` → ``set_theme`` 已经就地应用过了，这里再来一遍等于
+        # 整墙重建第二次：``_apply_theme`` 里有 ``wall.rebuild_palette``，那会把
+        # 56 张卡拆掉重造（它自己的注释：卡片是自绘的，换色靠整墙重建）。而
+        # 什么都没改直接关窗时，这次重建就是纯浪费——用户看到的主窗口闪烁就是它。
         self._refresh_tabs()
         if action["kind"] == "logout":
             self._logout()
@@ -913,7 +986,7 @@ class MainWindow(QMainWindow):
         from .confirm import confirm, notice
 
         path = self.client.auth_path
-        self._dim.cover(True)
+        self._cover_dim(True)
         try:
             ok = confirm(
                 self,
@@ -932,7 +1005,7 @@ class MainWindow(QMainWindow):
                 # 下次启动会直接自动登录，得跟用户说清楚。
                 notice(self, "凭据文件没有删掉", self.client.last_error, self.palette_ref)
         finally:
-            self._dim.cover(False)
+            self._cover_dim(False)
         self.store.clear()
         # 设备列表空了，指令条也别再挂着一台已经不认识的音箱
         self.speaker_bar.set_targets([])

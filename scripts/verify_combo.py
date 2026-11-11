@@ -410,16 +410,31 @@ def section_wiring(app: QApplication) -> None:
                f"{got.name()} vs {base.name()}")
     dlg.close()
 
+    # 详情页的单选枚举现在优先用轨道（2026-11-12，和卡片统一），**放不下才退回
+    # Combo**：项数超过 MAX_SEGMENTS 或自然宽度超过 SEG_MAX_W。Combo 这条通路
+    # 必须还在——二十项的枚举只有它列得清楚。
     prop = PropertySpec(
         siid=2, piid=7, name="mode", urn="", description="", comment="模式",
         format="uint8", access=("read", "write"), unit=None, value_range=None,
         value_list=(ValueOption(1, "日光", "Day"), ValueOption(2, "夜光", "Night")),
         service="", service_label="",
     )
+    many = PropertySpec(
+        siid=2, piid=8, name="scene-mode", urn="", description="", comment="模式",
+        format="uint8", access=("read", "write"), unit=None, value_range=None,
+        value_list=tuple(
+            ValueOption(i, f"模式{i}", f"M{i}") for i in range(1, 13)
+        ),
+        service="", service_label="",
+    )
+    from mihome.ui import card_controls as cc
     from mihome.ui.detail import ControlRow
 
-    row = ControlRow(prop, "模式", theme.LIGHT, "#3D7EFF", "select")
-    check("详情页 select 行是 Combo", isinstance(row.editor, Combo), True)
+    row_seg = ControlRow(prop, "模式", theme.LIGHT, "#3D7EFF", "select")
+    check("两项枚举 → 详情页也用轨道", isinstance(row_seg.editor, cc.CardSeg), True)
+
+    row = ControlRow(many, "模式", theme.LIGHT, "#3D7EFF", "select")
+    check("十二项枚举 → 详情页退回 Combo", isinstance(row.editor, Combo), True)
     check_true("详情页下拉框没有另写 styleSheet 覆盖全局",
                "border-radius: 9px" in row.editor.styleSheet())
     row.set_value(2)  # ControlRow 里 isinstance(ed, QComboBox) 的分支仍要生效

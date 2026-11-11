@@ -44,8 +44,19 @@ SLOTS: dict[str, tuple[str, ...]] = {
     "ir_mode": ("ir-mode",),
     "ir_temp": ("ir-temperature",),
     "fan_level": ("fan-level", "fan-speed", "fan-percent", "speed-level"),
+    # 连续风速（这台风扇是 1–100）。和 ``fan_level`` 是**两个独立属性**，
+    # 直吹风/自然风各管一个，谁的算数由型号适配说了算（``adapters/dmaker.py``
+    # 的 ``speed_by_mode``），别在这里按名字猜。
+    "fan_speed": ("speed-level", "fan-speed", "fan-percent"),
     "swing_v": ("vertical-swing", "vertical-swing-included-angle"),
     "swing_h": ("horizontal-swing", "horizontal-swing-included-angle"),
+    # 扫风角度（30/60/90/120/140 这类离散角度）。和 ``swing_h`` 的名字有重叠，
+    # 但它是**枚举**、那个是布尔，靠 ``Control.kind`` 分开，不会互相抢
+    "swing_angle": (
+        "horizontal-swing-included-angle",
+        "vertical-swing-included-angle",
+        "swing-angle",
+    ),
     "position": ("target-position",),
     "current_position": ("current-position",),
     "battery": ("battery-level",),
@@ -99,6 +110,40 @@ class Control:
     service: str | None = None  # 优先在哪个服务里找
     show_when_off: bool = False  # 关机时是否仍显示（灯的亮度条需要）
     critical: bool = False  # 绑定失败要告警（说明映射表写错了）
+    #: 这个槽位**只认某种形状**的属性：``"range"`` / ``"enum"`` / ``"bool"``。
+    #: 空 = 不限。名字撞车的槽位必须写它：``swing_h`` 的候选名里既有布尔
+    #: ``horizontal-swing`` 又有枚举 ``horizontal-swing-included-angle``，
+    #: 没有这一条时绑到哪个取决于服务顺序。
+    kind: str = ""
+    #: 显式指定卡片上用什么控件：``"slider"`` / ``"stepper"`` / ``"chips"`` /
+    #: ``"seg"`` / ``"toggle"``。空 = 按属性类型自动挑（见
+    #: ``ui/card_controls.make_control``，**选型只有那一份**）。
+    #: 为什么需要它：自动挑选只看类型，于是"1–100 的连续风速"和"16–30 的温度"
+    #: 都成了步进器——前者点二十下才到头。类型相同、语义不同，只能由声明方点名。
+    widget: str = ""
+    #: 首选服务里找不到时，再去**所有服务**里找一遍（含 ``INTERNAL_SERVICES``）。
+    #: 厂商常把正经属性塞进自定义服务：风扇的连续风速就在 ``dm-service`` 里，
+    #: 而那个服务整体被当成"内部服务"不出现在"更多功能"里。
+    search_all: bool = False
+
+    def __post_init__(self) -> None:
+        # 声明期报错：这两个字段都是"写错了不会崩、只会静默变丑"的类型
+        if self.widget and self.widget not in WIDGET_KINDS:
+            raise ValueError(
+                f"控件 {self.slot!r} 的 widget={self.widget!r} 不认识"
+                f"（可选 {list(WIDGET_KINDS)}）"
+            )
+        if self.kind and self.kind not in PROP_KINDS:
+            raise ValueError(
+                f"控件 {self.slot!r} 的 kind={self.kind!r} 不认识"
+                f"（可选 {list(PROP_KINDS)}）"
+            )
+
+
+#: ``Control.widget`` 允许的取值，与 ``ui/card_templates.CardBody._pick`` 一一对应
+WIDGET_KINDS = ("slider", "stepper", "seg", "chips", "toggle")
+#: ``Control.kind`` 允许的取值，即 ``PropertySpec.kind`` 的三种形状
+PROP_KINDS = ("range", "enum", "bool")
 
 
 @dataclass(frozen=True, slots=True)
@@ -198,6 +243,10 @@ PROFILES: dict[str, CategoryProfile] = {
         ),
     ),
     # --- 风扇 -----------------------------------------------------------
+    # 登记的是"可能有的功能"，**有没有由规格回答**（绑不上就跳过）。所以这
+    # 一台设备有 4 档 + 连续风速 + 左右扫风 + 角度 + 童锁 + 定时，另一台只有
+    # 3 档，同一张表都成立，不需要按型号分支，也不需要谁去维护"哪些风扇有上下
+    # 扫风"。唯一按型号的是"哪个模式下哪个风速算数"，见 ``speed_by_mode``。
     "fan": CategoryProfile(
         category="fan",
         label="风扇",
@@ -206,9 +255,20 @@ PROFILES: dict[str, CategoryProfile] = {
         accent="#2FBFAF",
         controls=(
             _c("power", "开关", "switch", critical=True),
-            _c("fan_level", "风速", "select", critical=True),
-            _c("mode", "模式", "select"),
-            _c("swing_h", "摇头", "toggle"),
+            # 连续风速先绑：它比档位更"精确"，两个都有时卡片默认展示它
+            _c(
+                "fan_speed", "风速", "slider",
+                kind="range", widget="slider", search_all=True,
+            ),
+            _c("fan_level", "档位", "select", kind="enum"),
+            # 模式和角度写成分段轨道：都是"互斥的几档"，选中态是实心品类色，
+            # 比分立胶囊更容易一眼看出当前是哪档（原来的 24% 混色在开启态的
+            # 卡片上几乎看不出来，2026-11-12 实测）。
+            _c("mode", "模式", "select", kind="enum", widget="seg"),
+            _c("swing_h", "左右扫风", "toggle", kind="bool"),
+            _c("swing_v", "上下扫风", "toggle", kind="bool"),
+            _c("swing_angle", "角度", "select", kind="enum", widget="seg"),
+            _c("child_lock", "童锁", "toggle", kind="bool"),
         ),
     ),
     # --- 净化器 ---------------------------------------------------------
@@ -603,6 +663,8 @@ class BoundControl:
     role: str
     prop: PropertySpec | None
     write: bool
+    #: 声明方点名的控件类型（``Control.widget``），空 = 按属性类型自动挑
+    widget: str = ""
 
     @property
     def siid(self) -> int | None:
@@ -625,6 +687,41 @@ class Gang:
     label: str
     power: PropertySpec
     room: str = ""
+    #: 这一路的 ``mode`` 属性（"有线开关 / 无线开关"，即米家设置里的"转无线"）。
+    #: 规格里没有就是 ``None``——纯插座、老面板、部分单火开关都没有这个属性。
+    mode: PropertySpec | None = None
+    #: ``mode`` 的取值里表示"仅无线"的那一项（见 :func:`wireless_value`）。
+    #: 设备上报值等于它时，这一路是转无线：继电器常通，按键不再切换。
+    wireless_value: int | None = None
+
+    def is_wireless(self, values: Mapping[tuple[int, int], Any]) -> bool:
+        """这一路当前是不是"转无线"。
+
+        判据是**设备上报的 mode 值**，不是名字、不是型号：同一块面板上可以只有
+        其中两三路转无线（实测：三开单控只有左键是 1）。
+        """
+        if self.mode is None or self.wireless_value is None:
+            return False
+        return values.get(self.mode.key) == self.wireless_value
+
+
+def wireless_value(prop: PropertySpec | None) -> int | None:
+    """在 ``mode`` 的值列表里认出"仅无线"那一项，认不出返回 ``None``。
+
+    只能用文案判：各家写的不一样（"无线开关" / "无线模式" / "无线"），而"有线"
+    那项一定带"有线"（"有线开关" / "有线和无线开关"），所以判据是
+    **含"无线"且不含"有线"**。要求恰好一项命中——认不准就当没有这个能力，
+    宁可不锁点击，也不能把有线键误锁成不能操作。
+    """
+    if prop is None:
+        return None
+    hits = [
+        o.value
+        for o in prop.value_list
+        if ("无线" in o.display or "wireless" in o.display.lower())
+        and ("有线" not in o.display and "wired" not in o.display.lower())
+    ]
+    return hits[0] if len(hits) == 1 else None
 
 
 @dataclass
@@ -648,6 +745,13 @@ class CardSpec:
     extra: list[PropertySpec] = field(default_factory=list)
     #: 模式激活判据用的属性（型号适配；``None`` = 用 ``mode`` 自己的值，默认行为）
     mode_active: PropertySpec | None = None
+    #: **型号级**：同一功能有两套属性时，"哪个模式下用哪个槽位"。键是 ``mode``
+    #: 的取值，值是槽位名（``fan_level`` / ``fan_speed``）。空 = 没有这条规则，
+    #: 卡片按"档位优先、有连续量才用连续量"的通用顺序挑。
+    #: 为什么放这里而不是样式里：这台风扇的规格里 ``speed-level`` 与 ``fan-level``
+    #: **同时存在**且都可写，哪个算数完全取决于固件语义——这是型号事实，
+    #: 不是品类约定（见 ``adapters/dmaker.py``）。
+    speed_by_mode: dict[int, str] = field(default_factory=dict)
     actions: list[ActionSpec] = field(default_factory=list)
     events: list[EventSpec] = field(default_factory=list)
     power_actions: tuple[ActionSpec, ActionSpec] | None = None
@@ -695,6 +799,21 @@ class CardSpec:
                 return m
         return None
 
+    def speed_slot(self, mode_value: Any = None) -> str | None:
+        """按当前模式值返回"风速该用哪个槽位"；没有双速度规则时返回 ``None``。
+
+        只在 ``speed_by_mode`` 非空时才有答案（那是型号级事实）。模式值读不到、
+        或不在表里（固件加了新模式）时也返回 ``None``——调用方退到通用顺序，
+        别因为一个未知值把风速整块藏起来。
+        """
+        if not self.speed_by_mode:
+            return None
+        try:
+            key = int(mode_value)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return None
+        return self.speed_by_mode.get(key)
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "category": self.category,
@@ -719,7 +838,16 @@ class CardSpec:
                 {"slot": m.slot, "label": m.label, "siid": m.siid, "piid": m.piid, "unit": m.prop.unit_text if m.prop else ""}
                 for m in self.metrics
             ],
-            "gangs": [{"siid": g.siid, "label": g.label, "room": g.room} for g in self.gangs],
+            "gangs": [
+                {
+                    "siid": g.siid,
+                    "label": g.label,
+                    "room": g.room,
+                    "mode": f"{g.mode.method}" if g.mode else None,
+                    "wireless_value": g.wireless_value,
+                }
+                for g in self.gangs
+            ],
             "advanced": [
                 {"method": f"{p.siid}.{p.piid}", "label": short_label(p.label), "raw": p.label, "kind": p.kind}
                 for p in self.advanced
@@ -752,15 +880,32 @@ def _primary_service_name(spec: DeviceSpec, prof: CategoryProfile) -> str | None
 
 def _bind(spec: DeviceSpec, ctl: Control, primary: str | None) -> BoundControl:
     names = SLOTS.get(ctl.slot, (ctl.slot,))
-    prop = spec.find(*names, service=ctl.service or primary, need_write=ctl.write)
+    prop = spec.find(
+        *names, service=ctl.service or primary, need_write=ctl.write, kind=ctl.kind
+    )
+    # 四条兜底，顺序有意义：
+    # 1) 声明了服务 → 整个规格里再找一遍（服务名因型号而异，写死的可能不存在）；
+    # 2) ``search_all`` → 连"内部服务"也翻（``dm-service`` 里的连续风速）；
+    # 3) 只读兜底：有些设备的"开关"是只读上报的，此时按只读读数展示。
     if prop is None and ctl.service:
-        prop = spec.find(*names, need_write=ctl.write)
+        prop = spec.find(*names, need_write=ctl.write, kind=ctl.kind)
+    if prop is None and ctl.search_all:
+        # 这一轮**不带 service**：``find`` 的 service 只是"优先"，但主机服务里
+        # 没有时它仍会返回候选里的第一条；真正挡住 ``dm-service`` 的不是这里，
+        # 是 ``_advanced`` 的服务过滤。所以这里显式关掉优先项即可。
+        prop = spec.find(*names, need_write=ctl.write, kind=ctl.kind)
     write = ctl.write
     if prop is None and ctl.write:
-        # 只读兜底：有些设备的"开关"是只读上报的，此时按只读读数展示，不画可点控件
-        prop = spec.find(*names, service=ctl.service or primary)
+        prop = spec.find(*names, service=ctl.service or primary, kind=ctl.kind)
         write = False
-    return BoundControl(slot=ctl.slot, label=ctl.label, role=ctl.role, prop=prop, write=write)
+    return BoundControl(
+        slot=ctl.slot,
+        label=ctl.label,
+        role=ctl.role,
+        prop=prop,
+        write=write,
+        widget=ctl.widget,
+    )
 
 
 def build_card(
@@ -829,6 +974,15 @@ def build_card(
         active = next((p for p in card.extra if p.name == adapter.mode_active), None)
         if active is not None and any(c.slot == "mode" for c in card.controls):
             card.mode_active = active
+        if adapter.speed_by_mode:
+            _, table = adapter.speed_by_mode
+            # 只留下**真的绑上了**的槽位：这台设备缺某个属性时，规则表里指向
+            # 空槽的那一条留着也没用，还会让卡片去显示一个不存在的控件。
+            card.speed_by_mode = {
+                value: slot
+                for value, slot in table.items()
+                if (b := card.control(slot)) is not None and b.prop is not None
+            }
     return card
 
 
@@ -844,10 +998,24 @@ def _gangs(
         on = next((p for p in svc.properties if p.name == "on" and p.writeable), None)
         if on is None:
             continue
+        # 只看**同一个服务**里的 mode：switch-sensor 也有个叫 mode 的属性
+        # （"极速单击模式/多功能模式"），混着找会把按键手势模式当成有线无线。
+        mode = next(
+            (p for p in svc.properties if p.name == "mode" and p.value_list), None
+        )
         raw = (names or {}).get(svc.siid, "")
         label = gang_label(raw, len(gangs) + 1)
         room = (rooms or {}).get(svc.siid, "")
-        gangs.append(Gang(siid=svc.siid, label=label, power=on, room=room))
+        gangs.append(
+            Gang(
+                siid=svc.siid,
+                label=label,
+                power=on,
+                room=room,
+                mode=mode,
+                wireless_value=wireless_value(mode),
+            )
+        )
     return gangs
 
 
@@ -855,6 +1023,8 @@ def _advanced(spec: DeviceSpec, card: CardSpec) -> list[PropertySpec]:
     """没被卡片用到的可写属性 → "更多功能"页，而不是堆在面板上。"""
     used = {c.prop.key for c in (*card.controls, *card.metrics) if c.prop}
     used |= {g.power.key for g in card.gangs}
+    # 每一路的 mode（有线/转无线）已经用在按键判断上了，别再重复出现在"更多功能"里
+    used |= {g.mode.key for g in card.gangs if g.mode is not None}
     out: list[PropertySpec] = []
     seen_names: set[str] = set()  # 同一属性名在多服务里重复（厂家复制的），只留一份
     for p in spec.properties:
@@ -959,6 +1129,7 @@ def coverage(card: CardSpec, spec: DeviceSpec) -> dict[str, int]:
     """给体检报告用的覆盖率统计。"""
     used = {c.prop.key for c in (*card.controls, *card.metrics) if c.prop}
     used |= {g.power.key for g in card.gangs}
+    used |= {g.mode.key for g in card.gangs if g.mode is not None}
     used |= {p.key for p in card.advanced}
     total = len(spec.properties)
     return {
@@ -990,4 +1161,5 @@ __all__ = [
     "short_label",
     "summary_line",
     "unit_symbol",
+    "wireless_value",
 ]

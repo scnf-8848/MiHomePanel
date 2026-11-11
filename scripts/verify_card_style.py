@@ -35,7 +35,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtCore import QPoint, QRect, Qt  # noqa: E402
 from PySide6.QtGui import QColor  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
-from PySide6.QtWidgets import QApplication, QComboBox  # noqa: E402
+from PySide6.QtWidgets import QApplication  # noqa: E402
 
 from mihome.core import adapters, catalog  # noqa: E402
 from mihome.core.catalog import PROFILES  # noqa: E402
@@ -44,7 +44,7 @@ from mihome.core.spec import PropertySpec, ValueOption, parse_raw  # noqa: E402
 from mihome.core.store import DeviceState, RoomView, _card_props  # noqa: E402
 from mihome.core.tree import DeviceNode  # noqa: E402
 from mihome.ui import theme  # noqa: E402
-from mihome.ui.card_controls import ROW_H  # noqa: E402
+from mihome.ui.card_controls import ROW_H, CardSeg  # noqa: E402
 import mihome.ui.card_templates as card_templates  # noqa: E402
 from mihome.ui.card_templates import (  # noqa: E402
     BODY_READOUT,
@@ -655,7 +655,9 @@ def main() -> int:
           list(body.controls), ["target_temp", "mode"])
     check("温度建成步进器",
           type(body.controls["target_temp"]).__name__, "CardStepper")
-    check("模式建成胶囊", type(body.controls["mode"]).__name__, "CardChips")
+    # 单选枚举的默认控件已经换成轨道分段（2026-11-12）：选中态是实心品类色，
+    # 比"在卡片底色上再混 24%"更容易看出当前是哪一档
+    check("模式建成分段轨道", type(body.controls["mode"]).__name__, "CardSeg")
     check("温度取到设备值", body.controls["target_temp"].value(), 26)
     check("模式取到设备值", body.controls["mode"].value(), 1)
     check("步进器是居中排布（不是靠左贴右）",
@@ -678,14 +680,17 @@ def main() -> int:
                and gm.left() >= 0 and gm.right() <= body.width()
                and gm.bottom() <= body.height(),
                f"body={body.width()}×{body.height()}")
-    check_true("步进器在上、胶囊在下且不重叠", gt.bottom() < gm.top(),
+    check_true("步进器在上、模式轨道在下且不重叠", gt.bottom() < gm.top(),
                f"{gt.bottom()} < {gm.top()}")
     check("两行都铺满 body 宽", (gt.width(), gm.width()),
           (body.width(), body.width()))
     chips = body.controls["mode"]
-    widths = {r.width() for r, _, _ in chips._layout()}
-    check("胶囊铺满后等宽", len(widths), 1)
-    check("胶囊取到当前模式", [v for _, v, _ in chips._layout()],
+    # 分段控件按文字给最小宽度、余量均分：五个两字模式在同一档字号下
+    # 只有 ±1px 的差别（不再像胶囊那样严格等宽）
+    widths = [r.width() for r, _, _ in chips._seg_rects()]
+    check("五段都排出来了", len(widths), 5)
+    check_true("段宽接近等宽（最大差 ≤ 2）", max(widths) - min(widths) <= 2, str(widths))
+    check("轨道取到当前模式", [v for _, v, _ in chips._seg_rects()],
           [0, 1, 2, 3, 4])
     check("副标题照旧是室温 · 湿度", acc._subtitle(), "24.9°C · 54%")
 
@@ -696,7 +701,7 @@ def main() -> int:
     check("点 + 发 (2,4,27)", sent[-1], (2, 4, 27))
     QTest.mouseClick(body.controls["target_temp"], Qt.LeftButton, pos=minus.center())
     check("点 − 回到 26", sent[-1], (2, 4, 26))
-    rect, value, _ = chips._layout()[3]
+    rect, value, _ = chips._seg_rects()[3]
     QTest.mouseClick(chips, Qt.LeftButton, pos=rect.center())
     check("点「制热」发 (2,2,3)", sent[-1], (2, 2, 3))
 
@@ -713,7 +718,7 @@ def main() -> int:
     ofl.show()
     app.processEvents()
     check("离线时步进器禁用", ofl._body.controls["target_temp"].isEnabled(), False)
-    check("离线时胶囊禁用", ofl._body.controls["mode"].isEnabled(), False)
+    check("离线时模式轨道禁用", ofl._body.controls["mode"].isEnabled(), False)
 
     print("\n2g) 判重：跨品类同名放行，同框撞名拒绝")
     a = CardStyle(id="x_light", label="亮度", span=2, category="light")
@@ -988,8 +993,8 @@ def main() -> int:
     # 手调亮度/色温后它不会变；真正生效的预设要从只读的 scene-mode(3,9) 读，
     # 0 = 无激活项。**别的灯不能套**——那是这台设备实测出来的行为，套错了会
     # 把别人的选中态弄坏。所以整件事只动"型号 → 属性"这一张表，通用逻辑零改动。
-    check("适配表只有挂灯一条（没扩散到别的型号）",
-          sorted(catalog.MODEL_ADAPTERS), ["yeelink.light.lamp22"])
+    check("适配表只有挂灯与风扇两条（没扩散到别的型号）",
+          sorted(catalog.MODEL_ADAPTERS), ["dmaker.fan.p5c", "yeelink.light.lamp22"])
     # 表在 adapters 包里，catalog 只是转出；两边必须是同一对象，不然查表会各查各的
     check_true("catalog.MODEL_ADAPTERS 就是 adapters 里那张表",
                catalog.MODEL_ADAPTERS is adapters.MODEL_ADAPTERS)
@@ -1030,57 +1035,55 @@ def main() -> int:
     check("不传型号 = 不做型号适配",
           catalog.build_card(spec).mode_active, None)
 
-    # 详情页：用客户端占位表示"无激活项"，不往枚举里塞假选项——假选项既能被
-    # 写出去（设备不认的值），也会被当成枚举值回读。
+    # 详情页：枚举的"单选"控件是轨道分段（2026-11-12 与卡片统一），当前值
+    # 不在枚举里时**一段都不点亮**——不往枚举里塞假选项，也不保留上一次的选中。
     lamp = make_lamp_state(scene=7)
     store_l = LooseStore(p, [lamp])
     dlg_l = DetailDialog(lamp, store_l, theme.LIGHT, None, icons=Icons())
-    box = dlg_l._mode_row.editor
-    dlg_l._sync()  # 构造函数不自己刷值，轮询定时器才会；这里先手动走一次
-    check("模式行是下拉框", isinstance(box, QComboBox), True)
-    check("枚举项就是设备给的 5–9（没有伪造的「无」）",
-          [box.itemData(i) for i in range(box.count())], [5, 6, 7, 8, 9])
-    check("scene=7 → 选中「影院」", (box.currentIndex(), box.currentText()), (2, "影院"))
+    seg = dlg_l._mode_row.editor
+    check("模式行是轨道分段", isinstance(seg, CardSeg), True)
+    check("段就是设备给的 5–9（没有伪造的「无」）",
+          [v for _, v, _ in seg._seg_rects()], [5, 6, 7, 8, 9])
+    # 构造函数自己刷一次值（2026-11-12 起），所以第一帧就是 store 里的真值。
+    # 以前要等 600ms 的定时器，用户看到的是"先亮默认值、再跳成真实值"。
+    check("打开详情页的第一帧就是真实值", seg.value(), 7)
+    check_true("底部『数据更新于…』也已填好", bool(dlg_l._foot.text()), dlg_l._foot.text())
 
     lamp.values[(3, 9)] = 0
     dlg_l._sync()
-    check("scene=0（无激活项）→ 不选中任何真实项", box.currentIndex(), -1)
-    check("…同时在框里显示客户端文案「无」", box.placeholderText(), "无")
+    check("scene=0（无激活项）→ 一段都不点亮", seg.value(), None)
+    check("…说明挂在 tooltip 上", seg.toolTip(), "无")
 
     lamp.values[(3, 9)] = 3
     dlg_l._sync()
-    check("自定义场景 3（不在枚举里）→ 显示「其他」",
-          (box.currentIndex(), box.placeholderText()), (-1, "其他"))
+    check("自定义场景 3（不在枚举里）→ 一段都不点亮", seg.value(), None)
+    check("…说明挂在 tooltip 上", seg.toolTip(), "其他")
 
     lamp.values[(3, 9)] = 6
     dlg_l._sync()
-    check("回到正常值 → 占位文案复位，不留上一轮的「其他」",
-          (box.currentIndex(), box.placeholderText()), (1, "—"))
+    check("回到正常值 → 高亮对应段", seg.value(), 6)
 
     lamp.values.pop((3, 9))
     lamp.values[(2, 5)] = 8
     dlg_l._sync()
-    check("scene 还没读到 / 不合法 → 退回按 mode(2,5) 高亮",
-          (box.currentIndex(), box.currentText()), (3, "暖光"))
+    check("scene 还没读到 / 不合法 → 退回按 mode(2,5) 高亮", seg.value(), 8)
 
-    # 占位态下用户点一项：写出去的必须是真实枚举值，而不是「无」
+    # 轨道上没有"占位项"这一格可点，所以"选一项写出去的必须是真实枚举值"
+    # 这条风险天生不存在（下拉框才有）。这里只确认写请求带的是枚举值。
     lamp.values[(3, 9)] = 0
     dlg_l._mode_pending = False
     dlg_l._sync()
-    check("回到「无」占位态", (box.currentIndex(), box.placeholderText()), (-1, "无"))
     store_l.writes.clear()
-    box.setCurrentIndex(2)
-    check("占位态下选「影院」→ 只写 (2,5,7)",
-          store_l.writes, [(lamp.did, (2, 5), 7)])
-    check("选完立刻高亮所选（不等设备回读）", box.currentIndex(), 2)
+    seg.committed.emit(7)
+    check("选「影院」→ 只写 (2,5,7)", store_l.writes, [(lamp.did, (2, 5), 7)])
 
-    # 刚点完模式、设备还没把 scene 改过来：这一段不能被 0 擦掉，否则下拉会在
-    # 一两百毫秒内先跳回「无」再跳回所选模式，闪两下。``_on_change`` 会置位。
+    # 刚点完模式、设备还没把 scene 改过来：这一段不能被 0 擦掉，否则轨道会在
+    # 一两百毫秒内先亮、再灭、再亮，闪两下。``_on_change`` 会置位。
     check("鼠标点选后进入 pending 保护", dlg_l._mode_pending, True)
+    seg.set_value(7)  # 模拟"点完已经亮起来"（点击会先本地设值）
     lamp.values[(3, 9)] = 0
     dlg_l._sync()
-    check("pending + scene=0 → 保留本地选择，不显示「无」",
-          (box.currentIndex(), box.currentText()), (2, "影院"))
+    check("pending + scene=0 → 保留刚选的段（不闪）", seg.value(), 7)
     dlg_l.deleteLater()
 
     print()

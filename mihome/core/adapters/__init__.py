@@ -35,11 +35,11 @@
 
 from __future__ import annotations
 
-from . import categories, yeelink
+from . import categories, dmaker, yeelink
 from .base import ModelAdapter, TextLayer, check_model, check_text_layer, collect
 
 #: 参与汇总的厂商模块。新增厂商文件后在这里登记，顺序不影响结果（重复型号会报错）。
-_MODULES = (yeelink,)
+_MODULES = (yeelink, dmaker)
 
 #: 型号 → 适配规则（唯一查找表）
 MODEL_ADAPTERS: dict[str, ModelAdapter] = collect(

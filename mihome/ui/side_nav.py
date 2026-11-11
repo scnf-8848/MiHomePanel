@@ -11,8 +11,9 @@
 底色和右边的卡片墙**不是同一个色**（``theme.nav_bg``）：栏是机身、卡片墙是台面。
 两边同色时只能靠一条 1px 竖线分隔，整块界面看起来是连着的。
 
-最下面固定一块「功能区」+ 一个「设置」入口：前者是全屋级页面的入口（目前两个按钮
-只占位、不响应点击），后者收纳主题、排序、隐藏设备这些不常改的东西。
+最下面固定一块「功能区」+ 一个「设置」入口：前者是全屋级页面的入口（目前三个按钮
+——耗材 / 监控 / 电脑自动化——只占位、不响应点击），后者收纳主题、排序、隐藏设备
+这些不常改的东西。
 两条分隔线把底部切出语义：房间列表 + 功能区都是「这个家」的内容，
 「设置」是「这个程序」的配置，所以功能区上下各一条线，设置单独成一组。
 "已隐藏设备"分组排在房间列表末尾，图标上和普通房间区分开——它是收纳箱，不是房间。
@@ -37,16 +38,19 @@ PAD_X = 18
 TOP = 30
 #: 设置行那一块的高度（含上下留白）。功能区在它上面，别把它当成整个底部区。
 FOOT_H = 46
-#: 功能区：两个占位按钮 + 上下留白。
+#: 功能区：占位按钮 + 上下留白。按钮数由 ``ZONE_ITEMS`` 决定，别把数量写死——
+#: 加一条「电脑自动化」时就是漏了这里，底部会压掉最后一条并盖住分隔线。
 ZONE_BTN_H = 32
 ZONE_GAP = 2
 ZONE_PAD_TOP = 7
 ZONE_PAD_BOTTOM = 6
-ZONE_H = ZONE_PAD_TOP + ZONE_BTN_H * 2 + ZONE_GAP + ZONE_PAD_BOTTOM
+#: (按钮文字, 图标类型)，顺序即从上到下的绘制顺序。
+#: 三个都只是占位：点击不切页、不发信号（见 ``mouseReleaseEvent``）。
+ZONE_ITEMS = (("耗材", "battery"), ("监控", "camera"), ("电脑自动化", "pc"))
+ZONE_H = (ZONE_PAD_TOP + ZONE_BTN_H * len(ZONE_ITEMS)
+          + ZONE_GAP * (len(ZONE_ITEMS) - 1) + ZONE_PAD_BOTTOM)
 #: 底部固定区总高；房间列表的可见区域与滚动上限都按它算。
 BOTTOM_H = ZONE_H + FOOT_H
-#: (按钮文字, 图标类型)，顺序即从上到下的绘制顺序。
-ZONE_ITEMS = (("耗材", "battery"), ("监控", "camera"))
 #: 第二条分隔线落在 FOOT_H 的上边界：上面是家庭级入口，下面是程序级设置。
 #: 两条线样式一致（pal.border / 1px / 左右各缩 12），别给其中一条加粗换色。
 
@@ -216,7 +220,7 @@ class SideNav(QWidget):
 
     @staticmethod
     def _paint_zone_icon(p: QPainter, center: QPoint, kind: str, color: str) -> None:
-        """功能区两枚线框图标，笔触与齿轮一致（1.5px / 圆头 / 默认无填充）。"""
+        """功能区线框图标，笔触与齿轮一致（1.5px / 圆头 / 默认无填充）。"""
         p.setBrush(Qt.NoBrush)
         p.setPen(QPen(QColor(color), 1.5, Qt.SolidLine, Qt.RoundCap))
         if kind == "battery":
@@ -227,6 +231,13 @@ class SideNav(QWidget):
             p.setBrush(QColor(color))
             p.setPen(Qt.NoPen)
             p.drawRoundedRect(QRectF(center.x() - 5, center.y() - 2.5, 4, 5), 1, 1)
+        elif kind == "pc":
+            # 显示器 + 支架：和「监控」那枚摄像头区分开，别用同一个方框
+            p.drawRoundedRect(QRectF(center.x() - 8, center.y() - 6, 16, 11), 1.5, 1.5)
+            p.drawLine(QPoint(center.x(), center.y() + 5),
+                       QPoint(center.x(), center.y() + 7))
+            p.drawLine(QPoint(center.x() - 4, center.y() + 7),
+                       QPoint(center.x() + 4, center.y() + 7))
         else:
             # 摄像头：圆角机身 + 镜头 + 底座
             p.drawRoundedRect(QRectF(center.x() - 7, center.y() - 5, 14, 10), 2, 2)

@@ -426,6 +426,11 @@ class WindowFrame(QObject):
             if border is not None:
                 self._overlay = _FrameBorder(window, self)
         window.installEventFilter(self)
+        # Python 侧引用跟着被监控的窗口走。只有 ``self.win`` 不够：调用方若没有
+        # 长期持有 frame（对话框常是局部变量），wrapper 被回收而 C++ 对象还挂在
+        # 窗口名下时，Qt 仍会回调 ``eventFilter``，访问 ``self.win`` 就是
+        # ``AttributeError: 'WindowFrame' object has no attribute 'win'``。
+        window._window_frame = self
 
     @property
     def is_maximized(self) -> bool:
@@ -622,6 +627,10 @@ class DimClickShield(QWidget):
         self._dialog = dialog
         self._press: QPoint | None = None
         dialog.installEventFilter(self)
+        # 和 WindowFrame 同一条理由：Python 引用必须跟着弹窗走，别只靠调用方
+        # 那个局部变量（否则 wrapper 被回收、C++ 还在，eventFilter 里就报
+        # 'DimClickShield' object has no attribute '_dialog'）。
+        dialog._dim_click_shield = self
         if dialog.isVisible() and self._place():
             self.show()
             self.raise_()
@@ -737,7 +746,14 @@ def exec_with_dim_click(dialog: QDialog) -> int:
     只关当前这一层：``reject()`` 和 Esc 是同一条路径；嵌套时每个弹窗各有一层
     ``DimClickShield``，最上层的 shield 也在最上面，点到的只会是最上层。
 
-    同一弹窗重复 exec 时复用同一层（它跟着弹窗的 Show/Hide 走），不反复建窗口。
+    **关掉就销毁**（``deleteLater``，2026-11-12 修）。以前关掉只是 hide：``dialog``
+    的 parent 是主窗口，C++ 对象被 parent 一直持有，于是挂在它身上的两个事件过滤器
+    （``WindowFrame`` / ``DimClickShield``）也活了下来；而 Python 侧这些对象只由
+    ``dialog.__dict__`` 和调用方的局部变量引用，函数一返回就可能被 GC。之后 Qt 继续
+    回调它们的 ``eventFilter``，访问 ``self.win`` / ``self._dialog`` 就是
+    ``AttributeError: 'WindowFrame' object has no attribute 'win'``——用户报的
+    "连续开关设置页后终端刷错、主页面变空"就是这个。顺带解决另一件事：每次都新建
+    对话框，不销毁就会越攒越多（每个还都是 ``Qt.Dialog`` 顶层窗口），反复开关会闪。
     """
     shield = getattr(dialog, "_dim_click_shield", None)
     if shield is None:
@@ -747,6 +763,8 @@ def exec_with_dim_click(dialog: QDialog) -> int:
         return dialog.exec()
     finally:
         shield.hide()
+        dialog.hide()
+        dialog.deleteLater()
 
 
 __all__ = [

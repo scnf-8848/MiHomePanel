@@ -399,17 +399,24 @@ class DeviceSpec:
         *names: str,
         service: str | None = None,
         need_write: bool = False,
+        kind: str = "",
     ) -> PropertySpec | None:
         """按属性名依次尝试查找。
 
         匹配顺序：精确名 → 去 ``-N`` 后缀；同分时优先所属服务名等于 ``service``
         的属性（避免"灯的 on"被"遥控器管理的 on"抢走），再按 siid/piid 升序。
+
+        ``kind`` 只留某种形状（``range`` / ``enum`` / ``bool``）。名字撞车的槽位
+        必须给：风扇的 ``swing_h`` 候选里既有布尔 ``horizontal-swing`` 又有枚举
+        ``horizontal-swing-included-angle``，光靠服务优先级绑到哪个是碰运气。
         """
         for name in names:
             for pool in (self._by_name.get(name), self._by_squash.get(squash(name))):
                 if not pool:
                     continue
                 cand = list(pool)
+                if kind:
+                    cand = [p for p in cand if p.kind == kind]
                 if need_write:
                     cand = [p for p in cand if p.writeable]
                 if not cand:

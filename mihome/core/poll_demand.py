@@ -29,8 +29,15 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 
-#: 任何轮询都不快于 1 秒。想改这个数之前先算一轮请求量和每小时总量。
-MIN_INTERVAL_MS = 1000
+#: 任何轮询都不快于 0.5 秒。
+#:
+#: 为什么从 1 秒放到 0.5 秒（2026-11-12）：写指令之后需要尽快确认设备有没有照做，
+#: 500 ms 才能在一屏里看清"按下去 → 设备应声"这一下。放开的**只有下限**，不是
+#: 常态频率：主窗口仍然登记 3 秒 / 托盘 15 秒，0.5 秒只出现在
+#: ``ui/main_window.BURST_MS`` 那个 5 秒窗口里（发一条指令最多多出 10 轮）。
+#: 换句话说，任何人想常驻 0.5 秒仍然得显式登记，且要能解释"为什么值得每 5 秒
+#: 多打 10 个批量请求"。
+MIN_INTERVAL_MS = 500
 
 
 @dataclass(frozen=True, slots=True)

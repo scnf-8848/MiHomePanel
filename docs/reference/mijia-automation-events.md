@@ -349,3 +349,40 @@ App 里配"设备 → 中枢网关 → 产生虚拟事件"，极客版里配"虚
 | 极客版节点目录（`deviceInput` 事件模式字段） | https://github.com/eyaeya/xiaomi-central-hub-gateway-cli/blob/main/packages/cli/skills/xgg-rule-authoring/references/node-catalog.md |
 | 米家 App 私有接口抓包整理（`GetSceneList` / `Edit` / `RunScene`） | https://imkero.net/posts/mihome-app-api/ |
 | 中枢网关规格（版本 3 才有 `virtual-service`） | https://miot-spec.org/miot-spec-v2/instance?type=urn:miot-spec-v2:device:gateway:0000A019:xiaomi-hub1:3 |
+
+## 11. 转无线按键能不能「发按下」（2026-11-12，结论：**不能**）
+
+需求背景：开关某一路设成转无线（继电器常通、给智能灯供电）之后，面板上点这一路不再
+切继电器。用户自己在米家里配了「这个键按下 → 切换吸顶灯」，希望界面点一下也能触发
+同一条联动。
+
+### 事实
+
+1. **「按下」是设备事件，不是可写属性。** `zimi.switch.dhkg01` 的 `switch-sensor`
+   服务只有事件 `click`（`siid 8 / eiid 1`），三开单控是 `5/6/7`；规格里没有"模拟按键"
+   的可写属性。`switch` 服务里的 `toggle` action 切的是**继电器**，不是事件。
+2. **云端没有"发事件"接口。** 本项目用到的请求面只有 `/miotspec/prop/get`、
+   `/miotspec/prop/set`、`/miotspec/action`、`AppSceneService/RunScene`，加上只读的
+   `/miotspec/event/get`（只给最近一次）。客户端伪造设备事件的入口不存在，
+   "发送按下"在协议层就不成立。
+3. **转无线的键确实会上报 click，而且能读到**（实测 2026-11-12 00:34）：
+   `event/get` 对吸顶灯开关 `(8,1)` 返回 `code 0`、`updateTime` = 当天 00:09（刚按过）；
+   领普三键 `(6,1)` 有 11-09 的记录。所以"物理按下 → 云端可读 → 自动化触发"是通的。
+4. **App 自动化可完整读出，动作是结构化的。** `GetSceneList` 里「三开中键绑定客厅灯」
+   原文 = trigger `event.6.1`(did 2044955685) + action `set_properties`
+   `{did 2007842188, siid 4, piid 1, value true}`；雷士灯 `4.1` 的属性名就叫
+   `toggle`（切换开关状态），所以"重放同一个值"等价于"切换"，语义不丢。
+5. **"开关设置里内置的匹配灯具"读不到。** 自动化列表 39 条里 `template_id` 全是 `0`
+   （没有内置模板生成的条目），设备规格里也没有"绑定目标设备"的属性。那套配置在米家
+   App 的设备设置里，属设备侧/云端私有存储，当前接口拿不到。
+
+### 当时的三条替代（用户 2026-11-12 定：**先不做**，保持点不动）
+
+| 方案 | 做法 | 代价 |
+| --- | --- | --- |
+| 本地直控 | 面板给这一路配"它控制谁"（设备 + 动作），点一下直接写灯 | 每个键配一次；与米家自动化各走各的 |
+| 本地重放 | 读用户自己建的那条自动化，点一下照它的动作执行 | 要先有这条自动化；条件 / 延时 / 嵌套场景 / 播报要自己解释，做不了得降级 |
+| 虚拟事件 | 我们发 `4.1`，米家把那条自动化的触发源加上这个事件 | 要改米家配置；`4.1` 全局单槽，两个事件互相覆盖 |
+
+结论停在原地：**界面只解释、不发请求**（`ui/device_card.py::mousePressEvent`）。将来要
+做联动从上面三条里选，别试图"伪造按下"——那条路在协议层不存在。

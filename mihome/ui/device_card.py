@@ -43,7 +43,16 @@ from PySide6.QtWidgets import QSizePolicy, QWidget
 from ..core.catalog import summary_line
 from ..core.store import DeviceState
 from . import theme, tooltip
-from .card_templates import BODY_GEEK, BODY_VIDEO, STYLES, CardBody, CardStyle
+from .card_templates import (
+    BODY_FAN,
+    BODY_GEEK,
+    BODY_VIDEO,
+    STYLES,
+    CardBody,
+    CardStyle,
+)
+from .fan_body import FanBody
+from .card_controls import CardControl
 from .widgets import IconProvider, draw_text
 
 PAD = 14
@@ -269,9 +278,13 @@ class DeviceCard(QWidget):
             self._body = None
         if not self._style.has_body or self._style.body in (BODY_VIDEO, BODY_GEEK):
             # 画面样式由 CameraCard 自己铺视频控件、极客版样式由 GeekCard 铺按钮，
-            # 这里都不建 CardBody
+            # 这里都不建 body
             return
-        body = CardBody(
+        # 风扇是两列四格的布局，一行一个槽位的 ``CardBody`` 摆不下（见 FanBody）。
+        # 两者的对外接口一致（``sync`` / ``apply_theme`` / 三个信号），所以下面
+        # 的装配代码一个字都不用分叉。
+        maker = FanBody if self._style.body == BODY_FAN else CardBody
+        body = maker(
             self._style,
             self.state,
             self._p,
@@ -356,7 +369,9 @@ class DeviceCard(QWidget):
         # 内容带：挂了模板 body 就整块让给子控件。它们是真实 QWidget，画在
         # 父窗口之上；这里再画一次产品图只会从滑条缝里透出来，显得脏。
         if self._draws_art():
-            if card.gangs:
+            # 「隐藏转无线」把按键剔空了就退回产品图：单开整块转无线时，
+            # 卡片上没有任何能点的东西，产品图比一块空内容带更像回事。
+            if self._paints_gangs():
                 self._paint_gangs(p, base, bg)
             else:
                 self._paint_art(p)
@@ -384,14 +399,63 @@ class DeviceCard(QWidget):
         if not st.node.spec_type:
             return "不支持控制"
         if st.card.gangs:
-            on = sum(1 for g in st.card.gangs if st.values.get(g.power.key))
-            return f"{len(st.card.gangs)} 路 · {on} 路开启" if on else f"{len(st.card.gangs)} 路 · 全部关闭"
+            return self._gang_subtitle(st)
         text = summary_line(st.card, st.values)
         if text:
             return text
         if st.power is None:
             return "—"
         return "已开启" if st.power else "已关闭"
+
+    def _gang_subtitle(self, st: DeviceState) -> str:
+        """多键面板的副标题。
+
+        **转无线那一路不计入"几路开启"**：它的继电器恒通（就是为了给智能灯一直
+        供电），算进去会让面板永远显示开着，"全部关闭"也永远出不来。无线单独报
+        一个数，能不能点另说（见 ``mousePressEvent``）。
+
+        带无线时换成「3 路 · 1 开 · 1 无线」这种紧凑写法：副标题只有 138px 宽，
+        「3 路 · 1 路开启 · 1 路转无线」会被省略号切成没信息量的半句。
+        """
+        # 「隐藏转无线」样式下统计的是**画出来的那几路**：卡片上只剩两块键，
+        # 副标题还写"3 路"会自相矛盾。
+        gangs = self._gangs()
+        if not gangs:
+            return f"{len(st.card.gangs)} 路 · 全部转无线"
+        wired = [g for g in gangs if not self._wireless(g)]
+        wireless = len(gangs) - len(wired)
+        if not wired:
+            return f"{len(gangs)} 路 · 全部转无线"
+        on = sum(1 for g in wired if st.values.get(g.power.key))
+        if not wireless:
+            return f"{len(gangs)} 路 · {on} 路开启" if on else f"{len(gangs)} 路 · 全部关闭"
+        # 「全关」而不是「0 开」：后者读起来像计数，前者是状态
+        return f"{len(gangs)} 路 · {on} 开 · {wireless} 无线" if on else (
+            f"{len(gangs)} 路 · 全关 · {wireless} 无线"
+        )
+
+    def _wireless(self, gang) -> bool:
+        """这一路当前是不是"转无线"（继电器常通、按键不切换）。"""
+        return gang.is_wireless(self.state.values)
+
+    def _gangs(self) -> list:
+        """这张卡**要画**的按键。
+
+        默认就是卡片声明的全部路数。选了「隐藏转无线」样式时，把转无线的那几路
+        剔掉——它们在物理上不控制通断，占着位置只会让人以为能点（而且点下去
+        什么都不会发生，见 ``mousePressEvent``）。剔完还是空，就退回产品图。
+        """
+        gangs = self.state.card.gangs
+        if not self._style.hide_wireless:
+            return gangs
+        return [g for g in gangs if not self._wireless(g)]
+
+    def _gang_for(self, siid: int):
+        return next((g for g in self._gangs() if g.siid == siid), None)
+
+    def _paints_gangs(self) -> bool:
+        """内容带画按键还是产品图。样式（「隐藏转无线」）把按键剔空时退回产品图。"""
+        return bool(self._gangs())
 
     # -- 布局 ------------------------------------------------------------
     def _title_hit(self, pos: QPoint) -> bool:
@@ -448,7 +512,7 @@ class DeviceCard(QWidget):
         * **4 键及以上：胶囊网格。** 竖条会被压到 28px 宽，竖排文字排不开；
           1–2 键一行反而更宽松（3 键时"排风扇"会被截成"排…"，所以 3–4 键走 2×2）。
         """
-        gangs = self.state.card.gangs
+        gangs = self._gangs()
         if not gangs:
             return []
         area = self._body_rect()
@@ -543,7 +607,7 @@ class DeviceCard(QWidget):
         p.drawLine(round(c.x()), round(c.y() - r * 1.18), round(c.x()), round(c.y()))
 
     def _paint_gangs(self, p: QPainter, base: str, bg: str) -> None:
-        gangs = self.state.card.gangs
+        gangs = self._gangs()
         rects = self._gang_rects()
         if not gangs:
             return
@@ -559,9 +623,16 @@ class DeviceCard(QWidget):
         vertical = bars and len(gangs) > 1
         size, line_h = self._gang_label_metrics(gangs, rects[0].height()) if vertical else (0, 0.0)
         for g, rect in zip(gangs, rects):
+            wireless = self._wireless(g)
             on = bool(self.state.values.get(g.power.key))
-            hot = self._hot == ("gang", g.siid)
-            if on:
+            hot = self._hot == ("gang", g.siid) and not wireless
+            if wireless:
+                # 转无线的路：**虚线 + 平平的底 + 右上角无线标记**。
+                # 不填品类色——填了会和"开着、可以关"的键混成一样；
+                # 也不画电源符号，因为这一路本来就没有可切换的负载。
+                p.setPen(QPen(QColor(pal.text_mute), 1, Qt.DashLine))
+                p.setBrush(QColor(theme.blend(bg, pal.text, 0.03)))
+            elif on:
                 p.setPen(Qt.NoPen)
                 p.setBrush(QColor(base if not hot else theme.blend(base, "#FFFFFF", 0.12)))
             else:
@@ -569,7 +640,9 @@ class DeviceCard(QWidget):
                 p.setBrush(QColor(off if not hot else theme.blend(off, pal.text, 0.06)))
             radius = GANG_BAR_RADIUS if bars else theme.RADIUS_SMALL
             p.drawRoundedRect(rect, radius, radius)
-            color = "#FFFFFF" if on else pal.text_soft
+            if wireless:
+                self._paint_wireless_badge(p, rect, pal.text_mute)
+            color = pal.text_mute if wireless else ("#FFFFFF" if on else pal.text_soft)
             if vertical:
                 paint_vertical_label(p, rect, g.label, color, size, line_h)
             else:
@@ -582,6 +655,26 @@ class DeviceCard(QWidget):
                     weight=QFont.Medium,
                     align=Qt.AlignCenter,
                 )
+
+    @staticmethod
+    def _paint_wireless_badge(p: QPainter, rect: QRectF, color: str) -> None:
+        """在按键右上角画一枚极小的无线符号：两层弧 + 一个点。
+
+        只有 10px 见方，所以弧用 1.2px 笔宽、圆心放在**底边中点**——三层同心弧从
+        圆心往上张开，看起来才是"信号在发射"。画在右上角而不是正中：竖排标签占
+        的是中间那一列，正中间会压字。
+        """
+        d = 10.0
+        x = rect.right() - d - 5
+        y = rect.top() + 5
+        c = QPointF(x + d / 2, y + d)
+        p.setPen(QPen(QColor(color), 1.2, Qt.SolidLine, Qt.RoundCap))
+        p.setBrush(Qt.NoBrush)
+        for r in (d * 0.28, d * 0.55, d * 0.82):
+            p.drawArc(QRectF(c.x() - r, c.y() - r, r * 2, r * 2), 45 * 16, 90 * 16)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(color))
+        p.drawEllipse(QPointF(c.x(), c.y() - 1.2), 1.1, 1.1)
 
     @staticmethod
     def _gang_label_metrics(gangs, bar_h: float) -> tuple[int, float]:
@@ -600,9 +693,10 @@ class DeviceCard(QWidget):
     # -- 交互 ------------------------------------------------------------
     def _hit(self, pos: QPoint) -> tuple[str, int] | None:
         st = self.state
-        if st.card.gangs:
+        gangs = self._gangs()
+        if gangs:
             pt = QPointF(pos)
-            for g, rect in zip(st.card.gangs, self._gang_rects()):
+            for g, rect in zip(gangs, self._gang_rects()):
                 if rect.contains(pt):
                     return ("gang", g.siid)
             return None
@@ -630,7 +724,8 @@ class DeviceCard(QWidget):
     def mousePressEvent(self, event) -> None:  # noqa: N802
         self._press_on_control = False
         if event.button() == Qt.LeftButton:
-            hit = self._hit(event.position().toPoint())
+            pos = event.position().toPoint()
+            hit = self._hit(pos)
             if hit is not None:
                 self._press_on_control = True
                 st = self.state
@@ -639,13 +734,46 @@ class DeviceCard(QWidget):
                     if ctl and ctl.prop:
                         self.toggled.emit(st.did, ctl.prop.siid, ctl.prop.piid)
                 else:
-                    gang = next((g for g in st.card.gangs if g.siid == hit[1]), None)
+                    gang = self._gang_for(hit[1])
                     if gang:
-                        self.toggled.emit(st.did, gang.power.siid, gang.power.piid)
+                        if self._wireless(gang):
+                            # 转无线的键**不发写请求**：固件不理 on/off，真发出去还可能
+                            # 把常通的继电器断掉——那是给智能灯供电的那一路。
+                            # 也不能"发一条按下"：click 是设备事件，云端没有 event/set
+                            # （见 docs/reference/mijia-automation-events.md 第 11 节），
+                            # 所以联动只认实体键。这里只解释，别让用户以为界面坏了。
+                            tooltip.toast(
+                                self,
+                                f"{gang.label}已转无线：这一路常通电，要联动请在实体键上按",
+                                self._p,
+                            )
+                        else:
+                            self.toggled.emit(st.did, gang.power.siid, gang.power.piid)
+                event.accept()
+                return
+            # 第二道闸：这点落在内容带的控件上时，这次点击就算控件消费掉了。
+            # 控件自己已经会 accept（``CardControl.mousePressEvent``），正常情况
+            # 走不到这里；但"禁用态早退""新控件忘了 override"这类遗漏一旦发生，
+            # 松手就会被当成长按卡片、打开详情页——操控失灵比点了没反应严重。
+            if self._control_at(pos) is not None:
+                self._press_on_control = True
                 event.accept()
                 return
             # 卡片主体不再在按下时打开详情：先让墙面的拖动排序有机会接管。
         super().mousePressEvent(event)
+
+    def _control_at(self, pos: QPoint) -> QWidget | None:
+        """这一点落在内容带的哪个控件上（含控件的子控件，如开关里的滑块）。
+
+        ``childAt`` 只给最深的那层，所以要沿父链往上找 ``CardControl``：
+        ``ToggleSwitch`` 是 ``CardToggle`` 的子控件，直接判类型会漏。
+        """
+        w = self.childAt(pos)
+        while w is not None and w is not self:
+            if isinstance(w, CardControl):
+                return w
+            w = w.parentWidget()
+        return None
 
     def mouseReleaseEvent(self, event) -> None:  # noqa: N802
         if event.button() == Qt.LeftButton:
@@ -665,7 +793,11 @@ class DeviceCard(QWidget):
         if hit != self._hot:
             self._hot = hit
             self.update()
-        self.setCursor(Qt.PointingHandCursor if hit else Qt.ArrowCursor)
+        # 转无线那一路照旧吃下按下事件（免得变成"点一下开详情"），但不是可点的东西，
+        # 光标留在箭头，别给"按得动"的暗示
+        gang = self._gang_for(hit[1]) if hit and hit[0] == "gang" else None
+        clickable = hit is not None and not (gang is not None and self._wireless(gang))
+        self.setCursor(Qt.PointingHandCursor if clickable else Qt.ArrowCursor)
 
     def contextMenuEvent(self, event) -> None:  # noqa: N802
         # 右键菜单由墙面统一弹（隐藏 / 取消隐藏 / 打开详情）

@@ -26,7 +26,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QPoint, QPointF, QTimer, Qt  # noqa: E402
+from PySide6.QtCore import QCoreApplication, QEvent, QPoint, QPointF, QTimer, Qt  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import QApplication, QDialog, QWidget  # noqa: E402
 
@@ -246,6 +246,45 @@ def test_nested(app: QApplication, host: QWidget) -> None:
     check("多层：主窗口始终在", host.isVisible())
 
 
+def _flush_deletes(app: QApplication) -> None:
+    """跑一轮 DeferredDelete：``deleteLater()`` 只是排队，要发事件才真删。"""
+    QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+    app.processEvents()
+
+
+def test_closed_is_deleted(app: QApplication, host: QWidget) -> None:
+    """关掉就销毁，别让弹窗攒在主窗口名下（2026-11-12 用户报的闪烁 + 终端刷错）。
+
+    以前 ``exec_with_dim_click`` 只 ``shield.hide()``，弹窗本身留活：parent 是主窗口，
+    C++ 对象被 parent 一直持有，挂在它身上的 ``WindowFrame`` / ``DimClickShield``
+    两个事件过滤器也跟着活；而 Python 侧只由调用方的局部变量引用，函数一返回就可能
+    被 GC——Qt 再回调时就报 ``'WindowFrame' object has no attribute 'win'``。
+    """
+    dialogs = []
+    for _ in range(5):
+        dlg = ProbeDialog(host)
+        dialogs.append(dlg)
+        QTimer.singleShot(0, dlg.reject)
+        exec_with_dim_click(dlg)
+    _flush_deletes(app)
+    from shiboken6 import isValid
+
+    alive = [i for i, d in enumerate(dialogs) if isValid(d)]
+    check("连续开关 5 次，没有一个弹窗还活着", not alive, f"活着 {alive}")
+    left = host.findChildren(QDialog)
+    check("主窗口名下不再挂着对话框（不会越攒越多）", not left, f"剩 {len(left)} 个")
+    # 过滤器本身也得随弹窗一起走：它们都是 dialog 的子对象
+    frames = [w for w in host.findChildren(QWidget) if getattr(w, "_window_frame", None)]
+    check("没有残留的 WindowFrame", not frames, f"剩 {len(frames)} 个")
+    # 反向：只 hide 不 delete 的对话框会一直活着，证明上面三条真能测到东西
+    kept = ProbeDialog(host)
+    kept.hide()
+    _flush_deletes(app)
+    check("只 hide 不 delete 的弹窗仍然活着（对照）", isValid(kept), "")
+    kept.deleteLater()
+    _flush_deletes(app)
+
+
 def main() -> int:
     app = QApplication.instance() or QApplication(sys.argv[:1])
     host = make_host(app)
@@ -256,6 +295,7 @@ def main() -> int:
     test_press_dim_release_inside(app, host)
     test_wheel_no_close(app, host)
     test_nested(app, host)
+    test_closed_is_deleted(app, host)
     print()
     if FAILS:
         print(f"{len(FAILS)} 项失败：")

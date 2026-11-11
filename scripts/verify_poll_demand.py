@@ -154,11 +154,47 @@ def _describe() -> None:
     check("describe 默认档", "默认" in b2.describe(), b2.describe())
 
 
+def _burst() -> None:
+    """指令后的高频窗口：压在上面的一档，撤掉就回原档。
+
+    这条对应 ``main_window`` 的 ``_start_burst`` / ``_end_burst``：窗口该是 3 秒
+    还是 15 秒由"看不看得见"决定，突发只在写指令之后的几秒里临时更严。
+    """
+    hits: list[int | None] = []
+
+    # 前台：3 秒常态 → 发指令 → 0.5 秒 → 窗口结束回 3 秒
+    b = PollDemandBoard("属性轮询", idle_ms=3000)
+    hits = _record(b)
+    b.set("window", 3000, "窗口可见")
+    b.set("burst", 500, "刚发过指令")
+    check("发指令后压到 500", b.interval_ms == 500, str(b.interval_ms))
+    check("突发那条是最严的", b.holder().owner == "burst", str(b.holder()))
+    b.clear("burst")
+    check("窗口结束回 3000", b.interval_ms == 3000, str(b.interval_ms))
+    # 两次切换各一次回调（3000 → 500 → 3000），没有多余的重置
+    check("只为两次真实变化回调", hits == [3000, 500, 3000], str(hits))
+
+    # 托盘：15 秒常态 → 发指令 → 仍然 0.5 秒（后台也不能等 15 秒）
+    b2 = PollDemandBoard("属性轮询", idle_ms=3000)
+    b2.set("window", 15_000, "窗口在托盘")
+    b2.set("burst", 500, "刚发过指令")
+    check("托盘里发指令也压到 500", b2.interval_ms == 500, str(b2.interval_ms))
+    b2.clear("burst")
+    check("托盘里窗口结束回 15000", b2.interval_ms == 15_000, str(b2.interval_ms))
+
+    # 下限：谁报 100 都会被抬到 MIN_INTERVAL_MS，0.5 秒已经不再被抬
+    b3 = PollDemandBoard("属性轮询", idle_ms=3000)
+    b3.set("burst", 500, "刚发过指令")
+    check("500 不被下限抬高", b3.interval_ms == 500, str(b3.interval_ms))
+    check("下限就是 500", MIN_INTERVAL_MS == 500, str(MIN_INTERVAL_MS))
+
+
 def main() -> int:
     _basics()
     _floor()
     _none_and_subscribe()
     _describe()
+    _burst()
     print()
     if FAILS:
         print(f"{len(FAILS)} 项失败：")

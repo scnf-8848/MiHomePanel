@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import math
+from typing import Any
 
 from PySide6.QtCore import QPointF, QRect, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import (
@@ -46,6 +47,12 @@ TRACK_H = 6
 THUMB_D = 14
 #: 胶囊控件的高度
 CHIP_H = 26
+#: 分段控件最多切几段，超过就退步进器。15 档（净化器）切出来每段只有 20px，
+#: "26-45" 这种文案一个也塞不下，等于把可选项藏起来。
+MAX_SEGMENTS = 8
+#: 卡片内容带的标称宽度（2×1 / 2×2 都是 340 − 14×2）。造控件的时候 Qt 还没给
+#: 几何，所以"这组标签放不放得下"只能按这个数回答，见 :func:`make_control`。
+BODY_W = 312
 #: 电容触摸的最小可点高度。桌面端鼠标可以更小，但卡片在触摸屏上也要能用。
 MIN_HIT_H = 24
 
@@ -121,14 +128,17 @@ class CardControl(QWidget):
         palette: theme.Palette,
         accent: str,
         *,
-        label: str = "",
+        label: str | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self.prop = prop
         self._p = palette
         self._accent = accent
-        self._label = label or prop.display_label
+        # 空串 = **故意不画标签**（卡片里的格子自己画，不再重复一遍）；
+        # None / 省略 = 用属性自己的行名。两者不能混：早先写 ``label or``
+        # 会让 ``label=""`` 悄悄退回去，格子里就出现两遍同样的字。
+        self._label = prop.display_label if label is None else label
         self._dimmed = False
         self._write = prop.writeable
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
@@ -156,6 +166,29 @@ class CardControl(QWidget):
     def sizeHint(self) -> QSize:  # noqa: N802
         return QSize(120, self.height())
 
+    # -- 鼠标 ------------------------------------------------------------
+    # 控件**必须把落在自己身上的左键吞掉**，包括"点了什么都不做"的分支。
+    #
+    # 为什么这条要写在基类：``DeviceCard.mouseReleaseEvent`` 只要"按下、松开都
+    # 在卡片内"就 ``clicked.emit``（打开详情页），而 Qt 默认会把没被 accept 的
+    # press 沿父链传上去。所以子控件里任何一个"没命中就 return"的早退，都会让
+    # 松手冒泡到卡片——2026-11-12 用户报的"点 body 里的控件，结果打开了详情页"
+    # 就是这个：值没写出去，详情页开了。
+    #
+    # 正确的边界是"控件矩形内的事归控件"：滑条的整行、轨道的整条、开关的整行
+    # 都是控件的地盘。点空白处不改变值，但也不该被解释成"点了一下卡片"。
+    def mousePressEvent(self, event) -> None:  # noqa: N802
+        if event.button() == Qt.LeftButton:
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802
+        if event.button() == Qt.LeftButton:
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
 
 # ---------------------------------------------------------------------------
 # 滑条：亮度、色温、窗帘开合度
@@ -176,7 +209,7 @@ class CardSlider(WheelSafe, CardControl):
         palette: theme.Palette,
         accent: str,
         *,
-        label: str = "",
+        label: str | None = None,
         gradient: bool = False,
         compact: bool = False,
         parent: QWidget | None = None,
@@ -322,7 +355,10 @@ class CardSlider(WheelSafe, CardControl):
 
     # -- 交互 ------------------------------------------------------------
     def mousePressEvent(self, event) -> None:  # noqa: N802
+        # 禁用态也要吞掉（见 ``CardControl.mousePressEvent``）：不然点一下灰条
+        # 就等于点了整张卡片，详情页会自己弹出来。
         if event.button() != Qt.LeftButton or not self.isEnabled():
+            super().mousePressEvent(event)
             return
         self._dragging = True
         self._update_from(event.position().x())
@@ -335,6 +371,7 @@ class CardSlider(WheelSafe, CardControl):
 
     def mouseReleaseEvent(self, event) -> None:  # noqa: N802
         if event.button() != Qt.LeftButton or not self._dragging:
+            super().mouseReleaseEvent(event)
             return
         self._dragging = False
         self._update_from(event.position().x())
@@ -384,7 +421,7 @@ class CardStepper(WheelSafe, CardControl):
         palette: theme.Palette,
         accent: str,
         *,
-        label: str = "",
+        label: str | None = None,
         centered: bool = False,
         parent: QWidget | None = None,
     ) -> None:
@@ -393,6 +430,22 @@ class CardStepper(WheelSafe, CardControl):
         # ``_numeric_range`` 会沿用规格自己的最小合法档位（通常是 1）。
         fine = 0.5 if prop.unit == "celsius" else 0.0
         self._lo, self._hi, self._step = _numeric_range(prop, fine_step=fine)
+        #: 枚举档位（扫风角度 30/60/90/120/140、净化器 15 档）。非空时内部一律
+        #: 用**下标**当数值：``_lo=0``、``_hi=len-1``、``_step=1``，对外仍然收发
+        #: 设备用的那个值。为什么让步进器吃枚举：离散小集合本来就该"上一下 /
+        #: 下一下"，而胶囊在半个卡片宽（≈140px）里铺五个根本放不下。
+        self._values: list[int] = (
+            [o.value for o in prop.value_list]
+            if prop.kind == "enum" and prop.value_list
+            else []
+        )
+        self._labels: dict[int, str] = (
+            {o.value: o.display_short for o in prop.value_list}
+            if self._values
+            else {}
+        )
+        if self._values:
+            self._lo, self._hi, self._step = 0.0, float(len(self._values) - 1), 1.0
         self._value = self._lo
         self._hot = 0  # -1 减、+1 加、0 无
         self._centered = centered
@@ -407,10 +460,27 @@ class CardStepper(WheelSafe, CardControl):
 
     # -- 值 --------------------------------------------------------------
     def value(self) -> float:
+        """当前值。枚举档位返回**设备那个值**（不是内部下标）。"""
+        if self._values:
+            return self._values[int(round(self._value))]
         return self._value
 
     def set_value(self, value: object, animate: bool = False) -> None:
         if value is None:
+            return
+        if self._values:
+            # 收到的可能是字符串或不在档位里的值（固件加了新档）。不在表里就
+            # 保持原状，别把指针甩到第一档去——那会让用户看到"自己跳回去了"。
+            try:
+                raw = int(value)  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                return
+            if raw not in self._values:
+                return
+            idx = float(self._values.index(raw))
+            if abs(idx - self._value) > 1e-6:
+                self._value = idx
+                self.update()
             return
         try:
             v = float(value)  # type: ignore[arg-type]
@@ -432,6 +502,12 @@ class CardStepper(WheelSafe, CardControl):
         f.setWeight(QFont.DemiBold)
         return f
 
+    def _text_at(self, v: float) -> str:
+        """内部数值 → 显示文案。枚举档位时内部存的是下标。"""
+        if self._values:
+            return self._labels.get(self._values[int(round(v))], "")
+        return self._fmt(v)
+
     def _layout(self) -> tuple[QRect, QRect, QRect]:
         """返回 (数值区, 减号, 加号) 三个矩形。居中/靠右的差别只在这里。
 
@@ -446,7 +522,7 @@ class CardStepper(WheelSafe, CardControl):
             return QRect(0, 0, max(40, minus.x() - 8), self.height()), minus, plus
 
         fm = QFontMetrics(self._text_font())
-        tw = fm.horizontalAdvance(self._fmt(self._value))
+        tw = fm.horizontalAdvance(self._text_at(self._value))
         # 数值矩形比字形宽 2px（给抗锯齿留一点余量），扣掉这 2px 后
         # 两侧间距才在**视觉上**相等：量的是矩形边到边，多出的 1px 会翻倍。
         text_w = tw + 2
@@ -473,13 +549,18 @@ class CardStepper(WheelSafe, CardControl):
             return QSize(120, self.height())
         fm = QFontMetrics(self._text_font())
         # 半度值（16.5°C）比两端的整数文案更宽，别只看 lo/hi
-        samples = (
-            self._lo,
-            self._hi,
-            min(self._hi, self._lo + self._step),
-            max(self._lo, self._hi - self._step),
-        )
-        text_w = max(fm.horizontalAdvance(self._fmt(v)) for v in samples) + 2
+        if self._values:
+            # 枚举档位：文案长度不重要（"140" 比 "30" 宽），但取所有档位的最大值
+            # 才能保证加减时整组宽度不跳
+            samples = tuple(float(i) for i in range(len(self._values)))
+        else:
+            samples = (
+                self._lo,
+                self._hi,
+                min(self._hi, self._lo + self._step),
+                max(self._lo, self._hi - self._step),
+            )
+        text_w = max(fm.horizontalAdvance(self._text_at(v)) for v in samples) + 2
         gap = self.TEXT_GAP - 1
         return QSize(self.BTN * 2 + gap * 2 + text_w, self.height())
 
@@ -492,7 +573,7 @@ class CardStepper(WheelSafe, CardControl):
         draw_text(
             p,
             text_rect,
-            self._fmt(self._value),
+            self._text_at(self._value),
             size=self._value_px(),
             color=self._p.text if self.isEnabled() else self._ink(),
             weight=QFont.DemiBold,
@@ -524,6 +605,7 @@ class CardStepper(WheelSafe, CardControl):
     # -- 交互 ------------------------------------------------------------
     def mousePressEvent(self, event) -> None:  # noqa: N802
         if event.button() != Qt.LeftButton or not self.isEnabled():
+            super().mousePressEvent(event)
             return
         minus, plus = self._buttons()
         pos = event.position().toPoint()
@@ -532,6 +614,8 @@ class CardStepper(WheelSafe, CardControl):
         elif plus.adjusted(-6, -6, 6, 6).contains(pos):
             self._hot = 1
         else:
+            # 点在"−"和"+"中间那截数字上：不改值，但也不让事件冒泡出去
+            super().mousePressEvent(event)
             return
         self._bump(self._hot)
         self._hold.start()
@@ -562,6 +646,10 @@ class CardStepper(WheelSafe, CardControl):
             return
         self._value = target
         self.update()
+        if self._values:
+            # 枚举：发出去的是**设备那个值**，不是内部下标
+            self.committed.emit(self._values[int(round(target))])
+            return
         self.committed.emit(_clean_number(target))
 
 
@@ -590,7 +678,7 @@ class CardChips(CardControl):
         palette: theme.Palette,
         accent: str,
         *,
-        label: str = "",
+        label: str | None = None,
         spread: bool = False,
         parent: QWidget | None = None,
     ) -> None:
@@ -738,9 +826,11 @@ class CardChips(CardControl):
 
     def mousePressEvent(self, event) -> None:  # noqa: N802
         if event.button() != Qt.LeftButton or not self.isEnabled():
+            super().mousePressEvent(event)
             return
         idx = self._hit(event.position().toPoint())
         if idx < 0:
+            super().mousePressEvent(event)
             return
         _, value, _ = self._layout()[idx]
         if value != self._current:
@@ -752,6 +842,259 @@ class CardChips(CardControl):
     def _hit(self, point) -> int:
         for i, (rect, _, _) in enumerate(self._layout()):
             if rect.contains(point):
+                return i
+        return -1
+
+
+# ---------------------------------------------------------------------------
+# 分段控件：一条轨道 + 内嵌按钮
+# ---------------------------------------------------------------------------
+
+
+class CardSeg(CardControl):
+    """一条轨道里切几段，单选（OpenMexia 的 ``.seg`` 那种观感）。
+
+    和 ``CardChips`` 的差别不只是外观——胶囊是"各自独立的块"，轨道是"一个容器
+    里切段"，三处实际差别：
+
+    * **选中态是实心品类色 + 反色字**，不再是"在卡片底色上再混一层"。卡片开启
+      时底色本身已经染过同一个品类色（``theme.tint``，10%），激活态若也只是
+      混色（原来 24%），在 26px 的高度上几乎看不出来——2026-11-12 实测：风扇
+      正在直吹风，模式那一排看着像一项都没选中。
+    * **宽度均分**，不按文字量分配。5 段角度（30/60/90/120/140）在半张卡
+      130px 里也放得下，胶囊排同样内容要 162px。
+    * **永远铺满**（``CardChips(spread=True)`` 是"有余宽才铺"）。分段控件的语义
+      是"这些是互斥的几档"，右边留一条空档会显得少了一段。
+
+    字号是这里唯一的自由度（宽度已经均分完了）：按最宽那项自动在 12/11/10 里
+    挑。一个都放不下就由 :func:`make_control` 退回步进器，**不在控件内部截字**。
+    """
+
+    committed = Signal(int)
+
+    HEIGHT = CHIP_H
+    #: 轨道内边距、段间距
+    TRACK_PAD = 2
+    GAP = 2
+    TRACK_RADIUS = 9
+    BTN_RADIUS = 7
+    #: 依次尝试的字号
+    SIZES = (12, 11, 10)
+    #: 段内左右各留多少（文字与段边）
+    TEXT_PAD = 3
+
+    def __init__(
+        self,
+        prop: PropertySpec,
+        palette: theme.Palette,
+        accent: str,
+        *,
+        label: str | None = None,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(prop, palette, accent, label=label, parent=parent)
+        self._items: list[tuple[int, str]] = [
+            (o.value, o.display_short) for o in prop.value_list
+        ]
+        # 与胶囊同一套语义：初始不选中任何一项，等真实值到了再点亮
+        self._current: int | None = None
+        self._active_seen: int | None = None
+        self._hover = -1
+        self._px = self.SIZES[0]
+        self.setFixedHeight(self.HEIGHT)
+        self.setMouseTracking(True)
+        self.setVisible(bool(self._items))
+
+    # -- 值（接口与 CardChips 一致，body.sync 不用分支）------------------
+    def value(self) -> int | None:
+        return self._current
+
+    def set_value(self, value: object, animate: bool = False) -> None:
+        if value is None:
+            return
+        try:
+            v = int(value)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return
+        if v != self._current:
+            self._current = v
+            self.update()
+
+    def set_active(self, value: object) -> None:
+        """同步"当前激活判据"（型号适配后由 store 给出）。语义见 ``CardChips``。"""
+        if value is None:
+            return
+        try:
+            v = int(value)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return
+        prev, self._active_seen = self._active_seen, v
+        if v == prev:
+            return
+        if v == 0:
+            if prev is not None:
+                self._current = 0
+                self.update()
+            return
+        if v != self._current:
+            self._current = v
+            self.update()
+
+    def set_unknown(self) -> None:
+        """值没读到：**一段都不点亮**。
+
+        轨道没有"占位项"（那是下拉框才有的东西），所以"未知"只能表现为
+        "没有一段是激活的"。别退回去点亮第一段——那看起来像"值就是第一项"，
+        和下拉框停在 ``currentIndex() == -1`` 是同一个原则（见 ``ControlRow``）。
+        """
+        if self._current is not None:
+            self._current = None
+            self._active_seen = None
+            self.update()
+
+    # -- 栅格 ------------------------------------------------------------
+    @staticmethod
+    def _proto_font(px: int) -> QFont:
+        """量尺寸用的字体。和 ``paintEvent`` 里必须同族同字号，否则量出来的
+        宽度和画出来的对不上（离屏平台尤其容易差一档）。"""
+        f = QFont()
+        f.setPixelSize(px)
+        f.setWeight(QFont.Medium)
+        return f
+
+    def _font(self, px: int | None = None) -> QFont:
+        return self._proto_font(px or self._px)
+
+    def _inner(self) -> int:
+        n = len(self._items)
+        return max(1, self.width() - self.TRACK_PAD * 2 - self.GAP * (n - 1))
+
+    def _widths(self, px: int) -> list[int] | None:
+        """按字号算每段的宽度；放不下返回 ``None``。
+
+        **按文字分配，不搞等宽**：角度那组是 30/60/90/120/140，"140" 比 "30"
+        宽一半，等宽的结果只能是把字号压到 9px 或者干脆放不下（半张卡里 5 段
+        等宽 = 每段 20px，装不下三个数字）。所以先按"文字 + 内边距"给出最小
+        宽度，剩下的余量**均分**给每一段——短的那几段因此略宽一点，看着仍像
+        等分的轨道。
+        """
+        n = len(self._items)
+        if n == 0:
+            return None
+        inner = self._inner()
+        fm = QFontMetrics(self._font(px))
+        need = [fm.horizontalAdvance(t) + self.TEXT_PAD * 2 for _, t in self._items]
+        total = sum(need)
+        if total > inner:
+            return None
+        extra = (inner - total) // n
+        return [w + extra for w in need]
+
+    def _fit_font(self) -> int:
+        for px in self.SIZES:
+            if self._widths(px) is not None:
+                return px
+        return self.SIZES[-1]
+
+    def _seg_rects(self) -> list[tuple[QRect, int, str]]:
+        n = len(self._items)
+        if n == 0:
+            return []
+        widths = self._widths(self._px)
+        if widths is None:
+            # 最小字号都放不下（工厂本该拦住，这里只做最后兜底）：退回等宽
+            w = self._inner() // n
+            widths = [w] * n
+        h = max(1, self.height() - self.TRACK_PAD * 2)
+        out: list[tuple[QRect, int, str]] = []
+        x = self.TRACK_PAD
+        for i, ((value, text), w) in enumerate(zip(self._items, widths, strict=False)):
+            # 最后一段吃掉整除余数，右边缘才不会差 1–2px
+            ww = self.width() - self.TRACK_PAD - x if i == n - 1 else w
+            out.append((QRect(x, self.TRACK_PAD, max(1, ww), h), value, text))
+            x += w + self.GAP
+        return out
+
+    # -- 绘制 ------------------------------------------------------------
+    def _ink_on_accent(self) -> str:
+        """实心品类色上的字色：亮底配深字，暗底配白字。"""
+        return "#101317" if theme.luma(self._accent) > 140 else "#FFFFFF"
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setOpacity(0.55 if self._dimmed else 1.0)
+        self._px = self._fit_font()
+        # 轨道：整块容器，比卡片底色深一档（开启态卡片已经染了品类色，
+        # 轨道要"沉"下去才看得出这是容器的底）
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(theme.blend(self._p.card, self._p.text, 0.10)))
+        p.drawRoundedRect(
+            QRect(0, 0, self.width(), self.height()),
+            self.TRACK_RADIUS,
+            self.TRACK_RADIUS,
+        )
+        for i, (rect, value, text) in enumerate(self._seg_rects()):
+            on = value == self._current
+            if on:
+                p.setBrush(QColor(self._accent))
+            elif i == self._hover:
+                p.setBrush(QColor(theme.blend(self._p.card, self._p.text, 0.10)))
+            else:
+                p.setBrush(Qt.NoBrush)
+            if on or i == self._hover:
+                p.drawRoundedRect(rect, self.BTN_RADIUS, self.BTN_RADIUS)
+            draw_text(
+                p,
+                rect,
+                text,
+                size=self._px,
+                color=self._ink_on_accent() if on else self._p.text_soft,
+                weight=QFont.Medium if on else QFont.Normal,
+                align=Qt.AlignCenter,
+                elide=False,
+            )
+        p.end()
+
+    def sizeHint(self) -> QSize:  # noqa: N802
+        """按 12px 字号量一遍"文字 + 内边距 + 段间距"，再给余量均分留 8px。"""
+        fm = QFontMetrics(self._font(self.SIZES[0]))
+        need = sum(fm.horizontalAdvance(t) + self.TEXT_PAD * 2 for _, t in self._items)
+        need += self.GAP * max(0, len(self._items) - 1) + self.TRACK_PAD * 2
+        return QSize(need + 8, self.HEIGHT)
+
+    # -- 交互 ------------------------------------------------------------
+    def mouseMoveEvent(self, event) -> None:  # noqa: N802
+        hit = self._hit(event.position().toPoint())
+        if hit != self._hover:
+            self._hover = hit
+            self.update()
+
+    def leaveEvent(self, event) -> None:  # noqa: N802
+        if self._hover != -1:
+            self._hover = -1
+            self.update()
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802
+        if event.button() != Qt.LeftButton or not self.isEnabled():
+            super().mousePressEvent(event)
+            return
+        idx = self._hit(event.position().toPoint())
+        if idx < 0:
+            super().mousePressEvent(event)
+            return
+        _, value, _ = self._seg_rects()[idx]
+        if value != self._current:
+            self._current = value
+            self.update()
+        self.committed.emit(value)
+        event.accept()
+
+    def _hit(self, point) -> int:
+        # 命中区用整条轨道的高度：段本身只有 22 高，上下各 2px 的内边距
+        # 也应该是有效点击区，否则贴着轨道边缘点会落空。
+        for i, (rect, _, _) in enumerate(self._seg_rects()):
+            if QRect(rect.x(), 0, rect.width(), self.height()).contains(point):
                 return i
         return -1
 
@@ -774,7 +1117,7 @@ class CardToggle(CardControl):
         palette: theme.Palette,
         accent: str,
         *,
-        label: str = "",
+        label: str | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(prop, palette, accent, label=label, parent=parent)
@@ -809,18 +1152,31 @@ class CardToggle(CardControl):
     # -- 绘制 ------------------------------------------------------------
     def resizeEvent(self, event) -> None:  # noqa: N802
         self.switch.move(
-            self.width() - self.switch.width(),
+            self._switch_x(),
             (self.height() - self.switch.height()) // 2,
         )
+
+    def _switch_x(self) -> int:
+        """开关摆哪儿。
+
+        **有标签就靠右、没标签就靠左**。``label=""`` 意味着标签由外面的格子
+        画（见 ``CardControl`` 的注释），那它就在控件的左边紧挨着；这时再把开关
+        推到行尾，中间会空出一大截，看起来像开关贴到了隔壁那一格——风扇卡
+        「左右扫风」和右列的「模式」就是这么看着别扭的（2026-11-12 用户指出）。
+        """
+        if self._label:
+            return self.width() - self.switch.width()
+        return 0
 
     def paintEvent(self, event) -> None:  # noqa: N802
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
         p.setOpacity(0.55 if self._dimmed else 1.0)
-        w = max(40, self.width() - self.switch.width() - 8)
+        # 有标签时文字占左边、给右边的开关留位；没标签时整行都是空的
+        w = self.width() - (self.switch.width() + 8) if self._label else self.width()
         draw_text(
             p,
-            QRect(0, 0, w, self.height()),
+            QRect(0, 0, max(40, w), self.height()),
             self._label,
             size=12,
             color=self._ink() if self.isEnabled() else self._p.text_mute,
@@ -858,7 +1214,7 @@ class CardReadout(CardControl):
         palette: theme.Palette,
         accent: str,
         *,
-        label: str = "",
+        label: str | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(prop, palette, accent, label=label, parent=parent)
@@ -905,14 +1261,145 @@ class CardReadout(CardControl):
 
 
 __all__ = [
+    "BODY_W",
     "CHIP_H",
+    "MAX_SEGMENTS",
+    "MIN_HIT_H",
+    "ROW_H",
     "CardChips",
     "CardControl",
     "CardReadout",
+    "CardSeg",
     "CardSlider",
     "CardStepper",
     "CardToggle",
-    "MIN_HIT_H",
-    "ROW_H",
+    "fits_chips",
+    "fits_segments",
     "kelvin_color",
+    "make_control",
 ]
+
+
+# ---------------------------------------------------------------------------
+# 控件库：一处决定"这个槽位画成什么"
+# ---------------------------------------------------------------------------
+
+
+def fits_chips(prop: PropertySpec, avail: int) -> bool:
+    """这组标签铺成分立胶囊，放得下吗（判据同样是"会不会出现省略号"）。
+
+    复现 ``CardChips._layout`` 的两步挤压（先压内边距，再按预算截字）。只有
+    显式声明 ``widget="chips"`` 时才会问到这里——默认的枚举单选已经走分段
+    控件了（见 :func:`make_control`）。
+    """
+    items = [o.display_short for o in prop.value_list]
+    n = len(items)
+    if n <= 0:
+        return False
+    fm = QFontMetrics(CardSeg._proto_font(12))
+    gap, pad = CardChips.GAP, CardChips.PAD
+    widths = [fm.horizontalAdvance(t) + pad * 2 for t in items]
+    total = sum(widths) + gap * (n - 1)
+    if total > avail:
+        pad = max(6, pad - (total - avail) // max(1, n * 2))
+        widths = [fm.horizontalAdvance(t) + pad * 2 for t in items]
+        total = sum(widths) + gap * (n - 1)
+    return total <= avail
+
+
+def fits_segments(prop: PropertySpec, avail: int) -> bool:
+    """这组标签切成段之后，还能不能把字放全。
+
+    判据和 ``CardChips`` 那套一样是"会不会出现省略号"，但算的是分段控件的
+    几何（按文字给最小宽度 + 余量均分 + 最小字号）。``CardSeg`` 内部会自己
+    往下降字号，所以这里用它的**最小**字号判：连 10px 都放不下就不该用分段
+    控件，该退步进器。
+    """
+    items = [o.display_short for o in prop.value_list]
+    n = len(items)
+    if n <= 0:
+        return False
+    inner = avail - CardSeg.TRACK_PAD * 2 - CardSeg.GAP * (n - 1)
+    if inner <= 0:
+        return False
+    fm = QFontMetrics(CardSeg._proto_font(CardSeg.SIZES[-1]))
+    need = sum(fm.horizontalAdvance(t) + CardSeg.TEXT_PAD * 2 for t in items)
+    return need <= inner
+
+
+def make_control(
+    ctl: Any,
+    palette: theme.Palette,
+    accent: str,
+    *,
+    avail: int = BODY_W,
+    label: str | None = None,
+    compact: bool = False,
+    centered: bool = True,
+    parent: QWidget | None = None,
+) -> CardControl | None:
+    """**卡片控件的唯一入口**：``Control.widget`` 声明 > 属性形状。
+
+    ``ctl`` 是 ``BoundControl``（有 ``prop`` / ``widget`` / ``label``）；用鸭子
+    类型是为了详情页预览这类只有 ``SimpleNamespace`` 的调用方也能用。
+
+    为什么要有这一层：卡片 body 有两套布局（一行一个槽位的 ``CardBody``、
+    两列四格的 ``FanBody``），各自实现一遍选型等于把同一张表抄两份——改一处、
+    漂一处。现在**选型的知识只有这一份**，布局只管"摆哪儿"：
+
+    * 声明了 ``widget`` 就按声明建（形状不符就退回按类型挑，不报错、不消失）；
+    * 枚举默认是 :class:`CardSeg`（轨道分段，单选语义），段数超
+      ``MAX_SEGMENTS`` 或放不下就退 :class:`CardStepper`；
+    * ``range`` 默认仍是步进器（温度语义），要滑条得显式声明
+      ``widget="slider"``——这一条不能反过来，1–100 的风速和 16–30 的温度都
+      是 range，猜不出来。
+
+    ``avail`` 是留给控件的宽度（调用方按布局扣掉标签/列宽）。``label=""``
+    表示"这格自己画名字"，见 ``CardControl`` 的注释。
+    """
+    prop = getattr(ctl, "prop", None)
+    if prop is None:
+        return None
+    want = getattr(ctl, "widget", "") or ""
+    kind = prop.kind
+    args = (prop, palette, accent)
+
+    def slider() -> CardSlider:
+        return CardSlider(*args, label=label, compact=compact, parent=parent)
+
+    def stepper() -> CardStepper:
+        return CardStepper(*args, label=label, centered=centered, parent=parent)
+
+    def seg() -> CardSeg:
+        return CardSeg(*args, label=label, parent=parent)
+
+    def chips() -> CardChips:
+        return CardChips(*args, label=label, spread=True, parent=parent)
+
+    def toggle() -> CardToggle:
+        return CardToggle(*args, label=label, parent=parent)
+
+    items = prop.value_list
+    seg_ok = bool(items) and len(items) <= MAX_SEGMENTS and fits_segments(prop, avail)
+
+    # 1) 显式声明。放不下/形状不符时不在这里返回 None——继续走下面的按类型
+    #    分支，等于"声明失效但控件还在"，比整格消失好。
+    if want == "slider" and prop.value_range:
+        return slider()
+    if want == "stepper" and (prop.value_range or items):
+        return stepper()
+    if want == "chips" and items and fits_chips(prop, avail):
+        return chips()
+    if want == "seg" and items and seg_ok:
+        return seg()
+    if want == "toggle" and kind == "bool":
+        return toggle()
+
+    # 2) 按属性形状
+    if kind == "bool":
+        return toggle()
+    if kind == "enum":
+        return seg() if seg_ok else stepper()
+    if prop.value_range:
+        return stepper()
+    return None

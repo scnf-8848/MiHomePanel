@@ -77,14 +77,14 @@ from PySide6.QtWidgets import QVBoxLayout, QWidget
 
 from ..core import geek
 from . import theme
+from . import card_controls
 from .card_controls import (
+    BODY_W,
     ROW_H,
-    CardChips,
     CardControl,
     CardReadout,
     CardSlider,
-    CardStepper,
-    CardToggle,
+    make_control,
 )
 
 if TYPE_CHECKING:
@@ -99,12 +99,19 @@ LIGHT_BRIGHT = "light_bright"
 PRESENCE_STATE = "presence_state"
 #: 空调「温度控制」：大数字步进器 + 模式胶囊。
 TEMP_CONTROL = "temp_control"
+#: 风扇「扫风 + 风速」：2×1，两列四格。左列左（右）扫风 + 角度，右列模式 + 风速；
+#: 右下的风速按当前模式换成 0–100 滑条或档位胶囊（型号规则见 ``dmaker`` 适配）。
+FAN_CONTROLS = "fan_controls"
 #: 摄像头「实时画面」：2×2，body 里直接铺视频。**不是**摄像头品类的默认样式，
 #: 用户要在右键「卡片样式」里主动选；默认仍是 1×1 标准卡（产品图）。
 CAMERA_LIVE = "camera_live"
 #: 中枢网关「极客版入口」：2×1，左产品图、右一个「打开极客版 + 复制登录码」的大按钮。
 #: 哪些设备有这项能力是**探测**出来的（见 ``ABILITY_GEEK``），不是写死的型号名单。
 GATEWAY_GEEK = "gateway_geek"
+#: 多键面板「隐藏转无线」：body 只画**实际控制通断**的那几路，按键按剩余数量重排
+#: （3 键里 1 路转无线 → 两键布局）；一路都不剩就退回产品图。判据是每路的
+#: ``Gang.mode`` + 运行时值，见 ``catalog.Gang.is_wireless``。
+SWITCH_WIRED = "switch_wired"
 
 #: 需要**实测确认**的能力才出现的样式，用 ``CardStyle.ability`` 声明。
 #: ``geek``：能给出极客版地址（``core.geek.probe`` 探过、结论落在
@@ -130,13 +137,29 @@ GRADIENT_SLOTS = frozenset({"color_temp"})
 BODY_SLIDERS = "sliders"
 BODY_READOUT = "readout"
 BODY_CONTROLS = "controls"
+#: 风扇 2×1：两列 × 两行的格子（左列扫风、右列模式 + 风速），由 ``FanBody`` 铺。
+#: 和 ``controls`` 的区别只在布局：那个是一行一个槽位，风扇要把四件事摆成两栏。
+BODY_FAN = "fan"
 #: 实时画面：body 不建 ``CardBody``，由 ``CameraCard`` 铺一个 ``CameraView``。
 #: 不占任何槽位，``slots`` 为空是正常的。
 BODY_VIDEO = "video"
 #: 极客版入口：body 是「左边产品图 + 右边一个大按钮」，由 ``GeekCard`` 铺一个
 #: ``GeekButton``。同样不占槽位——它调的是云端 RPC，不是设备属性。
 BODY_GEEK = "geek"
-BODY_KINDS = (BODY_SLIDERS, BODY_READOUT, BODY_CONTROLS, BODY_VIDEO, BODY_GEEK)
+BODY_KINDS = (
+    BODY_SLIDERS,
+    BODY_READOUT,
+    BODY_CONTROLS,
+    BODY_FAN,
+    BODY_VIDEO,
+    BODY_GEEK,
+)
+
+#: 分段控件最多切几段、超过改用步进器（枚举档位）。
+#: 原来的名字是 ``MAX_CHIPS``（胶囊上限），但单选枚举的默认控件已经换成
+#: ``CardSeg``（见 ``card_controls.make_control``），真正的上限也归到那边了——
+#: 这里只是转发，别在两处各定一个数。
+MAX_SEGMENTS = card_controls.MAX_SEGMENTS
 
 
 @dataclass(frozen=True, slots=True)
@@ -209,6 +232,11 @@ class CardStyle:
     span: int = 1
     rows: int = 1
     slots: tuple[str, ...] = ()
+    #: **至少绑上一个**就算可用（``slots`` 仍然要求全绑）。给"功能可多可少"
+    #: 的品类用：风扇有没有上下扫风、有没有模式、风速是档位还是连续量，
+    #: 每台都不一样，写成 ``slots`` 会让样式在缺一项的设备上整条消失。
+    #: 两个字段同时写时是"且"：``slots`` 全有 **且** ``at_least_one`` 有其一个。
+    at_least_one: tuple[str, ...] = ()
     category: str | None = None
     body: str = BODY_SLIDERS
     #: 需要设备**实测确认**的某项能力（见 ``ABILITY_GEEK``）。空 = 不设门槛。
@@ -217,6 +245,12 @@ class CardStyle:
     #: 人肉维护一份名单，而且漏一个就永远看不到入口。判据改成"程序问过这台设备"
     #: ——``core.geek.probe`` 发一条不耗码的请求，结论按 did 落盘。
     ability: str = ""
+    #: 多键面板专用：body 里**过滤掉转无线的路**，剩下的按键按数量重排；
+    #: 全被过滤掉就退回产品图。只在"至少一路具备有线/无线模式属性"的面板上出现
+    #: ——没有这个属性的插排/老面板选它等于选标准卡，菜单里不必多一条。
+    #: 判据是**静态能力**（规格里有没有 ``mode``），不看运行时值：样式菜单不能
+    #: 跟着轮询变，否则设备一侧改设置，菜单里就凭空多出/少掉一项。
+    hide_wireless: bool = False
 
     def __post_init__(self) -> None:
         # 声明期就炸，别等菜单里显示成"宽卡 3×1"才发现。注册表是模块级常量，
@@ -261,7 +295,11 @@ class CardStyle:
     @property
     def has_body(self) -> bool:
         # 画面样式没有槽位，但内容带确实被一个子控件占满，产品图不能再画。
-        return bool(self.slots) or self.body in (BODY_VIDEO, BODY_GEEK)
+        return bool(self.slots) or bool(self.at_least_one) or self.body in (
+            BODY_VIDEO,
+            BODY_GEEK,
+            BODY_FAN,
+        )
 
     def available(self, card: CardSpec) -> bool:
         """这台设备能不能用这个样式。
@@ -281,6 +319,16 @@ class CardStyle:
             return False
         if self.ability and not _ability_ready(self.ability, card):
             return False
+        if self.hide_wireless and not any(
+            g.mode is not None and g.wireless_value is not None for g in card.gangs
+        ):
+            # 没有一路带"有线/无线"模式属性（插排、老面板）→ 没有可隐藏的东西
+            return False
+        if self.at_least_one and not any(
+            self._slot_ready(card.bound(slot)) for slot in self.at_least_one
+        ):
+            # 一个都没绑上：这台设备没有这个样式要展示的东西，菜单里别出现
+            return False
         return all(self._slot_ready(card.bound(slot)) for slot in self.slots)
 
     def _slot_ready(self, ctl: Any) -> bool:
@@ -288,7 +336,7 @@ class CardStyle:
             return False
         if self.body == BODY_READOUT:
             return True
-        if self.body == BODY_CONTROLS:
+        if self.body in (BODY_CONTROLS, BODY_FAN):
             # 建什么控件由属性类型决定，能不能建也跟着类型走：枚举没有可选项
             # 就是一排空胶囊，数值没有刻度就是一对不知该加减多少的按钮。
             kind = ctl.prop.kind
@@ -304,6 +352,9 @@ class CardStyle:
 #: ``standard`` 永远排第一且永远可用，也是所有设备的默认。
 STYLES: tuple[CardStyle, ...] = (
     CardStyle(id=STANDARD, label="标准"),
+    # 多键面板的第二选择：只留"按下去真的会切继电器"的那几路。吸顶灯开关那种
+    # 整块都转无线的单开，选了它就等于一张产品图卡。
+    CardStyle(id=SWITCH_WIRED, label="隐藏转无线", category="switch", hide_wireless=True),
     CardStyle(
         id=LIGHT_DUAL,
         label="亮度 + 色温",
@@ -339,6 +390,28 @@ STYLES: tuple[CardStyle, ...] = (
         slots=("target_temp", "mode"),
         category="air-conditioner",
         body=BODY_CONTROLS,
+    ),
+    # 风扇：一天里最常碰的是"往哪儿吹"和"吹多大"，模式反而是一次性设置，
+    # 但模式和风速的控件是同一个位置（直吹风给 0–100 滑条、自然风给 4 档），
+    # 所以两行两列：左列扫风、右列模式 + 风速。
+    #
+    # **槽位一个都不"必须"**（``at_least_one``）：风扇之间的差异太大——有的只有
+    # 3 档没有连续量、有的有上下扫风、有的没有模式。写死 ``slots`` 会让这张卡在
+    # 缺一项的设备上整条消失，所以只要求"至少有一项能用"，具体摆什么由规格答。
+    CardStyle(
+        id=FAN_CONTROLS,
+        label="扫风 + 风速",
+        span=2,
+        at_least_one=(
+            "swing_h",
+            "swing_v",
+            "swing_angle",
+            "mode",
+            "fan_speed",
+            "fan_level",
+        ),
+        category="fan",
+        body=BODY_FAN,
     ),
     # 摄像头默认仍是 1×1 标准卡（产品图）；2×2 是用户主动选的查看方式。
     # 没有槽位，body 由 ``CameraCard`` 铺一个 ``CameraView``，播放控件与详情页共用。
@@ -576,29 +649,21 @@ class CardBody(QWidget):
         return widget
 
     def _pick(self, ctl: Any) -> CardControl | None:
-        """``controls`` body 的选型表：属性类型 → 控件。
+        """``controls`` body 的选型：**转给控件库**，这里只提供"用多宽"。
 
-        这张表是 ``BODY_CONTROLS`` 的全部含义，``_slot_ready`` 里的三条门槛
-        与它一一对应（枚举要有选项、数值要有刻度、布尔只要有属性）。
-        数值一律走步进器而不是滑条：温度这类属性是"精确的小整数"，
-        拖拽反而不好选到目标值。
+        选型的全部知识（声明优先、枚举默认分段、放不下退步进器、range 默认步进器）
+        都在 ``card_controls.make_control``。这里原先自己写了一遍，``FanBody`` 又写
+        一遍，两份已经开始漂（一处改了 MAX_CHIPS，另一处没动）——见
+        ``docs/DEVELOPMENT.md``「卡片控件库」。
         """
-        prop = ctl.prop
-        if prop.kind == "enum":
-            return CardChips(
-                prop, self._palette, self._accent,
-                label=ctl.label, spread=True, parent=self,
-            )
-        if prop.kind == "bool":
-            return CardToggle(
-                prop, self._palette, self._accent, label=ctl.label, parent=self
-            )
-        if prop.value_range:
-            return CardStepper(
-                prop, self._palette, self._accent,
-                label=ctl.label, centered=True, parent=self,
-            )
-        return None
+        return make_control(
+            ctl, self._palette, self._accent,
+            # 不能用 ``self.width()``：CardBody 还挂在父控件上、几何没定下来时
+            # 宽度是 QWidget 的默认 100，会把 5 段模式判成"放不下"而退步进器。
+            # 内容带的宽度是尺寸档定死的（2×1 / 2×2 都是 312），直接用那个。
+            avail=BODY_W,
+            label=ctl.label, centered=True, parent=self,
+        )
 
     # -- 数据 ------------------------------------------------------------
     def sync(self, state: DeviceState) -> None:
@@ -664,6 +729,7 @@ class CardBody(QWidget):
 __all__ = [
     "ABILITY_GEEK",
     "BODY_CONTROLS",
+    "BODY_FAN",
     "BODY_GAP",
     "BODY_GEEK",
     "BODY_KINDS",
@@ -671,10 +737,12 @@ __all__ = [
     "BODY_SLIDERS",
     "BODY_VIDEO",
     "CAMERA_LIVE",
+    "FAN_CONTROLS",
     "GATEWAY_GEEK",
     "GRADIENT_SLOTS",
     "LIGHT_BRIGHT",
     "LIGHT_DUAL",
+    "MAX_SEGMENTS",
     "PRESENCE_STATE",
     "TEMP_CONTROL",
     "SIZES",
