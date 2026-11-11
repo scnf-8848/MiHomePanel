@@ -2,6 +2,10 @@
 
 > 目标：让另一个 AI 在**非 HTML 程序**（桌面 / 移动 App / Canvas / 游戏引擎 / 自绘 UI）里复刻本项目的拖动排序效果。
 > 本文只描述「行为契约 + 状态机 + 几何算法 + 伪代码」，不依赖 DOM API。括号内标注本项目 Web 实现的对应做法，便于对照。
+>
+> 索引：`docs/reference/README.md`（状态 = **已落地**）。本程序里的落点是
+> `mihome/ui/dnd.py`（拖拽骨架：阈值 / 长按 / 幽灵 / 帧合并）与 `mihome/ui/wall.py`
+> （分区与卡片的落位、`set_drag_placeholder`），见 `docs/DEVELOPMENT.md`「排序与隐藏设备」。
 
 ---
 
@@ -375,7 +379,10 @@ resolveGrid(x, y, container, source, placeholder, n, perCol):
 
 ---
 
-## 12. 本项目对照实现（Web 版参考）
+## 12. 对照实现（Web 版参考，**外部仓库，不在本仓库内**）
+
+> 下表路径属于产出这份规格的 Web 项目，本仓库里没有 `js/` 目录，点开是空链接。
+> 本程序的落地位置在文件头的「索引」行：`mihome/ui/dnd.py` + `mihome/ui/wall.py`。
 
 | 内容 | 位置 |
 |---|---|

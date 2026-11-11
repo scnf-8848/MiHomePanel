@@ -631,6 +631,13 @@ class Gang:
 class CardSpec:
     category: str
     profile: CategoryProfile
+    #: 设备 did。样式能不能用有时要查**这台设备**的实测结论（极客版入口就靠
+    #: ``core.geek`` 的探测缓存，见 ``CardStyle.ability``），光有型号不够。
+    did: str = ""
+    #: 设备型号（``DeviceNode.model``）。品类太粗的地方要靠它收窄：``gateway``
+    #: 这一类里混着普通多模网关、遥控器，只有中枢网关才支持极客版那两条 RPC
+    #: （见 ``CardStyle.ability``）。
+    model: str = ""
     controls: list[BoundControl] = field(default_factory=list)
     metrics: list[BoundControl] = field(default_factory=list)
     gangs: list[Gang] = field(default_factory=list)
@@ -759,12 +766,15 @@ def _bind(spec: DeviceSpec, ctl: Control, primary: str | None) -> BoundControl:
 def build_card(
     spec: DeviceSpec,
     *,
+    did: str | None = None,
     model: str | None = None,
     gang_names: Mapping[int, str] | None = None,
     gang_rooms: Mapping[int, str] | None = None,
 ) -> CardSpec:
     """把一份 DeviceSpec 绑定成一张卡片描述。
 
+    ``did``: 设备 id。只有需要**按这台设备**的实测结论决定样式时才用得上
+    （极客版入口靠 ``core.geek`` 的探测缓存），其余地方可以不传。
     ``model``: 设备节点上报的型号（``DeviceNode.model``，如
     ``yeelink.light.lamp22``），是 ``MODEL_ADAPTERS`` 的唯一查找键。
     不传 = 不做型号适配（走默认路径）；别拿 ``spec.model`` 顶替——
@@ -773,7 +783,9 @@ def build_card(
     """
     prof = profile_for(spec.category, spec)
     primary = _primary_service_name(spec, prof)
-    card = CardSpec(category=spec.category, profile=prof)
+    card = CardSpec(
+        category=spec.category, profile=prof, did=did or "", model=model or ""
+    )
 
     for ctl in prof.controls:
         bound = _bind(spec, ctl, primary)

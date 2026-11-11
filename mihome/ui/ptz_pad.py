@@ -16,8 +16,16 @@
 - **上一条没回来不补下一条**——网络一堵就积压一串指令、松手后还在转，是这类控件最容易
   踩的坑。:attr:`MAX_HOLD_S` 是兜底：鼠标卡住 / 收不到松开事件时，12 秒必须停。
 
-能不能用由详情页决定（``set_ready``）：没在播放时 go2rtc 那边没有 producer，
+能不能用由承载它的页面决定（``set_ready``）：没在播放时 go2rtc 那边没有 producer，
 指令会被拒（``stream has no ptz producer``），所以画面没起来时整块置灰。
+
+两种形态
+--------
+* **详情页**：默认形态，132 px 的不透明底盘，占布局位置（画面下方，和卡片下边距对齐）。
+* **独立窗口**（``overlay=True``）：96 px，**叠在画面上**、常驻半透明。独立窗口里
+  画面是主角，一个不透明的圆压在画面上比"没有这个键"更碍事；所以底盘改用与右下角
+  那排圆钮同一套的黑色半透明（``_RoundButton`` 的 110），鼠标移上去再加 40。四角
+  必须真的透出去，因此 overlay 形态要 ``WA_TranslucentBackground``。
 """
 
 from __future__ import annotations
@@ -41,14 +49,20 @@ _ROTATE = {PTZ_UP: 0.0, PTZ_RIGHT: 90.0, PTZ_DOWN: 180.0, PTZ_LEFT: 270.0}
 class PtzPad(QWidget):
     """按住某个方向就连转，松手停。"""
 
-    #: 外圆直径
+    #: 外圆直径（详情页，占布局）
     SIZE = 132
+    #: 叠在画面上的半透明版直径（独立窗口）——比详情页小一号，别把画面压掉一块。
+    #: 96 时真机截图里箭头细到看不清（画面是白墙那一段尤其），104 是"小而不糊"的下限
+    OVERLAY_SIZE = 104
+    #: 半透明底盘的黑色 alpha。110（和右下角那排圆钮一样）在亮画面上太淡，
+    #: 白色箭头会糊进白墙里；150 还能看见底下的画面，但对比度够
+    OVERLAY_ALPHA = 150
     #: 中心孔半径占比：这块是"轴心"，不响应点击
     HUB = 0.36
     #: 箭头中心距圆心的比例
     ARROW_AT = 0.68
-    #: 箭头大小（外接圆半径）
-    ARROW_R = 9.0
+    #: 箭头大小（外接圆半径）占直径的比例（132 → 9.0）
+    ARROW_RATIO = 0.068
     #: 按下后要按住这么久才开始补发（短于它的松开算"点一下"，只发一条）
     HOLD_MS = 450
     #: 连转时的补发间隔（米家 App 那种"走一格停一下"的节奏）
@@ -60,23 +74,32 @@ class PtzPad(QWidget):
         self,
         did: str,
         palette: theme.Palette,
-        accent: str,
+        accent: str = "",
         parent: QWidget | None = None,
+        *,
+        size: int | None = None,
+        overlay: bool = False,
     ) -> None:
         super().__init__(parent)
         self._did = did
         self._p = palette
         self._accent = accent
+        self._overlay = bool(overlay)
+        self._size = int(size or (self.OVERLAY_SIZE if self._overlay else self.SIZE))
         self._hover: int = 0
         self._active: int = 0
         self._ready = False
         self._inflight = False
         self._repeating = False
+        self._inside = False
         self._deadline = 0.0
-        self.setFixedSize(self.SIZE, self.SIZE)
+        self.setFixedSize(self._size, self._size)
         self.setMouseTracking(True)
         self.setCursor(Qt.ArrowCursor)
         self.setToolTip("按住方向键转动摄像头")
+        if self._overlay:
+            # 圆外必须透出画面：不设的话四角会被父控件的底色填成一块方块
+            self.setAttribute(Qt.WA_TranslucentBackground)
 
         self._timer = QTimer(self)
         self._timer.setInterval(self.INTERVAL_MS)
@@ -111,11 +134,20 @@ class PtzPad(QWidget):
             self.update()
 
     # -- 几何 ------------------------------------------------------------
+    @property
+    def diameter(self) -> int:
+        """外圆直径（承载面做定位时用，别去读 ``SIZE``——overlay 形态不是它）。"""
+        return self._size
+
     def _center(self) -> QPointF:
         return QPointF(self.width() / 2.0, self.height() / 2.0)
 
     def _radius(self) -> float:
-        return self.SIZE / 2.0 - 1.0
+        return self._size / 2.0 - 1.0
+
+    def _arrow_r(self) -> float:
+        # 箭头跟着直径缩，两种形态的相对大小才一样
+        return max(6.0, self._size * self.ARROW_RATIO)
 
     def _hit(self, pos: QPointF) -> int:
         """落点在哪个方向；中心孔和圆外都返回 0。"""
@@ -146,31 +178,58 @@ class PtzPad(QWidget):
         }[op]
 
     # -- 绘制 ------------------------------------------------------------
+    def _tones(self) -> dict[str, QColor]:
+        """盘面配色。叠在画面上时不能依赖卡片底色（底下是亮的画面），
+        统一改成"黑半透明 + 白图形"，跟右下角那排圆钮同源。"""
+        if not self._overlay:
+            return {
+                "face": QColor(self._p.bg_soft),
+                "edge": QColor(self._p.border),
+                "arrow": QColor(self._p.text if self._ready else self._p.text_mute),
+                "hot": QColor(self._accent),
+                "hub": QColor(self._p.card),
+                "hub_edge": QColor(self._p.border),
+            }
+        alpha = min(225, self.OVERLAY_ALPHA + (45 if self._inside else 0))
+        return {
+            "face": QColor(0, 0, 0, alpha),
+            "edge": QColor(255, 255, 255, 60),
+            "arrow": QColor(255, 255, 255, 235 if self._ready else 105),
+            "hot": QColor(255, 255, 255),
+            "hub": QColor(255, 255, 255, 26),
+            "hub_edge": QColor(255, 255, 255, 44),
+        }
+
     def paintEvent(self, event) -> None:  # noqa: N802
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
         c = self._center()
         r = self._radius()
         box = QRectF(c.x() - r, c.y() - r, r * 2, r * 2)
+        tone = self._tones()
 
-        # 底盘：比卡片略浅一档，靠 1px 描边和画面区分开
-        p.setPen(QPen(QColor(self._p.border), 1.0))
-        p.setBrush(QColor(self._p.bg_soft))
+        # 底盘：普通形态比卡片略浅一档、靠 1px 描边和画面区分开；
+        # 叠加形态是半透明黑，靠画面自己透出来
+        p.setPen(QPen(tone["edge"], 1.0))
+        p.setBrush(tone["face"])
         p.drawEllipse(box)
 
-        # 高亮：悬停淡一点、按下用强调色，和右下角那排按钮同一套语言
+        # 高亮：悬停淡一点、按下更实，和右下角那排按钮同一套语言
         lit = self._active or self._hover
         if lit and self._ready:
             start, span = self._sector_span(lit)
-            tone = QColor(self._accent)
-            tone.setAlpha(90 if self._active else 44)
+            if self._overlay:
+                tone["hot"].setAlpha(78 if self._active else 34)
+            else:
+                tone["hot"].setAlpha(90 if self._active else 44)
             p.setPen(Qt.NoPen)
-            p.setBrush(tone)
+            p.setBrush(tone["hot"])
             p.drawPie(box, start, span)
 
         # 四条箭头
-        arrow = QColor(self._p.text if self._ready else self._p.text_mute)
-        hot = QColor(self._accent)
+        arrow = tone["arrow"]
+        hot = QColor(tone["hot"])
+        hot.setAlpha(255)
         for op in (PTZ_UP, PTZ_RIGHT, PTZ_DOWN, PTZ_LEFT):
             p.save()
             angle = math.radians(_ROTATE[op])
@@ -178,7 +237,7 @@ class PtzPad(QWidget):
                         c.y() - math.cos(angle) * r * self.ARROW_AT)
             p.rotate(_ROTATE[op])
             path = QPainterPath()
-            at = self.ARROW_R
+            at = self._arrow_r()
             path.addPolygon(
                 QPolygonF(
                     [
@@ -197,16 +256,18 @@ class PtzPad(QWidget):
 
         # 中心轴心：画一个小圆，让"圆环 + 三角"看起来是一个方向盘而不是四个按钮
         hub = r * self.HUB
-        p.setPen(QPen(QColor(self._p.border), 1.0))
-        p.setBrush(QColor(self._p.card))
+        p.setPen(QPen(tone["hub_edge"], 1.0))
+        p.setBrush(tone["hub"])
         p.drawEllipse(QRectF(c.x() - hub, c.y() - hub, hub * 2, hub * 2))
         p.end()
 
     # -- 交互 ------------------------------------------------------------
     def enterEvent(self, event) -> None:  # noqa: N802
+        self._inside = True
         self.update()
 
     def leaveEvent(self, event) -> None:  # noqa: N802
+        self._inside = False
         self._hover = 0
         self.stop()
         self.update()

@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import threading
 import weakref
 from collections.abc import Callable
 
@@ -18,9 +19,12 @@ from ..core.camera import shared as camera_service
 from . import theme
 from .camera_view import CameraView, playbacks
 from .chrome import TitleBar, WindowFrame
+from .ptz_pad import PtzPad
 
 MIN_WIDTH = 640
 MIN_HEIGHT = 420
+#: 方向盘离画面左边/下边各留多少（与画面里那排圆钮的 pad=12 对齐）
+PTZ_MARGIN = 12
 
 #: 当前存在的独立窗口。主窗口最小化/退出时要连它一起收掉。
 _OPEN_POPOUTS: list[weakref.ReferenceType[CameraPopoutWindow]] = []
@@ -38,6 +42,8 @@ class CameraPopoutWindow(QWidget):
     """一个较大的、可拖动/缩放（含右下角）的独立窗口，里面放详情页同一个画面控件。"""
 
     closed = Signal()
+    #: 后台探测「这个 go2rtc 构建带不带云台接口」的结果，回到 UI 线程用
+    _ptz_probed = Signal(bool)
 
     def __init__(
         self,
@@ -47,12 +53,14 @@ class CameraPopoutWindow(QWidget):
         title: str,
         *,
         did: str = "",
+        accent: str = "",
         online_provider: Callable[[], bool] | None = None,
     ) -> None:
         super().__init__(parent, Qt.Window)
         self._view = view
         self._p = palette
         self._did = did
+        self._accent = accent
         #: 详情页关掉后没人轮询设备状态，独立窗口自己隔一会儿问一次
         self._online = online_provider
         self._net = QTimer(self)
@@ -67,6 +75,12 @@ class CameraPopoutWindow(QWidget):
         self._host_layout = None
         self._index = -1
         self._placeholder: QLabel | None = None
+        #: 叠在画面左下角的云台方向盘；这个构建不支持（官方 go2rtc）时始终保持 None
+        self._ptz: PtzPad | None = None
+        #: 云台能力探测结果：None = 还没问出来
+        self._ptz_ok: bool | None = None
+        self._state_hooked = False
+        self._ptz_probed.connect(self._on_ptz_probed)
 
         self.setWindowTitle(f"{title} · 实时画面")
         self.setMinimumSize(MIN_WIDTH, MIN_HEIGHT)
@@ -118,6 +132,9 @@ class CameraPopoutWindow(QWidget):
             self.raise_()
             self.activateWindow()
             return
+        # 同一个窗口可以被"关掉再打开"复用（详情页只在脱离后重建）：
+        # 不复位的话，第二次进来 `_closing` 还是 True，出错时就不会自动关窗了
+        self._closing = False
         self._detach()
         self._box.addWidget(self._view, 1)
         self._view.set_stage_mode(True)
@@ -129,6 +146,9 @@ class CameraPopoutWindow(QWidget):
         self.show()
         self.raise_()
         self.activateWindow()
+        self._hook_state()
+        self._ensure_ptz()
+        self._sync_ptz()
 
     def detach_from_parent(self) -> bool:
         """详情页要关了，但画面还在播：窗口挂到主窗口上继续，自己持有会话。
@@ -152,19 +172,24 @@ class CameraPopoutWindow(QWidget):
         self._view.popout_requested.connect(self.close)
         # 独立持有会话时没有详情页帮忙收错误：播放器一进错误/停止态就关窗，
         # 由 closeEvent 统一归还观看位，避免窗口留着一块黑屏还占着 relay。
-        self._view.state_changed.connect(self._on_view_state)
+        self._hook_state()
         if self._online is not None:
             self._net.start()
         playbacks().set_surface(self._view, "popout")
         self.show()
         self.raise_()
         self.activateWindow()
+        self._sync_ptz()
         return True
 
     def dock(self) -> None:
         """把画面放回详情页原位。不碰播放器，继续播。"""
         if not self._staged:
             return
+        if self._ptz is not None:
+            # 方向盘别在窗口已经空了以后还攥着定时器
+            self._ptz.stop()
+            self._ptz.hide()
         self._box.removeWidget(self._view)
         self._view.set_stage_mode(False)
         # 回到详情页内嵌画面：恢复原来的 cover 呈现
@@ -182,6 +207,7 @@ class CameraPopoutWindow(QWidget):
         self._staged = False
 
     def _on_view_state(self, state: str) -> None:
+        self._sync_ptz()
         if (
             self._standalone
             and not self._closing
@@ -194,9 +220,95 @@ class CameraPopoutWindow(QWidget):
             # 设备掉线后不再抱着一条已经死掉的会话占观看位
             self.close()
 
+    # -- 云台 ------------------------------------------------------------
+    def _hook_state(self) -> None:
+        """接管画面状态（`present` 与 `detach_from_parent` 都走这里，只连一次）。"""
+        if self._state_hooked:
+            return
+        self._state_hooked = True
+        self._view.state_changed.connect(self._on_view_state)
+
+    def _ensure_ptz(self) -> None:
+        """建方向盘（先藏着，探测回来再决定要不要显出来）。
+
+        探测要在后台做：``ptz_supported()`` 是一条 HTTP，未命中缓存时最长 0.8 秒；
+        开窗不能为了一个可能根本不存在的控件卡这么久。
+        """
+        if self._ptz is not None or not self._did:
+            return
+        self._ptz = PtzPad(
+            self._did,
+            self._p,
+            self._accent,
+            self,
+            size=PtzPad.OVERLAY_SIZE,
+            overlay=True,
+        )
+        self._ptz.hide()
+        QTimer.singleShot(0, self._probe_ptz)
+
+    def _probe_ptz(self) -> None:
+        def work() -> None:
+            try:
+                ok = camera_service().ptz_supported()
+            except Exception:  # noqa: BLE001 - 探测失败按"不支持"处理
+                ok = False
+            try:
+                self._ptz_probed.emit(ok)
+            except RuntimeError:
+                # 窗口已经销毁：没必要把结果送回来了
+                pass
+
+        threading.Thread(target=work, name="mihome-ptz-probe", daemon=True).start()
+
+    def _on_ptz_probed(self, ok: bool) -> None:
+        self._ptz_ok = bool(ok)
+        self._sync_ptz()
+
+    def _sync_ptz(self) -> None:
+        """半透明方向盘什么时候露出来。
+
+        与详情页那条规则同一套：**构建支不支持**（官方 go2rtc 没有这条路由）
+        和**现在能不能转**（没在播时 go2rtc 那边没有 producer）。区别只有一条：
+        详情页把它排进布局，这里叠在画面左下角，没画面时干脆不露。
+        """
+        pad = self._ptz
+        if pad is None:
+            return
+        state = self._view.state
+        live = state in (CameraView.LOADING, CameraView.PLAYING, CameraView.PAUSED)
+        ready = self._ptz_ok is True and live
+        if not ready:
+            pad.stop()
+        pad.set_ready(ready)
+        pad.setVisible(self._staged and self._ptz_ok is True and live)
+        self._place_ptz()
+
+    def _place_ptz(self) -> None:
+        """贴在画面左下角。用 ``_view`` 的几何而不是窗口的：上面还有一条标题栏。"""
+        pad = self._ptz
+        if pad is None or not pad.isVisible():
+            return
+        geo = self._view.geometry()
+        pad.move(
+            geo.left() + PTZ_MARGIN,
+            geo.top() + geo.height() - pad.height() - PTZ_MARGIN,
+        )
+        # 画面控件后 show 过就会压在它上面，每次定位顺手抬一下
+        pad.raise_()
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        self._place_ptz()
+        # 这一轮布局可能还没把画面撑开，下一轮再量一次（成本就是一次 move）
+        QTimer.singleShot(0, self._place_ptz)
+
     def closeEvent(self, event) -> None:  # noqa: N802
         self._closing = True
         self._net.stop()
+        if self._ptz is not None:
+            # 关窗就等于不想看了：别让 12 秒兜底或者按住的补发继续往摄像头发指令
+            self._ptz.stop()
         if self._standalone:
             # 详情页已经关了：这次关窗就是"用户不想看了"，停播并归还观看位
             self._view.set_contain_fit(False)

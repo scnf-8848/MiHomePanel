@@ -20,8 +20,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QCoreApplication, QEvent, QPoint, QPointF, Qt  # noqa: E402
-from PySide6.QtGui import QColor, QFont, QMouseEvent  # noqa: E402
+from PySide6.QtCore import QCoreApplication, QEvent, QPoint, QPointF, QRect, Qt  # noqa: E402
+from PySide6.QtGui import (  # noqa: E402
+    QColor, QFont, QFontMetrics, QGuiApplication, QMouseEvent,
+)
 from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import QApplication, QWidget  # noqa: E402
 
@@ -152,9 +154,110 @@ def main() -> int:
     check("单行比多行矮", mgr._bubble.height() < tall,
           f"{mgr._bubble.height()} < {tall}")
 
+    # provider 里自己写的换行必须原样保留：整串丢给按字宽折行的话，"\n" 会被
+    # 当成普通字符塞进一行中间，drawText 在那里再换一次行，第二行溢出单行高度
+    # 的矩形、和后一行叠在一起（2026-11-11 实测截图：提示文字挤成一团）。
+    two = "打开极客版并把一枚新登录码复制到剪贴板。\n登录码只能用一次；取新码会让旧的立即失效。"
+    mgr._bubble.show_for(two, QPoint(100, 100))
+    QApplication.processEvents()
+    got = list(mgr._bubble._lines)
+    check("自己写的换行不被折行吞掉", len(got) == 2, str(got))
+    check("没有一行里还藏着 \\n", all("\n" not in line for line in got), str(got))
+    check("两行各是完整的一句",
+          got == two.split("\n"), str(got))
+    check("两行的高度真的翻倍",
+          mgr._bubble.height() == 2 * QFontMetrics(mgr._bubble._font).height()
+          + tooltip.LINE_GAP + tooltip.PAD_Y * 2 + 2,
+          f"{mgr._bubble.height()}px")
+
+    # 换行 + 其中一段超长：既保换行，又要在段内折
+    mgr._bubble.show_for(
+        "动作：" + "把客厅的灯关掉并打开风扇" * 6 + "\n后果：旧的立即失效", QPoint(100, 100))
+    QApplication.processEvents()
+    got = list(mgr._bubble._lines)
+    check("换行 + 超长段：第一段被折成多行", len(got) > 2, f"{len(got)} 行")
+    check("最后一行是换行后的第二句", got[-1] == "后果：旧的立即失效", got[-1])
+    check("每行都不超宽",
+          all(QFontMetrics(mgr._bubble._font).horizontalAdvance(line) <= tooltip.MAX_W
+              for line in got))
+
+    # toast 会盖在**别的程序**上面（Qt.ToolTip 是顶层窗口），所以程序一失去激活
+    # 就得收：点完卡片按钮打开浏览器，那一刻这条提示已经没有读者了。
+    print("\n5.5) 一次性提示：失焦即收")
+    mgr.show_toast("登录码 123456 已复制", QRect(100, 100, 200, 40))
+    QApplication.processEvents()
+    check("toast 起来了（计时器在跑）", mgr._bubble._toast_timer.isActive())  # noqa: SLF001
+
+    # 真的走信号，而不是直接调方法：这条路径才是"浏览器抢焦点"时发生的
+    QApplication.instance().applicationStateChanged.emit(
+        Qt.ApplicationState.ApplicationInactive
+    )
+    check("程序失焦就收（不挂在浏览器上面）", mgr._bubble.isHidden())
+    check("连带把 toast 的计时也停了", not mgr._bubble._toast_timer.isActive())  # noqa: SLF001
+
+    mgr.show_toast("登录码 123456 已复制", QRect(100, 100, 200, 40))
+    QApplication.processEvents()
+    QApplication.instance().applicationStateChanged.emit(
+        Qt.ApplicationState.ApplicationActive
+    )
+    check("还在前台就不收", mgr._bubble._toast_timer.isActive())  # noqa: SLF001
+    mgr._bubble.hide()
+
+    # 居中置顶那条：位置在屏幕上沿往下一点、切到浏览器也不收、成功失败两种颜色。
+    # 它和上面两条的**唯一区别就是这三件事**，所以逐条钉住。
+    print("\n5.6) 居中置顶提示")
+    bubble = mgr._bubble
+    area = QGuiApplication.primaryScreen().availableGeometry()
+    mgr.show_message("登录码 123456 已复制，已打开极客版", QRect(100, 100, 200, 40),
+                     theme.LIGHT, kind=tooltip.TOAST_OK)
+    QApplication.processEvents()
+    check("横向居中（不是锚在卡片上）",
+          abs(bubble.x() + bubble.width() // 2 - area.center().x()) <= 2,
+          f"中心 {bubble.x() + bubble.width() // 2} vs 屏幕 {area.center().x()}")
+    expect_y = area.top() + int(area.height() * tooltip.TOAST_TOP_RATIO)
+    check("落在屏幕上沿往下 18%（中间偏上，不贴边也不压住内容）",
+          bubble.y() == expect_y, f"{bubble.y()} vs {expect_y}")
+    check("字号比悬停提示大一档", bubble._font.pixelSize() == tooltip.MSG_FONT,  # noqa: SLF001
+          f"{bubble._font.pixelSize()}px")  # noqa: SLF001
+    check("弹出来了，且状态是 pinned", bubble.isVisible() and bubble.pinned())
+
+    img = bubble.grab().toImage()
+    dot_x = int(tooltip.MSG_PAD_X + tooltip.DOT_R)
+    ok_dot = QColor(img.pixel(dot_x, bubble.height() // 2)).name().lower()
+    check("成功：圆点是薄荷绿", ok_dot == theme.ACCENT_GREEN.lower(), ok_dot)
+    ok_border = bubble.border_color()
+
+    QApplication.instance().applicationStateChanged.emit(
+        Qt.ApplicationState.ApplicationInactive
+    )
+    check("切到浏览器也不收（它就是给那一刻看的）", bubble.isVisible(),
+          f"visible={bubble.isVisible()} pinned={bubble._pinned}")  # noqa: SLF001
+    check("计时器还在跑（到点才收）", bubble._toast_timer.isActive())  # noqa: SLF001
+
+    mgr.show_message("获取登录码失败：token 过期", QRect(100, 100, 200, 40),
+                     theme.LIGHT, kind=tooltip.TOAST_FAIL)
+    QApplication.processEvents()
+    img = bubble.grab().toImage()
+    fail_dot = QColor(img.pixel(dot_x, bubble.height() // 2)).name().lower()
+    check("失败：圆点转警告红", fail_dot == theme.DANGER.lower(), fail_dot)
+    fail_border = bubble.border_color()
+    check("失败：连边框也跟着染（两种结果一眼分得开）", fail_border != ok_border,
+          f"{fail_border} vs {ok_border}")
+
+    # 复位：锚定 toast 仍然失焦即收，两套行为互不影响
+    bubble.hide()
+    mgr.show_toast("指令已发送", QRect(100, 100, 200, 40))
+    QApplication.processEvents()
+    QApplication.instance().applicationStateChanged.emit(
+        Qt.ApplicationState.ApplicationInactive
+    )
+    check("锚定提示仍失焦即收（pinned 没有漏到别处）", bubble.isHidden())
+    QApplication.instance().applicationStateChanged.emit(
+        Qt.ApplicationState.ApplicationActive
+    )
+
     # -- 6. 空文本 / 销毁 --------------------------------------------------
-    print("\n6) 边界")
-    # 先把光标挪到没有控件的地方再收气泡：气泡隐藏时 Qt 会把 hover 重新派发给
+    print("\n6) 边界")    # 先把光标挪到没有控件的地方再收气泡：气泡隐藏时 Qt 会把 hover 重新派发给
     # 下面的控件，凭空产生一个 Enter（tooltip 里靠"光标真的在里面"挡掉了）。
     cursor["pos"] = QPoint(600, 600)
     mgr._dismiss()

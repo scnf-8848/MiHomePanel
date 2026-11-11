@@ -18,8 +18,17 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import QEvent, QPoint, QPointF, QRect, Qt, Signal
-from PySide6.QtGui import QColor, QFont, QFontMetrics, QPainter, QPainterPath, QPen
+from PySide6.QtCore import QEvent, QPoint, QPointF, QRect, Qt, QUrl, Signal
+from PySide6.QtGui import (
+    QColor,
+    QDesktopServices,
+    QFont,
+    QFontMetrics,
+    QGuiApplication,
+    QPainter,
+    QPainterPath,
+    QPen,
+)
 from PySide6.QtWidgets import (
     QFrame,
     QLabel,
@@ -30,15 +39,17 @@ from PySide6.QtWidgets import (
 )
 
 from ..core.camera import is_camera
+from ..core.geek import Entry
 from ..core.store import DeviceState, RoomView, Store
-from . import theme
+from . import theme, tooltip
 from .camera_card import CameraCard
 from .camera_view import CameraView, playbacks
 from .camera_wall import WallCameraController
 from .card_grid import CardGridLayout
-from .card_templates import available_styles, resolve_card_style
+from .card_templates import GATEWAY_GEEK, available_styles, resolve_card_style
 from .device_card import DeviceCard
 from .dnd import DragGesture
+from .geek_card import GeekCard
 from .menu import Menu, add_choice, submenu
 from .scene_bar import SceneBar
 from .widgets import IconProvider, draw_text
@@ -433,6 +444,9 @@ class WallView(QScrollArea):
 
         # 摄像头：同一时刻只允许一张卡播放，取址在工作线程里
         self._camera_ctl = WallCameraController(store, self)
+        # 某台设备的极客版能力探出来了：如果用户早先选过这个样式，那时可能因为
+        # "还没探到"被兜底成标准卡，现在按偏好重新解析一次（只刷那一张）。
+        store.on_geek_ability = self._on_geek_ability
         # 滚出可视区域就停播（滚动条动一下就检查，成本只是一次矩形相交）
         self.verticalScrollBar().valueChanged.connect(self._check_active_visible)
         # 会话结束（详情页 / 独立窗口关掉、设备离线）时叫醒停在 MOVED 的卡片
@@ -483,10 +497,15 @@ class WallView(QScrollArea):
             section = RoomSection(view, palette=self._p, collapsed=collapsed)
             section.collapse_changed.connect(self._on_section_collapsed)
             for st in view.devices:
+                # 非摄像头一律用 ``GeekCard``：它只是 ``DeviceCard`` 多了"右半
+                # 可以放一个大按钮"这条支路，没有那个样式时行为与父类完全一致。
+                # 为什么不能按能力挑类：能力是**运行时探出来的**，而卡片类在
+                # 样式切换时不会重建（``apply_card_style`` 只 ``set_style``），
+                # 探出结果后再换类就得重造整面墙，滚动位置和悬停全丢。
                 cls = (
                     CameraCard
                     if is_camera(st.node.model, st.card.category)
-                    else DeviceCard
+                    else GeekCard
                 )
                 card = cls(
                     st,
@@ -501,6 +520,9 @@ class WallView(QScrollArea):
                     card.view_state_changed.connect(
                         lambda state, c=card: self._camera_ctl.on_view_state(c, state)
                     )
+                if isinstance(card, GeekCard):
+                    # 中枢网关：卡片右半那个大按钮（只在「极客版入口」样式下存在）
+                    card.geek_requested.connect(self._on_geek_requested)
                 card.clicked.connect(self.card_clicked)
                 card.toggled.connect(self.card_toggled)
                 card.menu_requested.connect(self._on_card_menu)
@@ -540,6 +562,75 @@ class WallView(QScrollArea):
         self._store.prefs.set_hidden_collapsed(collapsed)
         self._relayout()
         self._check_active_visible()
+
+    # -- 极客版入口 ------------------------------------------------------
+    def _on_geek_requested(self, did: str) -> None:
+        """点了中枢网关卡片右半的大按钮：取码 → 复制 → 打开浏览器。
+
+        取码是一次云端往返（几百毫秒），走 ``store`` 的工作线程，界面不等它。
+        **一次点击 = 消耗一枚码**（取新码会让旧码立即失效），所以往返期间按钮
+        置忙、不接受第二次点击——否则连点三下就白烧三枚。
+        """
+        card = self._cards.get(did)
+        if isinstance(card, GeekCard):
+            card.set_busy(True)
+        self._store.fetch_geek_passcode(
+            did, lambda entry, error, url: self._on_geek_done(did, entry, error, url)
+        )
+
+    def _on_geek_done(self, did: str, entry: Entry | None, error: str, url: str) -> None:
+        """取码回来了：复制 → 开浏览器 → 在按钮上留下结论。
+
+        提示条的位置是**屏幕中央偏上**（``tooltip.toast_top``）而不是锚在卡片上：
+        点完按钮浏览器立刻抢走焦点，锚在卡片上的提示只活在那 0.2 秒里，等于没有。
+        这条因此不随失焦收起，用户切到浏览器时正好能在屏幕上半部看到那串码。
+
+        按钮上同时留下结论——提示几秒后自己收，按钮是回到程序时唯一还记得
+        「刚才成了没成」的地方；失败时它同时就是重试入口。
+        """
+        card = self._cards.get(did)
+        anchor: QWidget = card if card is not None else self
+        if isinstance(card, GeekCard):
+            card.set_busy(False)
+
+        if entry is not None:
+            # 先复制再开浏览器：打开网页会抢焦点，剪贴板不受影响；
+            # 用户切过去正好按 Ctrl+V，不用再回来找这串数字。
+            QGuiApplication.clipboard().setText(entry.code)
+            if isinstance(card, GeekCard):
+                card.set_result(entry.code)
+            if QDesktopServices.openUrl(QUrl(entry.url)):
+                tooltip.toast_top(
+                    anchor,
+                    f"登录码 {entry.code} 已复制，已打开极客版",
+                    self._p,
+                    kind=tooltip.TOAST_OK,
+                )
+            else:
+                tooltip.toast_top(
+                    anchor,
+                    f"登录码 {entry.code} 已复制；没能打开浏览器，地址 {entry.url}",
+                    self._p,
+                    kind=tooltip.TOAST_FAIL,
+                    ms=5200,
+                )
+            return
+
+        # 失败：地址拿到过就先打开网页，码让用户手输——比什么都不做有用
+        if isinstance(card, GeekCard):
+            card.set_error()
+        if url and QDesktopServices.openUrl(QUrl(url)):
+            tooltip.toast_top(
+                anchor,
+                f"{error}；网页已打开，登录码请手动输入",
+                self._p,
+                kind=tooltip.TOAST_FAIL,
+                ms=5200,
+            )
+            return
+        tooltip.toast_top(
+            anchor, error or "取码失败", self._p, kind=tooltip.TOAST_FAIL, ms=5200
+        )
 
     def _on_card_menu(self, did: str, pos: QPoint) -> None:
         """打开详情 / 卡片样式 / 隐藏设备。
@@ -662,6 +753,19 @@ class WallView(QScrollArea):
                     # 离线卡片不能继续占着观看位；先让控制器把会话和播放器收掉
                     self._camera_ctl.stop_if_card(card, "设备离线")
                 card.refresh(st)
+
+    def _on_geek_ability(self, did: str) -> None:
+        """探测出结论后只做一件事：若偏好里存着极客版样式，按新结论重解析一次。
+
+        正常路径上什么都不会发生（用户没选过这个样式）；只有"删了能力缓存 /
+        换了机器"这种偏好还在、结论没了的情况，卡片才会从标准卡切回来。
+        """
+        st = self._store.devices.get(did)
+        if st is None or self._cards.get(did) is None:
+            return
+        want = self._store.prefs.card_style(did)
+        if want == GATEWAY_GEEK:
+            self.apply_card_style(did)
 
     def apply_card_style(self, did: str) -> None:
         """右键改完样式后**只**刷新这一张卡。

@@ -43,7 +43,7 @@ from PySide6.QtWidgets import QSizePolicy, QWidget
 from ..core.catalog import summary_line
 from ..core.store import DeviceState
 from . import theme, tooltip
-from .card_templates import BODY_VIDEO, STYLES, CardBody, CardStyle
+from .card_templates import BODY_GEEK, BODY_VIDEO, STYLES, CardBody, CardStyle
 from .widgets import IconProvider, draw_text
 
 PAD = 14
@@ -267,8 +267,9 @@ class DeviceCard(QWidget):
             old.setParent(None)
             old.deleteLater()
             self._body = None
-        if not self._style.has_body or self._style.body == BODY_VIDEO:
-            # 画面样式由 CameraCard 自己铺视频控件，这里不建 CardBody
+        if not self._style.has_body or self._style.body in (BODY_VIDEO, BODY_GEEK):
+            # 画面样式由 CameraCard 自己铺视频控件、极客版样式由 GeekCard 铺按钮，
+            # 这里都不建 CardBody
             return
         body = CardBody(
             self._style,
@@ -354,7 +355,7 @@ class DeviceCard(QWidget):
 
         # 内容带：挂了模板 body 就整块让给子控件。它们是真实 QWidget，画在
         # 父窗口之上；这里再画一次产品图只会从滑条缝里透出来，显得脏。
-        if not self._style.has_body:
+        if self._draws_art():
             if card.gangs:
                 self._paint_gangs(p, base, bg)
             else:
@@ -422,6 +423,19 @@ class DeviceCard(QWidget):
         """内容带：产品图、多键胶囊、以后的控件模板都只能画在这个矩形里。"""
         return QRect(PAD, BODY_TOP, self.width() - PAD * 2, self.height() - PAD - BODY_TOP)
 
+    def _draws_art(self) -> bool:
+        """外壳要不要在产品图那块画东西。
+
+        默认判据是"没有 body"：挂了滑条 / 读数就把整块让给子控件。极客版样式
+        是例外——右半给了按钮，左半仍然要产品图，所以 ``GeekCard`` 把它覆盖成
+        True，再配合下面的 ``_art_rect`` 收窄到左半。
+        """
+        return not self._style.has_body
+
+    def _art_rect(self) -> QRect:
+        """产品图的落点。默认整个内容带；极客版样式只占左半（见 ``GeekCard``）。"""
+        return self._body_rect()
+
     def _power_rect(self) -> QRect:
         return QRect(self.width() - PAD - POWER_D, POWER_TOP, POWER_D, POWER_D)
 
@@ -466,10 +480,10 @@ class DeviceCard(QWidget):
         return out
 
     def _paint_art(self, p: QPainter) -> None:
-        """产品图：在内容带里居中，不染色、不加圆底。"""
+        """产品图：在自己的落点里居中，不染色、不加圆底。"""
         st = self.state
         pal = self._p
-        area = self._body_rect()
+        area = self._art_rect()
         size = min(ART, area.height(), area.width())
         x = area.x() + (area.width() - size) // 2
         y = area.y() + (area.height() - size) // 2

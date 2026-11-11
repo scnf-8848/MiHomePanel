@@ -957,6 +957,7 @@ class DetailDialog(QDialog):
                 self._p,
                 self.state.name,
                 did=did,
+                accent=self._accent,
                 online_provider=online,
             )
         self._cam_popout.present()

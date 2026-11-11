@@ -11,7 +11,10 @@
 底色和右边的卡片墙**不是同一个色**（``theme.nav_bg``）：栏是机身、卡片墙是台面。
 两边同色时只能靠一条 1px 竖线分隔，整块界面看起来是连着的。
 
-最下面固定一个「设置」入口，收纳主题、排序、隐藏设备这些不常改的东西。
+最下面固定一块「功能区」+ 一个「设置」入口：前者是全屋级页面的入口（目前两个按钮
+只占位、不响应点击），后者收纳主题、排序、隐藏设备这些不常改的东西。
+两条分隔线把底部切出语义：房间列表 + 功能区都是「这个家」的内容，
+「设置」是「这个程序」的配置，所以功能区上下各一条线，设置单独成一组。
 "已隐藏设备"分组排在房间列表末尾，图标上和普通房间区分开——它是收纳箱，不是房间。
 """
 
@@ -32,7 +35,20 @@ from .widgets import draw_text
 ITEM_H = 36
 PAD_X = 18
 TOP = 30
+#: 设置行那一块的高度（含上下留白）。功能区在它上面，别把它当成整个底部区。
 FOOT_H = 46
+#: 功能区：两个占位按钮 + 上下留白。
+ZONE_BTN_H = 32
+ZONE_GAP = 2
+ZONE_PAD_TOP = 7
+ZONE_PAD_BOTTOM = 6
+ZONE_H = ZONE_PAD_TOP + ZONE_BTN_H * 2 + ZONE_GAP + ZONE_PAD_BOTTOM
+#: 底部固定区总高；房间列表的可见区域与滚动上限都按它算。
+BOTTOM_H = ZONE_H + FOOT_H
+#: (按钮文字, 图标类型)，顺序即从上到下的绘制顺序。
+ZONE_ITEMS = (("耗材", "battery"), ("监控", "camera"))
+#: 第二条分隔线落在 FOOT_H 的上边界：上面是家庭级入口，下面是程序级设置。
+#: 两条线样式一致（pal.border / 1px / 左右各缩 12），别给其中一条加粗换色。
 
 
 @dataclass
@@ -57,6 +73,7 @@ class SideNav(QWidget):
         self._active: tuple[str, str] = ("", "*")
         self._hover = -1
         self._settings_hover = False
+        self._zone_hover = -1
         self._offset = 0
         self._content_h = 0
         self._home = ""
@@ -97,13 +114,25 @@ class SideNav(QWidget):
 
     # -- 布局辅助 --------------------------------------------------------
     def _view_rect(self) -> QRect:
-        return QRect(0, TOP - 6, self.width(), max(0, self.height() - TOP + 6 - FOOT_H))
+        return QRect(0, TOP - 6, self.width(),
+                     max(0, self.height() - TOP + 6 - BOTTOM_H))
 
     def _settings_rect(self) -> QRect:
         return QRect(8, self.height() - FOOT_H + 7, self.width() - 16, 32)
 
+    def _zone_rect(self, index: int) -> QRect:
+        top = self.height() - BOTTOM_H + ZONE_PAD_TOP
+        return QRect(8, top + index * (ZONE_BTN_H + ZONE_GAP),
+                     self.width() - 16, ZONE_BTN_H)
+
+    def _zone_index_at_point(self, pos: QPoint) -> int:
+        for i in range(len(ZONE_ITEMS)):
+            if self._zone_rect(i).contains(pos):
+                return i
+        return -1
+
     def _max_offset(self) -> int:
-        return max(0, self._content_h + 10 - (self.height() - FOOT_H))
+        return max(0, self._content_h + 10 - (self.height() - BOTTOM_H))
 
     # -- 绘制 ------------------------------------------------------------
     def paintEvent(self, event) -> None:  # noqa: N802
@@ -153,7 +182,24 @@ class SideNav(QWidget):
                           color=pal.text_mute, align=Qt.AlignRight | Qt.AlignVCenter)
         p.restore()
 
-        # 底部：一条分隔线 + 设置入口
+        # 底部固定区：分隔线 + 功能区按钮 + 分隔线 + 设置入口
+        p.setPen(QPen(QColor(pal.border), 1))
+        p.drawLine(12, self.height() - BOTTOM_H, self.width() - 12, self.height() - BOTTOM_H)
+
+        for i, (label, icon) in enumerate(ZONE_ITEMS):
+            zrect = self._zone_rect(i)
+            hot = i == self._zone_hover
+            if hot:
+                p.setPen(Qt.NoPen)
+                p.setBrush(QColor(hover_bg))
+                p.drawRoundedRect(zrect, 10, 10)
+            color = pal.text_soft if hot else pal.text_mute
+            self._paint_zone_icon(p, QPoint(zrect.x() + 16, zrect.center().y()), icon, color)
+            draw_text(p, QRect(zrect.x() + 32, zrect.y(), zrect.width() - 32, zrect.height()),
+                      label, size=13, color=color)
+
+        # 家庭级入口到此为止，下面只剩「这个程序」的设置；再分一道，别让功能区
+        # 和设置读成同一组。位置取 FOOT_H 上边界，正好落在两组留白的中间。
         p.setPen(QPen(QColor(pal.border), 1))
         p.drawLine(12, self.height() - FOOT_H, self.width() - 12, self.height() - FOOT_H)
 
@@ -167,6 +213,28 @@ class SideNav(QWidget):
         draw_text(p, QRect(srect.x() + 32, srect.y(), srect.width() - 32, srect.height()),
                   "设置", size=13, color=pal.text_soft if self._settings_hover else pal.text_mute)
         p.end()
+
+    @staticmethod
+    def _paint_zone_icon(p: QPainter, center: QPoint, kind: str, color: str) -> None:
+        """功能区两枚线框图标，笔触与齿轮一致（1.5px / 圆头 / 默认无填充）。"""
+        p.setBrush(Qt.NoBrush)
+        p.setPen(QPen(QColor(color), 1.5, Qt.SolidLine, Qt.RoundCap))
+        if kind == "battery":
+            # 横放电池：外壳 + 正极 + 一格余量
+            p.drawRoundedRect(QRectF(center.x() - 7, center.y() - 4.5, 12, 9), 1.5, 1.5)
+            p.drawLine(QPoint(center.x() + 6, center.y() - 2),
+                       QPoint(center.x() + 6, center.y() + 2))
+            p.setBrush(QColor(color))
+            p.setPen(Qt.NoPen)
+            p.drawRoundedRect(QRectF(center.x() - 5, center.y() - 2.5, 4, 5), 1, 1)
+        else:
+            # 摄像头：圆角机身 + 镜头 + 底座
+            p.drawRoundedRect(QRectF(center.x() - 7, center.y() - 5, 14, 10), 2, 2)
+            p.drawEllipse(center, 2.5, 2.5)
+            p.drawLine(QPoint(center.x(), center.y() + 5),
+                       QPoint(center.x(), center.y() + 7))
+            p.drawLine(QPoint(center.x() - 4, center.y() + 7),
+                       QPoint(center.x() + 4, center.y() + 7))
 
     @staticmethod
     def _paint_gear(p: QPainter, center: QPoint, r: int, color: str) -> None:
@@ -208,21 +276,29 @@ class SideNav(QWidget):
         pos = event.position().toPoint()
         idx = self._row_index_at_point(pos)
         over_settings = self._settings_rect().contains(pos)
-        if idx != self._hover or over_settings != self._settings_hover:
+        zidx = self._zone_index_at_point(pos)
+        if (idx != self._hover or over_settings != self._settings_hover
+                or zidx != self._zone_hover):
             self._hover = idx
             self._settings_hover = over_settings
-            self.setCursor(Qt.PointingHandCursor if (idx >= 0 or over_settings) else Qt.ArrowCursor)
+            self._zone_hover = zidx
+            pointing = idx >= 0 or over_settings or zidx >= 0
+            self.setCursor(Qt.PointingHandCursor if pointing else Qt.ArrowCursor)
             self.update()
 
     def leaveEvent(self, event) -> None:  # noqa: N802
         self._hover = -1
         self._settings_hover = False
+        self._zone_hover = -1
         self.update()
 
     def mouseReleaseEvent(self, event) -> None:  # noqa: N802
         if event.button() != Qt.LeftButton:
             return
         pos = event.position().toPoint()
+        # 占位按钮：目前不接任何信号、不切页、不弹窗。将来接页面时在这里发信号。
+        if self._zone_index_at_point(pos) >= 0:
+            return
         if self._settings_rect().contains(pos):
             self.settings_requested.emit()
             return

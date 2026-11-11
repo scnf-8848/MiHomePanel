@@ -70,11 +70,12 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 
 from PySide6.QtCore import QPoint, QSize, Signal
 from PySide6.QtWidgets import QVBoxLayout, QWidget
 
+from ..core import geek
 from . import theme
 from .card_controls import (
     ROW_H,
@@ -101,6 +102,15 @@ TEMP_CONTROL = "temp_control"
 #: 摄像头「实时画面」：2×2，body 里直接铺视频。**不是**摄像头品类的默认样式，
 #: 用户要在右键「卡片样式」里主动选；默认仍是 1×1 标准卡（产品图）。
 CAMERA_LIVE = "camera_live"
+#: 中枢网关「极客版入口」：2×1，左产品图、右一个「打开极客版 + 复制登录码」的大按钮。
+#: 哪些设备有这项能力是**探测**出来的（见 ``ABILITY_GEEK``），不是写死的型号名单。
+GATEWAY_GEEK = "gateway_geek"
+
+#: 需要**实测确认**的能力才出现的样式，用 ``CardStyle.ability`` 声明。
+#: ``geek``：能给出极客版地址（``core.geek.probe`` 探过、结论落在
+#: ``geek_ability.json``）。目前只有这一种，写成常量是为了让样式声明读起来
+#: 是一句话而不是一个裸字符串。
+ABILITY_GEEK = "geek"
 
 #: body 区两行控件之间的间距。2×36 + 4 = 76，正好是 ``DeviceCard._body_rect()`` 的高。
 BODY_GAP = 4
@@ -123,7 +133,10 @@ BODY_CONTROLS = "controls"
 #: 实时画面：body 不建 ``CardBody``，由 ``CameraCard`` 铺一个 ``CameraView``。
 #: 不占任何槽位，``slots`` 为空是正常的。
 BODY_VIDEO = "video"
-BODY_KINDS = (BODY_SLIDERS, BODY_READOUT, BODY_CONTROLS, BODY_VIDEO)
+#: 极客版入口：body 是「左边产品图 + 右边一个大按钮」，由 ``GeekCard`` 铺一个
+#: ``GeekButton``。同样不占槽位——它调的是云端 RPC，不是设备属性。
+BODY_GEEK = "geek"
+BODY_KINDS = (BODY_SLIDERS, BODY_READOUT, BODY_CONTROLS, BODY_VIDEO, BODY_GEEK)
 
 
 @dataclass(frozen=True, slots=True)
@@ -156,6 +169,26 @@ def size_of(span: int, rows: int = 1) -> CardSize | None:
     return _SIZE_BY_CELL.get((span, rows))
 
 
+#: 能力判据表：``CardStyle.ability`` 写名字，这里给"这台设备能不能用"的判断。
+#: 加一项新能力 = 这里登记一条 + 样式里写名字，样式声明本身不用改。
+_ABILITIES: dict[str, Callable[[CardSpec], bool]] = {
+    # ``getattr``：能力判据会被 ``available()`` 调用，而那是纯判据函数，历史上
+    # 被验证脚本用 ``SimpleNamespace`` 鸭子类型喂过（没有 did 字段）。缺字段就
+    # 当作"没探过"，别让一个样式开关把整张菜单炸掉。
+    ABILITY_GEEK: lambda card: geek.supports(
+        getattr(card, "did", "") or "", getattr(card, "model", "") or ""
+    ),
+}
+
+
+def _ability_ready(name: str, card: CardSpec) -> bool:
+    """这台设备有没有 ``name`` 这项能力（没探过 = 没有）。"""
+    test = _ABILITIES.get(name)
+    # 名字写错时当成不可用：宁可不显示这个样式，也别让一个点了就报错的入口
+    # 出现在菜单里（注册期还会在 ``__post_init__`` 里直接拦下来）。
+    return bool(test and test(card))
+
+
 @dataclass(frozen=True, slots=True)
 class CardStyle:
     """一个卡片样式的**声明**；解析结果就是它本身，不再包一层。
@@ -178,6 +211,12 @@ class CardStyle:
     slots: tuple[str, ...] = ()
     category: str | None = None
     body: str = BODY_SLIDERS
+    #: 需要设备**实测确认**的某项能力（见 ``ABILITY_GEEK``）。空 = 不设门槛。
+    #: 为什么不用型号前缀：极客版这项能力在 MIoT 规格里根本不存在，能给出地址的
+    #: 设备也不止一个型号（中枢网关 / 带中枢的路由器 / 中控屏），写死前缀等于让
+    #: 人肉维护一份名单，而且漏一个就永远看不到入口。判据改成"程序问过这台设备"
+    #: ——``core.geek.probe`` 发一条不耗码的请求，结论按 did 落盘。
+    ability: str = ""
 
     def __post_init__(self) -> None:
         # 声明期就炸，别等菜单里显示成"宽卡 3×1"才发现。注册表是模块级常量，
@@ -196,6 +235,12 @@ class CardStyle:
         if self.body not in BODY_KINDS:
             raise ValueError(
                 f"样式 {self.id!r} 的 body={self.body!r} 不认识（可选 {list(BODY_KINDS)}）"
+            )
+        if self.ability and self.ability not in _ABILITIES:
+            # 写错名字的表现是"样式永远不出现"，静默得让人查半天，所以注册期就炸
+            raise ValueError(
+                f"样式 {self.id!r} 的 ability={self.ability!r} 没有登记"
+                f"（可选 {list(_ABILITIES)}）"
             )
 
     @property
@@ -216,12 +261,13 @@ class CardStyle:
     @property
     def has_body(self) -> bool:
         # 画面样式没有槽位，但内容带确实被一个子控件占满，产品图不能再画。
-        return bool(self.slots) or self.body == BODY_VIDEO
+        return bool(self.slots) or self.body in (BODY_VIDEO, BODY_GEEK)
 
     def available(self, card: CardSpec) -> bool:
         """这台设备能不能用这个样式。
 
-        两条判据：品类对得上；``slots`` 里每个槽位都在这台设备上**绑到了属性**。
+        三条判据：品类对得上；需要的能力已确认（``ability`` 非空时）；``slots``
+        里每个槽位都在这台设备上**绑到了属性**。
 
         槽位查的是 ``card.bound(slot)``（先控件后读数），所以样式既能引用可写
         的 ``brightness``，也能引用只读的 ``occupancy``——登记在哪个 list 是
@@ -232,6 +278,8 @@ class CardStyle:
         平板灯，``color_temp`` 绑不上，菜单里就不会出现「亮度 + 色温」。
         """
         if self.category is not None and card.category != self.category:
+            return False
+        if self.ability and not _ability_ready(self.ability, card):
             return False
         return all(self._slot_ready(card.bound(slot)) for slot in self.slots)
 
@@ -301,6 +349,21 @@ STYLES: tuple[CardStyle, ...] = (
         rows=2,
         category="camera",
         body=BODY_VIDEO,
+    ),
+    # 中枢网关平时没有任何可点的地方（没有开关、没有读数），卡片就是一张产品图。
+    # 真正高频的动作只有一个：进极客版写规则。而登录码**只能现取**（一次性，
+    # 取新码会让旧码失效），所以做成卡片上一个大按钮：点一下 = 取地址 + 取码 +
+    # 复制 + 打开浏览器。
+    #
+    # **不写 category**：能不能用只由能力决定。写 ``category="gateway"`` 会把
+    # 带中枢的路由器（``router``）、中控屏（``screen``）挡在门外，而它们恰恰是
+    # 用户点名的"另一种中枢设备"——判据只能有一个，能力已经是那个判据了。
+    CardStyle(
+        id=GATEWAY_GEEK,
+        label="极客版入口",
+        span=2,
+        ability=ABILITY_GEEK,
+        body=BODY_GEEK,
     ),
 )
 
@@ -599,13 +662,16 @@ class CardBody(QWidget):
 
 
 __all__ = [
+    "ABILITY_GEEK",
     "BODY_CONTROLS",
     "BODY_GAP",
+    "BODY_GEEK",
     "BODY_KINDS",
     "BODY_READOUT",
     "BODY_SLIDERS",
     "BODY_VIDEO",
     "CAMERA_LIVE",
+    "GATEWAY_GEEK",
     "GRADIENT_SLOTS",
     "LIGHT_BRIGHT",
     "LIGHT_DUAL",

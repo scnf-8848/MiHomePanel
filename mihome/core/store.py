@@ -30,6 +30,12 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from .api import Client, HomeNode, PropRef, ReadValue, Topology, classify, explain
 from .catalog import CardSpec, build_card, summary_line
+from .geek import Entry as GeekEntry
+from .geek import GeekError
+from .geek import candidates as geek_candidates
+from .geek import fetch as fetch_geek_entry
+from .geek import probe as geek_probe
+from .geek import remember as geek_remember
 from .jobs import PRIORITY_CONTROL, PRIORITY_DATA, SerialWorker
 from .prefs import HIDDEN_ROOM, Prefs
 from .spec import DeviceSpec, PropertySpec, SpecRepository, localize
@@ -167,6 +173,9 @@ class Store:
         # 每轮轮询结束后回调一次（主线程），参数是 `PollHealth.snapshot()`。
         # 界面拿它决定要不要弹提醒——Store 自己不判断"该不该打扰用户"。
         self.on_poll_health: Callable[[dict[str, Any]], None] | None = None
+        # 某台设备的「有没有极客版」探出来了（参数是 did）。界面拿它刷菜单提示，
+        # Store 自己不改界面。
+        self.on_geek_ability: Callable[[str], None] | None = None
         self._poll_generation = 0
         self._last_topology_change: set[str] = set()
         # (URN, 型号) → (源规格, 套了型号级文案的规格)。规格对象换了就重算；
@@ -175,6 +184,8 @@ class Store:
         self._text_specs: dict[tuple[str, str], tuple[DeviceSpec, DeviceSpec]] = {}
         self._fail_streak = 0
         self._next_poll_at = 0.0
+        #: 本轮已经派出去、还没回来的能力探测（同一台别重复提交）
+        self._geek_pending: set[str] = set()
 
     # -- 加载 ------------------------------------------------------------
     def clear(self) -> None:
@@ -190,6 +201,7 @@ class Store:
         self.home_id = ""
         self.loading = False
         self.last_error = ""
+        self._geek_pending.clear()
         if self.on_layout_changed:
             self.on_layout_changed()
 
@@ -230,6 +242,9 @@ class Store:
         self._status(f"已连接 · {len(self.devices)} 台设备")
         if self.on_loaded:
             self.on_loaded()
+        # 设备表齐了才谈得上"给谁探能力"。放在 on_loaded 之后：先把界面铺出来，
+        # 探测走低优先级队列，不和首屏抢带宽。
+        self.scan_geek_abilities()
 
     def _text_spec(self, node: DeviceNode, specs: Mapping[str, DeviceSpec]) -> DeviceSpec | None:
         """这台设备的规格，套上**型号级**文案覆盖；没登记就是原对象。
@@ -266,7 +281,7 @@ class Store:
                 if spec is not None and prev.spec is not spec:
                     prev.spec = spec
                     prev.card = build_card(
-                        spec, model=node.model,
+                        spec, did=node.did, model=node.model,
                         gang_names=node.gang_names, gang_rooms=node.gang_rooms
                     )
                 _register_keys(prev, node.did)
@@ -274,7 +289,7 @@ class Store:
                 continue
             card = (
                 build_card(
-                    spec, model=node.model,
+                    spec, did=node.did, model=node.model,
                     gang_names=node.gang_names, gang_rooms=node.gang_rooms
                 )
                 if spec
@@ -933,6 +948,79 @@ class Store:
             callback=done,
         )
 
+    # -- 极客版能力探测 ----------------------------------------------------
+    #: 一次启动最多探几台。探测是"每台一次、结论落盘"的成本，但设备多的家里
+    #: 一轮全探就是几十条请求挤在正常轮询前面；分批之后每轮都是小步慢走，
+    #: 而 ``geek.candidates`` 会把 gateway / router / screen 排到最前面，
+    #: 中枢本身第一轮就命中，不靠"扫完全部"才出现入口。
+    GEEK_SCAN_LIMIT = 20
+
+    def scan_geek_abilities(self) -> None:
+        """给还没定论的设备各发一条**不耗码**的探测，判定它有没有极客版。
+
+        为什么必须探：MIoT 规格里根本没有这项能力（中枢网关的 spec 只有网络 /
+        指示灯 / 虚拟事件），所以「按型号写死名单」等于让人肉维护——用户家里还
+        有中控屏、路由器这类内置中枢，漏一个就永远看不到入口。而
+        ``get_autowebconfig_url`` 不耗码，问一句就知道。
+
+        成本上限：每台设备**一次**请求，结论落盘（``geek_ability.json``）；
+        "不支持"的结论 7 天后才重探一次；共享家庭整户跳过（那是另一户人家，
+        不替他们发请求），离线设备也跳过。
+        """
+        shared = {h.name for h in self.topology.homes if h.shared}
+        nodes = [st.node for st in self.devices.values() if st.node.did not in self._geek_pending]
+        for node in geek_candidates(nodes, shared, limit=self.GEEK_SCAN_LIMIT):
+            self._geek_pending.add(node.did)
+            self.worker.submit(
+                geek_probe,
+                (self.client.raw(), node.did),
+                priority=PRIORITY_DATA,
+                label="geek-probe",
+                callback=lambda result, error, d=node.did, m=node.model: self._on_ability(
+                    d, m, result, error
+                ),
+            )
+
+    def _on_ability(
+        self, did: str, model: str, result: Any, error: BaseException | None
+    ) -> None:
+        self._geek_pending.discard(did)
+        if error is not None:
+            # 工作线程层面就抛了（不是"设备说没有"）：当没探过，下次启动再来
+            return
+        geek_remember(did, model, bool(result))
+        if self.on_geek_ability:
+            self.on_geek_ability(did)
+
+    def fetch_geek_passcode(
+        self,
+        did: str,
+        on_done: Callable[[GeekEntry | None, str, str], None],
+    ) -> None:
+        """取一枚极客版登录码。``on_done(entry, 错误原因, 可用地址)``。
+
+        成功时 ``entry`` 有值（``url`` + ``code``）；失败时 ``entry`` 为 ``None``、
+        第二个参数是一句人话，第三个参数有值表示地址已经拿到、网页还能打开。
+
+        **一次调用 = 消耗一枚码**（取新码会让旧码立即失效），所以这里没有缓存、
+        没有重试、也没有自动刷新——只由用户点按钮触发。
+        """
+
+        def done(result: Any, error: BaseException | None) -> None:
+            if error is None and isinstance(result, GeekEntry):
+                on_done(result, "", "")
+                return
+            url = error.url if isinstance(error, GeekError) else ""
+            on_done(None, str(error) if error is not None else "取码失败", url)
+
+        self.worker.submit(
+            fetch_geek_entry,
+            (self.client.raw(), did),
+            priority=PRIORITY_CONTROL,
+            label="geek",
+            callback=done,
+        )
+
     def run_scene(self, scene_id: str, home: str = "") -> None:
         self.worker.submit(
             self.client.run_scene,
@@ -1011,7 +1099,7 @@ def build_card_empty(node: DeviceNode) -> CardSpec:
     """没有 spec_type 的设备（如手环）：只展示，不给控件。"""
     from .catalog import GENERIC
 
-    return CardSpec(category="unknown", profile=GENERIC)
+    return CardSpec(category="unknown", profile=GENERIC, did=node.did, model=node.model)
 
 
 __all__ = ["DeviceState", "RoomView", "Store", "build_card_empty"]
