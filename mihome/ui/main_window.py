@@ -42,6 +42,7 @@ from PySide6.QtWidgets import (
 from ..core import speaker
 from ..core.alerts import Alert, AlertPolicy
 from ..core.api import Client, explain
+from ..core.automation.service import AutomationService
 from ..core.icons import IconCache
 from ..core.jobs import SerialWorker
 from ..core.poll_demand import PollDemandBoard
@@ -273,7 +274,15 @@ class MainWindow(QMainWindow):
         self.nav = SideNav(self.palette_ref)
         self.nav.room_selected.connect(self._on_room_selected)
         self.nav.settings_requested.connect(self.open_settings)
+        self.nav.zone_requested.connect(self._on_zone)
         body_row.addWidget(self.nav)
+
+        # 电脑自动化的常驻服务：规则、冷静期冷却表、全局热键注册表都得活过
+        # 对话框的销毁（exec_with_dim_click 关窗会 deleteLater），所以挂主窗口上。
+        self.automation = AutomationService(
+            store=self.store, client=self.client, worker=self.worker,
+            window=self, parent=self,
+        )
 
         # 右侧：顶部指令条 + 卡片墙。指令条占的正是警告条浮层那条横带
         # （同一个 ALERT_MARGIN_X / ALERT_MARGIN_TOP + AlertBar.H），所以警告条
@@ -605,10 +614,15 @@ class MainWindow(QMainWindow):
         self.client.flush()
         # 把本次运行结束时的轮询健康状况落盘，下次启动能看出上次到底好不好
         self.client.health.close()
+        # 先注销全局热键、丢弃未跑完的动作队列，再停后台线程
+        self.automation.close()
         self.worker.stop()
 
     # -- 启动 ------------------------------------------------------------
     def start(self) -> None:
+        # 热键不依赖网络：未登录也要能用（发事件时才需要中枢）。开机自启顺序
+        # 不定，被占用的组合由服务层延迟重试一次。
+        self.automation.start()
         self.wall.show_placeholder("正在连接米家…")
         if not self.client.available:
             self._set_status("未登录 · 需要扫码")
@@ -958,7 +972,21 @@ class MainWindow(QMainWindow):
         if bar is not None and bar.target() is not None and bar.target().model == model:
             bar.update_icon()
 
-    # -- 设置 ------------------------------------------------------------
+    # -- 功能区 / 设置 ---------------------------------------------------
+    def _on_zone(self, key: str) -> None:
+        """功能区入口。目前只有「电脑自动化」有页面；其余两个仍是占位，忽略即可。"""
+        if key == "automation":
+            self.open_automation()
+
+    def open_automation(self) -> None:
+        """先弹规则列表；三段式编辑窗由列表窗自己再叠一层（嵌套模态）。"""
+        from .automation_list import AutomationListDialog
+
+        dlg = AutomationListDialog(self.automation, self.palette_ref, self)
+        self._run_dialog(dlg)
+        # **不要补 _apply_theme()**：那会整墙重建，正是 11-12 关窗闪烁的根因。
+        # 规则保存 / 热键重注册都在常驻服务里完成，不需要主窗口跟着刷新。
+
     def open_settings(self) -> None:
         from .settings import SettingsDialog
 

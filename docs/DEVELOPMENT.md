@@ -23,7 +23,8 @@
 - [详情页：打开就是真值（不等 600ms）](#详情页打开就是真值不等-600ms)
 - [交互约定：点压暗区关闭子窗口](#交互约定点压暗区关闭子窗口)
   - [关窗那一下只许重绘一次](#关窗那一下只许重绘一次)
-- [左侧导航底部的功能区（占位）](#左侧导航底部的功能区占位)
+- [左侧导航底部的功能区](#左侧导航底部的功能区)
+- [电脑自动化：四层窗口（2026-11-13 落地）](#电脑自动化四层窗口2026-11-13-落地)
 - [单实例：再点一次图标只把窗口叫到前台](#单实例再点一次图标只把窗口叫到前台)
 - [开机启动：一条 HKCU 启动项，加上一个自愈](#开机启动一条-hkcu-启动项加上一个自愈)
 - [系统托盘常驻：关窗不退出](#系统托盘常驻关窗不退出)
@@ -1179,18 +1180,20 @@ AttributeError: 'WindowFrame' object has no attribute 'win'
 **离屏测不到"看不看得见闪"**（离屏 QPA 不做分段提交），这里守的是根因；
 视觉效果只能在真机上复测。
 
-## 左侧导航底部的功能区（占位）
+## 左侧导航底部的功能区
 
 `ui/side_nav.py` 底部现在是**两组**：功能区（耗材 / 监控 / 电脑自动化三个按钮）在上，
 设置在下，中间用 `FOOT_H` 上边界那条线切一刀，最上面还有一条线压在功能区上边界。
-三个按钮都只是占位：点击直接 return，不切页、不发信号。
+**2026-11-13 起第三个按钮已接线**（详见下一节），前两个仍是占位。
 
 - **两条线的语义不是装饰**：房间列表 + 功能区 = 「这个家」的内容；设置 = 「这个程序」
   的配置。所以功能区上下各一条线，设置单独成一组。两条线样式必须一致
   （`pal.border` / 1px / 左右各缩 12），别给其中一条加粗换色——那会把功能区夹成第三组。
-- **占位就是占位**：`mouseReleaseEvent` 里命中 `_zone_index_at_point()` 直接 `return`，
-  不发信号、不切页、不弹窗；hover 仍给底色和指针光标（不然用户以为这一块没做）。
-  将来接页面时在这里发 `zone_requested`，**不要**先悄悄跳一个空页面。
+- **接线只接了一根**：`mouseReleaseEvent` 命中 `_zone_index_at_point()` 后统一
+  `zone_requested.emit(ZONE_KEYS[idx])`，`MainWindow._on_zone()` 目前只认
+  `"automation"`（弹 `AutomationDialog`）；`"consumables"` / `"monitor"` 收到即忽略，
+  **不要**先悄悄跳一个空页面。hover 仍给底色和指针光标（不然用户以为这一块没做）。
+  `ZONE_KEYS` 与 `ZONE_ITEMS` 顺序必须一一对应，加按钮时两处一起改。
 - **几何只有一个来源**：`BOTTOM_H = ZONE_H + FOOT_H`。房间列表的可视区
   （`_view_rect`）和滚动上限（`_max_offset`）都减 `BOTTOM_H`，不是 `FOOT_H`。
   改底部任何一块高度都要改这里，否则列表会盖住按钮。
@@ -1199,6 +1202,302 @@ AttributeError: 'WindowFrame' object has no attribute 'win'
   只需往 `ZONE_ITEMS` 里加一项 + 在 `_paint_zone_icon` 里补一个图标分支。
 - 为什么先放空按钮：把这块位置**定下来**（主程序里独立页面 / 工具的入口区），
   页面的规划在 `TODO.md`「功能区与独立页面」，别在这里先做半成品页面。
+
+## 电脑自动化：四层窗口（2026-11-13 落地）
+
+> 契约与调研依据在 `docs/reference/automation-hotkeys-and-ui.md` 第 6 节、
+> `pc-state-api.md`、`mijia-automation-events.md`；本节只记**实现取舍和踩过的坑**。
+> v1 明确不做清单（米家 → 电脑、设备触发、设备条件、脚本、宏、else 分支、本地 HTTP）
+> 见契约文档 6.2，别顺手补。
+
+### 分层：core 里有一半是纯逻辑、一半是 Qt 适配层
+
+| 文件 | 职责 | 能不能离线 import |
+| --- | --- | --- |
+| `rules.py` | `Rule` / `Condition` / `Action` / `RuleSet`，校验、`rules.json` 原子写、热键去重 | ✅ |
+| `hotkeys.py` | 组合键规范串 ↔ Win32 `mods/vk`，保留键拦截，`MOD_NOREPEAT` 常量 | ✅ |
+| `pc_state.py` | 纯 `ctypes` 快照 + 条件求值（6 类），**「不可用 ≠ 不成立」** | ✅ |
+| `engine.py` | 纯逻辑：条件、冷静期、动作队列、重入、日志；`call_later` / `emit` 外部注入 | ✅ |
+| `logbook.py` | 触发日志的中文结果名、五列、全文与筛选 / 查找（独立日志窗共用） | ✅ |
+| `sender.py` | 动态查 `emit-virtual-event` 的 `siid/aiid` 并同步调云端 | ✅（假 API 测） |
+| `hotkeys_win.py` | `RegisterHotKey` + `WM_HOTKEY` 原生事件过滤器 | ❌ 依赖 PySide6 |
+| `service.py` | 常驻 `AutomationService`：串起上面全部 + `SerialWorker` + 成员 `QTimer` | ❌ 依赖 PySide6 |
+
+`core/automation/__init__.py` **只导出前五个纯逻辑模块**。离线验证脚本一律从包入口
+import；一旦把 `service.py` / `hotkeys_win.py` 也塞进 `__init__`，`verify_automation_rules.py`
+就会要求装 PySide6 才能跑，等于把纯逻辑测试绑死在 GUI 环境上。`service.py` 和
+`hotkeys_win.py` 放在 `core/` 下只是因为它们不画界面，别按目录名误判成"core 无 Qt"。
+
+### 数据与生命周期
+
+- `<data>/rules.json` 是**唯一真相**；键位在每条规则的 `keys` 字段里，
+  **没有 `hotkeys.json`**。`RuleSet` 用 `.tmp` + `os.replace` 原子写；**删除标记也落盘**
+  （见「回收站：软删除」）。热键冲突、注册状态、冷静期表、触发日志
+  **全只在内存**，重启不残留（日志上限 `max_log=500`）。
+- 状态必须挂 `MainWindow` 上**常驻**的 `AutomationService`：`exec_with_dim_click()`
+  关窗会 `deleteLater()` 销毁对话框，冷却表 / 注册表挂在 `AutomationDialog` 上
+  会随关窗蒸发。页面只持有一份「草稿」`Rule`，点「保存」才写回 `RuleSet` 并
+  `service.sync()`；`sync()` 同时重算热键注册表。
+- `MainWindow.start()` 调 `automation.start()` 注册热键，`shutdown()` 先
+  `automation.close()`（撤注册 + 丢弃未跑完的动作队列）再停 worker。
+- 关自动化页**不补** `_apply_theme()`（11-12 关窗闪烁的根因，见「交互约定：点压暗区
+  关闭子窗口」）；录制态按 Esc / 点遮罩只取消录制，不走 `reject()`。
+
+### 三层防重与动作队列
+
+`MOD_NOREPEAT (0x4000)` 内置在 `RegisterHotKey` 里、不给用户配不展示；规则级
+`cooldown_ms` 默认 1000 ms（`0` = 关），从「触发被接受」起算；上一串动作没跑完又来
+一次 → **丢弃 + 记 `reentry` 日志**，不排队。三种拦截（`cooldown` / `reentry` / 条件不成立）
+都会落一条 `LogEntry`，**绝不静默**（"按了没反应"会被当成程序坏了）。延迟用
+`service` 上的**成员 `QTimer`** 串队列，`engine` 只调注入的 `call_later`；发事件异步
+结果回来才走下一步，失败即停串。退出时 `_closed` 挡住迟到的回调。
+
+### 发送链路
+
+`VirtualEventSender` 按 action 名 `emit-virtual-event` 从 `DeviceSpec` 里查
+`siid/aiid`，**不写死 `4/1`**；中枢网关同样按能力去探，不在型号白名单里硬编码。
+payload 的键是 **`in`**（`prop/set` 才是 `value`，混用报 `-704220025`，看着像
+"设备不支持"）。云端调用走现成 `SerialWorker.submit()`，worker 里不碰 UI。
+
+### 四层窗口：列表 → 编辑 / 回收站 / 日志
+
+**02:49 用户要求拆开**：点功能区「电脑自动化」只弹规则列表，点卡片「编辑」或
+「＋ 新建规则」才叠出三段式编辑窗。**03:17 又按截图加了两层**：底部「回收站」
+「日志」各自弹独立窗口；列表去掉「完成」（右上 × / 点遮罩关），绿色主按钮改圆角矩形。
+**04:xx 又按 UI 评审结果做了一轮优化**（见下面各节）。四层都是同一个
+`AutomationService` 的视图，谁都不持有规则状态。
+
+| 窗口 | 文件 | 内容 |
+| --- | --- | --- |
+| 规则列表 | `ui/automation_list.py`（`AutomationListDialog` / `RuleCard`） | **只列 `active()`**：名称、触发键、启停开关、编辑 / 删除；底部「回收站」「日志」「＋新建规则」；空态；标题栏报条数 |
+| 三段式编辑 | `ui/automation.py`（`AutomationDialog`） | ①②③ + **冷静期在①块内**；只认一个 `rule_id`（`None` = 新建草稿）；**没有启停、没有日志、没有测试发送**；**保存成功即关闭** |
+| 回收站 | `ui/automation_trash.py`（`AutomationTrashDialog` / `TrashCard`） | 还原 / 彻底删除，显示删除时间；彻底删除是红色描边幽灵按钮 |
+| 触发日志 | `ui/automation_log.py`（`AutomationLogDialog`） | 五列表格，默认跨全部规则；关键字 / 规则 / 结果 / 时间范围筛选；结果三档着色；新日志增量插入 |
+
+- **嵌套模态直接用 `exec_with_dim_click`**，别自己造一层：它给每层各挂一个
+  `DimClickShield`，`_stack()` 把链路上所有可见弹窗一起挖洞，所以编辑窗开着时
+  点主窗口压暗区只关编辑窗。父窗口一律传列表窗，**主窗口压暗仍只由
+  `MainWindow._run_dialog` 管一次**，列表窗里不要调 `_cover_dim`。回收站里的
+  「彻底删除」确认框是第三层，同样走这套。
+- **启停直接走 `RuleSet.set_enabled()`**：它落盘并触发 `on_changed` → 服务重算热键
+  注册表。隐蔽的坑是这个回调从 `ToggleSwitch.toggled` 的信号栈里同步发出来，
+  当场销毁重建卡片等于删掉正在发信号的对象。所以开关只改自己那张卡的描边
+  （`RuleCard.set_enabled_state`），整表重建用**成员 `QTimer`** 排到下一轮事件循环
+  （`_schedule_refresh()` 里 `start(0)` 顺延，别 `singleShot` 一点一个）。
+  回收站的还原 / 彻底删除按钮同理，也排队重建。
+- 卡片颜色走项目色板：启用描边 `p.accent`、停用 `p.border`；编辑 `p.accent`、
+  删除 `theme.DANGER`、开关用 `ToggleSwitch` 的薄荷绿。属性选择器
+  `QFrame#RuleCard[on="true"]` 切状态，切主题不必逐控件重刷。
+- 编辑窗保存时用 `QSignalBlocker(service)` 挡住 `rules_changed`，列表窗的刷新统一
+  由 `_open_editor()` 返回后排一次，别在保存调用栈里就重建卡片。**保存按钮接的是
+  `_on_save()`**（`_save()` 成功 → `accept()`）。
+- 底部两个「Outline」按钮用 `p.text` + `blend(border, text, 0.32)` 描边：
+  直接写 `p.text_soft` / `p.border` 在浅色主题下几乎看不见（离屏渲染才发现）。
+
+### 公共样式层：`ui/automation_style.py`
+
+评审实测发现三窗卡片各写一份参数（108 / 96、r14 / r13、`p.card` / `panel_bg`），
+且深色 `p.card`(#1B1D22) 对对话框底 (#191A1D) 对比度只有 **1.03:1** ——
+`theme.py:214` 早就写过「深色不能照抄 `p.card`」，列表 / 回收站违反了既有约定。
+现在四窗在各自 stylesheet **末尾**拼一份 `common_qss(p)`：
+
+- 卡片统一 `theme.panel_bg(p)`、`CARD_H=108`、`CARD_RADIUS=14`、1px 边框，
+  启用态 `QFrame#RuleCard[on="true"]` 才用 2px accent；
+- 说明文字统一 `text_soft`：浅色 `text_mute`(#9CA3AF) 对白卡只有 **2.54:1**，
+  AA 正文要 4.5:1，`text_soft` 是 4.83:1。**不改 `dialog_qss` 本身**（会波及设置页），
+  靠"拼在末尾"覆盖 `QLabel#RowSub` 等 objectName；
+- `QPushButton:focus` 键盘焦点外框。QSS 特异性：只写通用的会被
+  `QPushButton#Primary { border: none }` 这类 ID 规则压掉，所以**把带 objectName 的
+  按钮逐个列出**。**焦点只许换颜色，不许换边框宽度**（见下一节）；
+- 大按钮统一 `theme.RADIUS_BUTTON_SOFT = 10`（圆角矩形）：`RADIUS_BUTTON`(20) 配
+  40px 高的按钮就是胶囊。`ui/confirm.py` 的确认框也吃这一档；
+- 每个按钮都有 `:pressed`（以前一条都没有，点击反馈全靠焦点框，那才是"按下去没弹回来"）；
+- 压在卡片上的小按钮底色用 `chip_fill(p, k)`（从 `panel_bg` 起算）+ `chip_border(p)`
+  1px 描边，不能用 `blend(p.bg, ...)`；
+- 按钮焦点策略统一 `tab_focus_only(root)`（四窗 + 确认框都调一次），鼠标点完不留框；
+- 三段编号圆徽章 `QLabel#StepBadge` + `QFrame#SectionCard[step="1|2|3"]` 左侧
+  3px 语义色竖条（①accent 蓝 / ②`SLIDER_WARM` 琥珀 / ③`ACCENT_GREEN` 绿）。
+  属性选择器改完要 `style().unpolish/polish` 才重算；
+- `fit_height(default, ratio=0.85)` 按 `QApplication.primaryScreen().availableGeometry()`
+  限高，四个窗口都用它，别再写死 900×620 顶出小屏任务栏。
+
+### 按钮：焦点只换颜色，尺寸一动不动（2026-11-13）
+
+用户报的两个现象其实是**同一个根因**：鼠标点一下按钮 → 按钮拿到焦点 → `:focus` 的
+`border: 2px solid accent` 画上去，而且**松手后还留着**。
+
+1. "按下再松开，按钮维持按下的样子" —— 那个框不是按下态，是焦点态；
+2. "按下时文字两侧被遮挡" —— `sizeHint` 是照**没焦点**的状态算的（Qt 的
+   `SE_PushButtonContents` 也不随 `State_HasFocus` 变），而 `:focus` 把边框从 0 变成
+   2px，内容区当场缩 4px。「编辑」正好 26px 宽，挤到 22px 就被裁掉了。回收站「回收站」
+   按钮、`#Tool` 一圈都中招，所以看起来"几乎所有按钮"都有。
+
+两条一起改：
+
+- **焦点规则只写 `border-color`**；没有描边的按钮（`#RuleEdit` / `#RuleDelete` /
+  `#Disclosure`）在常态就留 `border: 2px solid transparent` 占住那 2px。宽度永远不变
+  → 文字永远不会被裁。实心按钮（`#Primary` / `#Ghost`）没有描边可用，焦点改成
+  "提亮一档"；
+- **焦点策略收成 `Qt.TabFocus`**（`automation_style.tab_focus_only(root)`，
+  动态创建的按钮要在自己的构造函数里再设一次）：鼠标点击不再抢焦点，Tab 键照样能到。
+  这才是"点完不留任何痕迹"的正解 —— 光改颜色的话，点完那个 accent 框还在。
+
+顺手补齐 `:pressed`：按下要有一眼可见、松手就一定消失的反馈，别让焦点框兼职。
+
+> 验证方式见 `scripts/verify_automation_ui.py` 第 13 组：用
+> `style().subElementRect(SE_PushButtonContents, opt)` 量**有焦点 / 没焦点**的内容区，
+> 断言两者相等；再用一份"旧写法"的 QSS 反向证明这个方法真能抓到 4px 的缩水
+> （26 → 22）。只比 `sizeHint` 是抓不到的。
+
+### 压在卡片上的小按钮：底色要从 `panel_bg` 起算
+
+回收站深色主题的「还原」几乎看不见，不是配色丑，是**算错了底**：
+`blend(p.bg, p.text, 0.12)` = `#292A2D`，而卡片底 `panel_bg` = `#28292C`，**1.01:1**。
+按钮长在卡片上，却按窗口底算色。现在统一：
+
+- `chip_fill(p, amount)` = `blend(panel_bg(p), p.text, amount)`，深色 1.52:1 起；
+- `chip_border(p)` = `blend(p.border, p.text, 0.30)`，浅色白卡上靠这 1px 撑边界
+  （浅色 `panel_bg` 是纯白，光靠底色反而更淡）；
+- 有底色的同时**把 padding 减 1px**，加边框后尺寸不变（`#Tool` 6→5、`#Restore`
+  7→6、日志 `#Tool` 8→7）。
+
+`#IconTool`（行右侧 × ↑ ↓）同病同治：它本来就压在 `SectionCard` 上。
+
+### 压在**窗口底**上的小按钮：换成 `surface_fill`（2026-11-13 第二跳）
+
+同一个错误的镜像：日志窗那排「重置」按 `blend(p.bg, p.text, 0.12)` 算色，而它长在
+对话框底 `surface_bg` 上 —— 浅色下 `#DEDFE1` 压 `#E6E7E9`，**1.16:1**，只剩一圈描边。
+凡是**不压在卡片里**的按钮一律用 `surface_fill(p, amount)`（从 `surface_bg` 起算）。
+两把尺子别用混：`chip_fill` = 卡片上，`surface_fill` = 窗口底上。
+
+### 次要按钮只有一份 `ghost_qss`（2026-11-13）
+
+确认框的「直接关闭」第一版写成 `background: bg_soft`：深色下 `#15171C` 压在对话框底
+`#191A1D` 上 **1.03:1** —— 等于没画（用户第二次报"这个弹窗的按钮又是区分度低"）。
+现在 `automation_style.ghost_qss(p)` 是**唯一**一份次要按钮样式：四窗的 `common_qss`
+末尾拼它，`confirm.py` 也直接拼它，别再各写一份。
+
+- 底色 `surface_fill(p, 0.18 深 / 0.14 浅)`（1.7:1 / 1.34:1）+ 1px `chip_border`；
+- 文字用主文字色 `p.text`（不是 `text_soft`）；
+- **尺寸必须和实心主按钮一样**：主按钮 `padding: 11px 22px`、无边框；`#Ghost` 是
+  `1px 边框 + 10px 21px`，外框正好相等。编辑页的「取消」原来挂 `#Tool`（5px 13px），
+  比「保存」矮一圈（用户 11-13 的另一条反馈），现在也换成 `#Ghost`。
+
+`scripts/verify_automation_ui.py` 第 14 组钉住：确认框两按钮 `height()` / `sizeHint()`
+相等、编辑页「保存 / 取消」相等、深色 1.70:1 与浅色 1.34:1 的底色对比度，并反向证明
+`bg_soft` 那版只有 1.03:1、`p.bg` 起算那版在浅色下只有 1.16:1。
+
+### 日志窗空态：富余高度只能给说明那一句
+
+表格空态时 `table` 是隐藏的，它那份 `stretch=1` 也跟着消失，于是剩下的几百像素被
+`filters` / `empty` / `status_row` 三个 `Preferred` 控件**均分**——筛选条被撑到 200px 高
+（输入框就沉到窗口中间），状态行同样被撑高、文字浮在半空（用户 11-13 的截图）。
+
+给说明那句 `col.addWidget(self.empty, 1)` 就够：富余高度全落在它身上，文字在中间那块
+区域里居中，筛选条贴顶、状态行贴底。
+
+> 判据不能只看 `top()`——老写法下 `top()` 也是 12，**变高的是行本身**。
+> 验证断言的是"三个控件的高度都等于自己的 `sizeHint`，只有说明被撑开"。
+
+
+### 「测试发送」已整个去掉（用户 04:xx 拍板）
+
+评审离屏实测：旧「测试发送」会先 `_save(quiet=True)` 把**草稿静默写进 `rules.json`**
+并发云端事件，`_is_new` / `_dirty` 同时变 False，之后点「取消」仍是 1 条规则 ——
+用户以为只是"试一下"，实际已经建了规则、注册了热键。按用户要求**直接删掉按钮，
+不改成「保存并测试」**：`_test()`、`last_result` 单行回显、`log_added` 连接、
+相关 QSS 一并移除，固定底栏只剩「保存 / 取消」。`AutomationService.test()` 保留
+（引擎能力与离线验证还要用），但**页面不得再调用**。日志窗空态文案也别再提它。
+
+### 回收站：软删除，不是 `remove()`
+
+列表点「删除」= `RuleSet.trash()` 只打 `deleted` 标记（连同 `deleted_at` 一起落盘），
+**不弹二次确认**，因为可还原；只有回收站里的「彻底删除」= `purge()` 才物理移除且弹确认。
+`active()` / `get()`（默认）/ `enabled_keys()` / `rules_for()` / `set_enabled()` /
+`update()` 全部跳过或拒绝 `deleted` 规则 —— **少过滤一处，删掉的规则还在注册热键**，
+这是软删除最容易漏的坑。`purge()` 默认 `only_deleted=True`，避免误删在用规则。
+`add()` 也要连回收站里的 id 一起查重，否则还原时撞出两条。
+离线验证专门覆盖「已删规则不能被热键触发 / 不能被 `engine.test()` 触发」。
+「彻底删除」原先是透明红字、权重比「还原」还低，现改**红色描边幽灵按钮** + 间距 10px。
+
+### 独立日志窗：筛选逻辑在 core，不在 UI
+
+`core/automation/logbook.py` 是纯逻辑：中文结果名表、表格五列、全文（**必须含 `keys`**，
+不然「刚才按的是 Ctrl+K」搜不到）、`matches()` / `filter_entries()`，以及
+`outcome_tone()` 三档语义（`FAIL_OUTCOMES` 真失败 / `NEUTRAL_OUTCOMES` 被拦下 /
+其余正常）。`ui/automation_log.py` 只收集条件 + 画 `QTableWidget`，默认 `rule_id=""`
+即**跨全部规则**，时间正序的 `engine.log` 在表格里倒序显示（最新的在最上）。
+
+- 规则下拉要合并 `RuleSet.rules`（含回收站）**和**历史条目里的名字，否则已经彻底删除的
+  规则那段历史筛不出来。
+- **结果三档着色**：以前「冷静期拦截」和「发送失败」同为红，排查"按了没反应"分不清
+  是被拦了还是真出错。现在真失败 `theme.DANGER`、拦截 / 重入 / 条件不成立琥珀
+  （浅色下 `blend(SLIDER_WARM, p.text, 0.35)` 压深，纯 #F3BE44 对白底只有 1.7:1）、
+  正常流程 `ACCENT_GREEN`。
+- **新日志改 `insertRow(0)` 增量插入**，不再 80ms 合批全量重建 500×5 个 item：
+  保存滚动值与选中行、插完把滚动补一行高度，用户正在看的那几条不会跳。
+  超过 `MAX_ROWS` 删末行。这是性能优化，**不是「跟随最新」开关**（用户明确不要）。
+- **筛选激活态**：非默认值的 Combo 加 accent 描边（`Combo` 自带 stylesheet，得整份
+  `combo_qss(p) + extra` 重设，连 `:hover` 一起覆盖否则鼠标一放就没了）；状态行右侧
+  「已筛选 · 点击清除」chip 一键 `_reset()`；搜索框 placeholder 明写能搜**快捷键**。
+- 日志**只活内存**（`max_log=500`，重启清空），界面状态条如实写明。
+- **明确不做**（用户 04:xx 拍板）：复制选中行 / 导出 CSV / 「跟随最新」开关；
+  保存 / 还原 / 彻底删除 / 重置筛选**一律不加 toast 确认提示**。
+
+### 编辑窗布局：`ui/automation.py`
+
+仿米家 App「创建自动化」三段式：① 快捷键（录制 + 注册状态 + 折叠的手动选键 +
+**冷静期，单位维持毫秒**）、② 条件（AND / OR、可空、增删）、③ 动作（发事件 / 延迟，
+增删 + ↑↓ 调序）。头部只剩「名称」一行：**启停归列表卡片**（编辑一次不该把停用的
+规则悄悄打开），**冷静期按用户要求挪到①触发块最下面**。
+
+- **③动作行右侧的 ×↑↓ 曾经根本看不见（用户截图报的）**：根因是套用了
+  `QPushButton#Tool`，那个样式有 `padding: 6px 14px`（左右共 28px），而按钮被压到
+  26px 宽 —— 文字整个被内边距挤出可视区，深色下只剩一块和卡片近色的灰方块。
+  现在统一走 `_icon_button()` → `QPushButton#IconTool`：**padding: 0**、固定 30×30、
+  明显底 + 1px 描边、hover accent、disabled 变淡，且都带 `setToolTip` /
+  `setAccessibleName`。条件行的 × 同样处理。
+- **切动作类型要重置值**：`_kind_changed()` 只换 placeholder 时，把「发虚拟事件」
+  切成「延迟」会残留事件名 → `int()` 失败 → 必报校验错。现在切到延迟填 "1000"、
+  切回事件清空。构造期用 `ActionRow._loading` 挡住 `setCurrentIndex` 触发的
+  `_kind_changed`，否则会把刚回填的值清掉。条件行换类型同理清掉旧参数。
+- **边界箭头禁用 + tooltip**：`_renumber()` 每行调 `set_move_enabled(up, down)`，
+  增删 / 调序后都会重算，不再"点了没反应"。
+- **①块降密度**：注册状态并进「键盘快捷键」行右侧（省一行），「或手动选键」默认
+  折叠成 `#Disclosure`（再省一行），段距 `col.setSpacing(12)` + 标题上下留白，
+  三段用编号徽章与语义竖条分开。省下的高度正好抵消段距，③三行动作仍一屏可见。
+- 标题栏副标题接 `name_edit.textChanged` 实时同步，别停在构造时的旧规则名。
+- **固定底栏不能进 `QScrollArea`**；固定区要薄（`error_label` 空时隐藏、静态说明
+  回滚动区），否则③动作块被挤掉。窗口 `860 × fit_height(900)`。
+- 构造期信号早连会崩：`Combo.addItem` 会发 `currentIndexChanged`，此时同行其它
+  控件还没建好。所有 `Combo` 填充一律 `QSignalBlocker`，信号连接放到**全部控件
+  创建之后**；`_set_manual_from_keys()` 也要挡住回填触发的 `stateChanged`。
+  `clicked` / `textChanged` / `currentIndexChanged` 接的无参槽统一写 `*_args`。
+- 录制态 `reject()` 只取消录制；`dirty` 时关窗弹「保存并关闭 / 直接关闭」。
+  新建草稿没点保存不会 `add` 进 `RuleSet`，直接取消不落盘。
+
+### 验证与预览
+
+`scripts/verify_automation_rules.py`（**132 项**，纯逻辑；新增 `outcome_tone` 三档语义）、
+`verify_automation_ui.py`（**204 项**，假 service；新增动作行右侧图标按钮可见性 /
+padding / tooltip / 边界禁用、切类型重置、三段徽章与竖条、手动选键折叠、副标题同步、
+筛选激活态与 chip、三档结果色、增量插入保留选中、去测试发送、公共样式层与限高；
+第 13 组专测按钮——圆角矩形、焦点前后内容区等宽（带"旧写法会缩 4px"的反向证明）、
+鼠标点完不拿焦点、压在卡片上的底色对比度、日志空态三行高度不被撑开）、
+`verify_automation_hotkeys.py`（34 项，假 `user32` + 假 API，**不抢用户真实热键、
+不发米家请求**）。全套 `verify_*.py` 共 47 个脚本零失败。
+`scripts/out/shot_automation_page.py` 离屏渲染四张浅 / 深对照图
+（`automation_list_preview.png` / `automation_editor_preview.png` /
+`automation_trash_preview.png` / `automation_log_preview.png`）加一张
+`automation_preview.png` 总览（本地产物、已 gitignore），渲染时把
+`hotkeys_win._user32` 换成假对象，所以**预览图里红色的注册状态是故意的，不是真冲突**。
+
+> **运行验证一律用 `.venv/Scripts/python.exe`**：系统 `python` 没装 PySide6 /
+> `mijiaAPI`，直接跑会得到 46 个 `ModuleNotFoundError`，那不是代码坏了。
+
+**还没做真机端到端**：实现阶段发送层只用假 API 验过，没向米家云端发过事件。
+11-13 早先 `probe_automations.py emit "极客版按键自动化执行"` 打通并听到音箱播报，
+验的是云端能力；新页面这条链路要走真机需单独授权，建议用随机事件名避免命中真实自动化。
 
 ## 单实例：再点一次图标只把窗口叫到前台
 
@@ -1592,6 +1891,48 @@ Store.set_value / set_many / run_action / run_scene
 
 落盘在 `<data>/prefs.json`（Windows 是 `%LOCALAPPDATA%\MiHomePanel\prefs.json`）。
 删掉它等于全部恢复默认，不影响登录和缓存。
+
+### 拖动快照：四角要透明，**容器也不能铺底**（2026-11-13，两轮才修对）
+
+拖动排序时跟手的那张"幽灵卡"是卡片的一张透明快照，贴在墙上当浮层。
+
+**第一轮（只治了一半）**：先 `card.grab()` 拿位图，再用 mask 图 + `CompositionMode_DestinationIn`
+把圆角以外抠掉。四角 alpha 确实变成 0 了，验证也全绿 —— 但真机上**还是四块黑角**，
+而且弧线边缘有一圈白毛边。两个原因叠在一起：
+
+1. 快照贴在一个 `QLabel` 上。`QLabel` 是普通子控件，**绘制前 Qt 会先按调色板把它的
+   矩形铺一遍**（离屏 `#EFEFEF`，深色主题下近黑）。抠掉的那几个像素露出的是这层底色，
+   不是墙 —— 所以 alpha=0 一点用都没有；
+2. 卡片自绘的矩形有 0.5px 内缩（`self.rect().adjusted(0.5, 0.5, -0.5, -0.5)`），
+   `grab()` 时这圈是被**不透明底色**填过的；即使 mask 抠得再准，弧线上那几像素也已经是
+   `卡片色×α + 底色×(1-α)`，再抠一次只会得到一圈更暗/更亮的描边加明显阶梯。
+
+**现在的做法**（`wall.rounded_shot` + `wall.DragGhost`）：
+
+- `rounded_shot` 不抓图，改成**先备一张透明画布、用圆角路径裁好、再让卡片往上画**：
+  ```python
+  painter.setClipPath(圆角路径)
+  widget.render(painter, QPoint(0, 0), QRegion(),
+                QWidget.RenderFlags(QWidget.DrawChildren))   # 关键：不带 DrawWindowBackground
+  ```
+  `DrawWindowBackground` 那面旗默认是开的，它会按调色板铺底 —— 就是白毛边的来源。
+- 容器换成 `DragGhost(QWidget)`：`WA_TranslucentBackground` + `WA_NoSystemBackground`，
+  `paintEvent` 里只 `drawPixmap`。四角露出的是**下面已经画好的墙**（`DragGhost.pixmap()`
+  是给验证脚本读的，别按 QLabel 的接口想它）。
+
+验证分三层（`scripts/verify_card_style.py` 第 8 组，共 16 项）：
+
+- pixmap 本身：四角 alpha = 0、中心 255、角外 2px 也干净、弧内侧没多抠；
+- **容器**：把快照铺到红底上 `render`，四角必须还是红的、中心是卡片色；同一张 pixmap
+  装进 `QLabel` 反向证明四角会被铺成 `#EFEFEF`（这条才是用户看到的那个 bug）；
+- 弧线上不许出现近白色（`min(r,g,b) > 200` 且 0 < alpha < 255）的毛边像素。
+
+外加一条真实起拖的用例：`_begin_drag` 之后从 `ghost.pixmap()` 读四角，
+再 `_finish_drag(commit=False)` 确认快照已销毁。
+
+> 直接调 `wall._begin_drag()` 而不先摆好 `_drag_card / _drag_section / _drag_origin`，
+> 会让 `_cancel_drag()` ↔ `_finish_drag()` 互递归（生产路径不可达，写测试要照"按下"
+> 那一步摆一遍）。
 
 ### 一处刻意不做：房间标题的批量按钮
 
@@ -2153,6 +2494,20 @@ UI 规范：版式尺寸（dp）、6 列栅格、配色表、圆角与字号体�
 
 这些是实测确认、写进代码注释的：
 
+- **`:focus` 加边框 = 文字被裁 + "按下去没弹回来"**。`sizeHint` 是照没焦点算的，
+  `:focus` 把边框从 0 变 2px，内容区当场缩 4px；松手后焦点还在，那个框就一直留着。
+  焦点只许换 `border-color`（无描边的按钮常态留透明等宽描边），鼠标点击别给焦点
+  （`Qt.TabFocus`）。详见「按钮：焦点只换颜色」。
+- **按钮底色必须按"它压在谁身上"算**。同一个错误犯了两次：压卡片的按窗口底算
+  （`blend(p.bg, text, 0.12)` 深色 `#292A2D` vs 卡片 `#28292C` = 1.01:1），压窗口底的
+  又按 `p.bg` 算（浅色 1.16:1）。卡片上用 `chip_fill`，窗口底上用 `surface_fill`，
+  对号入座，别混。
+- **透明快照贴到 `QLabel` 上 = 白贴**。`QLabel` 是普通子控件，绘制前 Qt 会按调色板
+  把它的矩形铺一遍（离屏 `#EFEFEF`、深色下近黑），pixmap 里 alpha=0 的角露的就是这层
+  底色 → "抠了半天还是黑角"。浮层用 `wall.DragGhost`（`WA_TranslucentBackground`）。
+- **`QWidget.grab()` 是不透明位图**，而且卡片自绘有 0.5px 内缩，边缘像素**已经在底色上
+  混过一次**了 —— 事后再抠角只会得到一圈毛边。正确顺序是"先备透明画布、`setClipPath`
+  圆角、`widget.render(..., RenderFlags(DrawChildren))`（**不带** `DrawWindowBackground`）"。
 - **"关窗时顺手再应用一次主题"就是闪烁**。`_apply_theme` 里有 `wall.rebuild_palette`
   （整墙 56 张卡拆了重造），叠加在"弹窗销毁 + 点击层隐藏 + 压暗层隐藏"三处整窗
   失效上；主窗口是 `WA_TranslucentBackground`，Qt 在这种窗口上逐控件分段提交，

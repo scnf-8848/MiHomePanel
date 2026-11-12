@@ -360,6 +360,9 @@ FONT_STACK = '"Microsoft YaHei UI", "Microsoft YaHei", "PingFang SC", "Noto Sans
 RADIUS_CARD = 18  # 卡片 / 分组卡 / 浮窗
 RADIUS_PILL = 16  # 状态胶囊、小标签
 RADIUS_BUTTON = 20  # 大按钮（场景胶囊）
+#: 「圆角矩形」按钮：40px 高、圆角 20 就是胶囊，不是用户要的矩形。
+#: 电脑自动化四窗 + 确认框统一用这一档（11-13 用户定）。
+RADIUS_BUTTON_SOFT = 10
 RADIUS_SMALL = 12  # 卡内小按钮、导航选中块
 RADIUS_WINDOW = 12  # 窗口外框（无边框窗口的 setMask 遮罩）
 
@@ -485,6 +488,7 @@ __all__ = [
     "NAV_BG_DARK",
     "NAV_BG_LIGHT",
     "RADIUS_BUTTON",
+    "RADIUS_BUTTON_SOFT",
     "RADIUS_CARD",
     "RADIUS_PILL",
     "RADIUS_SMALL",

@@ -11,9 +11,10 @@
 底色和右边的卡片墙**不是同一个色**（``theme.nav_bg``）：栏是机身、卡片墙是台面。
 两边同色时只能靠一条 1px 竖线分隔，整块界面看起来是连着的。
 
-最下面固定一块「功能区」+ 一个「设置」入口：前者是全屋级页面的入口（目前三个按钮
-——耗材 / 监控 / 电脑自动化——只占位、不响应点击），后者收纳主题、排序、隐藏设备
-这些不常改的东西。
+最下面固定一块「功能区」+ 一个「设置」入口：前者是全屋级页面的入口（三个按钮
+——耗材 / 监控 / 电脑自动化），后者收纳主题、排序、隐藏设备这些不常改的东西。
+点击功能区统一发 ``zone_requested(key)``；目前只有「电脑自动化」接了页面，另两个
+由主窗口忽略（仍是占位），**不要在侧栏里悄悄跳一个空页面**（`DEVELOPMENT.md` 约定）。
 两条分隔线把底部切出语义：房间列表 + 功能区都是「这个家」的内容，
 「设置」是「这个程序」的配置，所以功能区上下各一条线，设置单独成一组。
 "已隐藏设备"分组排在房间列表末尾，图标上和普通房间区分开——它是收纳箱，不是房间。
@@ -45,8 +46,10 @@ ZONE_GAP = 2
 ZONE_PAD_TOP = 7
 ZONE_PAD_BOTTOM = 6
 #: (按钮文字, 图标类型)，顺序即从上到下的绘制顺序。
-#: 三个都只是占位：点击不切页、不发信号（见 ``mouseReleaseEvent``）。
 ZONE_ITEMS = (("耗材", "battery"), ("监控", "camera"), ("电脑自动化", "pc"))
+#: 与 ``ZONE_ITEMS`` 一一对应的稳定 key。信号带 key 而不是索引：以后在中间插一个
+#: 入口，主窗口的接线不会因为下标挪动而点错页面。
+ZONE_KEYS = ("consumables", "monitor", "automation")
 ZONE_H = (ZONE_PAD_TOP + ZONE_BTN_H * len(ZONE_ITEMS)
           + ZONE_GAP * (len(ZONE_ITEMS) - 1) + ZONE_PAD_BOTTOM)
 #: 底部固定区总高；房间列表的可见区域与滚动上限都按它算。
@@ -69,6 +72,8 @@ class _Row:
 class SideNav(QWidget):
     room_selected = Signal(str, str)  # home, room；("", "*") 表示全部
     settings_requested = Signal()
+    #: 功能区入口被点击，参数是 ``ZONE_KEYS`` 里的稳定 key
+    zone_requested = Signal(str)
 
     def __init__(self, palette: theme.Palette) -> None:
         super().__init__()
@@ -307,8 +312,10 @@ class SideNav(QWidget):
         if event.button() != Qt.LeftButton:
             return
         pos = event.position().toPoint()
-        # 占位按钮：目前不接任何信号、不切页、不弹窗。将来接页面时在这里发信号。
-        if self._zone_index_at_point(pos) >= 0:
+        zidx = self._zone_index_at_point(pos)
+        if zidx >= 0:
+            # 只有「电脑自动化」目前接了页面；其余两个主窗口收到后忽略，仍是占位
+            self.zone_requested.emit(ZONE_KEYS[zidx])
             return
         if self._settings_rect().contains(pos):
             self.settings_requested.emit()
@@ -331,4 +338,4 @@ class SideNav(QWidget):
             self.update()
 
 
-__all__ = ["SideNav"]
+__all__ = ["SideNav", "ZONE_ITEMS", "ZONE_KEYS"]

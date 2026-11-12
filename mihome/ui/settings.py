@@ -64,7 +64,12 @@ PAGE_MARGIN = 26
 COMBO_W = 168
 
 
-def _dialog_qss(p: theme.Palette) -> str:
+def dialog_qss(p: theme.Palette) -> str:
+    """所有模态子窗口共用的行式 QSS（设置页 / 电脑自动化页）。
+
+    抽成公开函数是为了让新页面复用同一套 ``SectionCard`` / ``SettingsRow`` 配色，
+    别各抄一份——切主题时整张表重算，抄漏一条就留着上个主题的颜色。
+    """
     return theme.app_qss(p) + f"""
     QDialog {{ background: transparent; }}
     /* 下拉框的样式在 ui/combo.py 里（含自绘箭头、弹出层的真圆角、禁滚轮）。
@@ -301,7 +306,7 @@ class SettingsDialog(QDialog):
         theme.apply_to_app(palette)
         # 行式排版的颜色全在 QSS 里（PageTitle / RowTitle / SectionCard ...），
         # 重新 setStyleSheet 就全跟着换了，不必逐个控件设色
-        self.setStyleSheet(_dialog_qss(palette))
+        self.setStyleSheet(dialog_qss(palette))
         self.titlebar.set_palette(palette)
         for box in (
             getattr(self, "cb_placement", None),
@@ -1016,4 +1021,4 @@ class SettingsDialog(QDialog):
         self._fill_order_trees_silently()
 
 
-__all__ = ["SettingsDialog"]
+__all__ = ["SettingsDialog", "dialog_qss"]

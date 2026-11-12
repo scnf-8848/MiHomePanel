@@ -4,7 +4,9 @@
 > `docs/reference/mihome-app/31_create_automation.jpg`），并问「系统级 API 能拿到哪些电脑
 > 状态，会不会必须外接其它程序」。本页记**设计契约 + 能力调研 + 本机实测**。
 > 探针 `scripts/probe_pc_state.py`（纯标准库 ctypes、只读、不装依赖、不发米家请求）。
-> 索引状态 = **待排期**：结论已通，功能未做。
+> 索引状态 = **已落地**（2026-11-13 电脑自动化 v1 开工，6 类零依赖条件、
+> 三层防重、冷静期均已实现）。本文仍是能力边界与契约依据；实现取舍见
+> `docs/DEVELOPMENT.md`「电脑自动化：四层窗口（2026-11-13 落地）」。
 >
 > **一句话结论**：进程 / 前台窗口 / 空闲 / 锁屏 / 电源这些**纯 Windows API 就能读，不用装
 > 任何东西**；「整机墙上功率」确实拿不到，但 **CPU 封装功率能读**（本机实测 17 W，
@@ -62,11 +64,16 @@ scene_action.actions[]             ↔ ③ 动作，数组顺序即执行顺序
   天然支持 2–3 键），只有「按下」没有「松手」——做触发够用。**注册必须带
   `MOD_NOREPEAT`（见 1.4）**。单键（如裸 `F7`）会抢全局按键，注册失败 / 被占用
   要给可见提示。骨架可复用 `core/single_instance.py` 的原生事件过滤器。
-- **发虚拟事件**已端到端验证（`mijia-automation-events.md` 4.2.1）：
+- **发虚拟事件**已端到端验证（`mijia-automation-events.md` 4.2.1，
+  **验的是云端能力；新页面这条链路尚未真机跑过**）：
   `siid 4 / aiid 1 / in:["事件名"]`，`code 0` 只代表云端收下。规则里存事件名，
-  中枢 did 按 `core/geek.py` 的思路「程序自己问出来」，不写死型号 / iid。
-- 示意结构（**形态已定、字段命名属实现细节，开工时定**；v1 契约索引见
-  `automation-hotkeys-and-ui.md` 6.1，明确不做清单见 6.2）：
+  中枢 did 按 `core/geek.py` 的思路「程序自己问出来」，不写死型号 / iid；
+  落地时 `siid/aiid` 也是按 action 名 `emit-virtual-event` 从规格动态查的。
+- 示意结构（**2026-11-13 已落地**；形态即下面三段，v1 契约索引见
+  `automation-hotkeys-and-ui.md` 6.1，明确不做清单见 6.2）。
+  **下图是拍板时的契约示意，实际 `rules.json` 字段名以 `core/automation/rules.py` 为准**：
+  `keys` / `condition_mode` / `conditions` / `cooldown_ms` 都摊平在顶层，
+  没有 `trigger` / `condition` 这层嵌套，且每条规则多一个 `id`：
   ```jsonc
   {
     "name": "示例", "enabled": true,

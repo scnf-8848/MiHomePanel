@@ -33,9 +33,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QPoint, QRect, Qt  # noqa: E402
-from PySide6.QtGui import QColor  # noqa: E402
+from PySide6.QtGui import QColor, QImage, QPainter  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
-from PySide6.QtWidgets import QApplication  # noqa: E402
+from PySide6.QtWidgets import QApplication, QLabel  # noqa: E402
 
 from mihome.core import adapters, catalog  # noqa: E402
 from mihome.core.catalog import PROFILES  # noqa: E402
@@ -44,6 +44,7 @@ from mihome.core.spec import PropertySpec, ValueOption, parse_raw  # noqa: E402
 from mihome.core.store import DeviceState, RoomView, _card_props  # noqa: E402
 from mihome.core.tree import DeviceNode  # noqa: E402
 from mihome.ui import theme  # noqa: E402
+from mihome.ui.wall import DragGhost, rounded_shot  # noqa: E402
 from mihome.ui.card_controls import ROW_H, CardSeg  # noqa: E402
 import mihome.ui.card_templates as card_templates  # noqa: E402
 from mihome.ui.card_templates import (  # noqa: E402
@@ -1085,6 +1086,97 @@ def main() -> int:
     dlg_l._sync()
     check("pending + scene=0 → 保留刚选的段（不闪）", seg.value(), 7)
     dlg_l.deleteLater()
+
+    print("\n8) 拖动快照：四角的黑块要抠掉")
+    # ``QWidget.grab()`` 出的是不透明位图，卡片自绘只铺了圆角矩形，四角从来没被画过
+    # → 拖动时四块黑角（用户 11-13 报）。这里连**真起拖**那一段一起验：
+    # 直接调 ``_begin_drag``，再从 ghost 的 pixmap 上读四角 alpha。
+    plain = card.grab().toImage()
+    check("反向证明：直接 grab 的四角是不透明的",
+          plain.pixelColor(0, 0).alpha(), 255)
+    shot = rounded_shot(card)
+    simg = shot.toImage()
+    w, h = simg.width(), simg.height()
+    corners = [simg.pixelColor(x, y).alpha()
+               for x, y in ((0, 0), (w - 1, 0), (0, h - 1), (w - 1, h - 1))]
+    check("抠完四个角都是全透明", corners, [0, 0, 0, 0])
+    check("抠完卡片中心还是不透明", simg.pixelColor(w // 2, h // 2).alpha(), 255)
+    check("直边中点没被抠（上边中点不透明）",
+          simg.pixelColor(w // 2, 1).alpha(), 255)
+    # 圆角 18：角上 (2,2) 离弧心 22.6 > 18 → 在外；离角最近的那条弧内侧必须留着
+    check("角外 2px 处也抠干净了", simg.pixelColor(2, 2).alpha(), 0)
+    check("圆角弧内侧没被多抠", simg.pixelColor(14, 14).alpha(), 255)
+    check_true("快照尺寸 / DPR 与控件一致",
+               (shot.width(), shot.height()) == (card.width(), card.height())
+               and shot.devicePixelRatio() == card.grab().devicePixelRatio(),
+               f"{shot.width()}x{shot.height()}@{shot.devicePixelRatio()}")
+
+    # 真起拖：按下那一步（_on_drag_press）负责登记卡片与所在分区，这里照着摆一遍，
+    # 再调 _begin_drag —— 直接调 _begin_drag 会留下"已开始但没登记卡片"的怪状态。
+    wcard = next(iter(wall.findChildren(DeviceCard)))
+    section = wall._section_of(wcard)
+    check_true("墙上的卡片找得到所属分区", section is not None)
+    wall._drag_card = wcard
+    wall._drag_section = section
+    wall._drag_origin = section.flow.index_of(wcard) if section else -1
+    wall._begin_drag(wcard, wcard.mapToGlobal(QPoint(wcard.width() // 2, 8)))
+    app.processEvents()
+    ghost = wall._drag_ghost
+    check_true("起拖后有浮动快照", ghost is not None)
+    if ghost is not None:
+        gimg = ghost.pixmap().toImage()
+        check("浮窗快照四角透明",
+              [gimg.pixelColor(x, y).alpha()
+               for x, y in ((0, 0), (gimg.width() - 1, 0),
+                            (0, gimg.height() - 1),
+                            (gimg.width() - 1, gimg.height() - 1))],
+              [0, 0, 0, 0])
+        check_true("浮窗快照不是空图",
+                   gimg.pixelColor(gimg.width() // 2, gimg.height() // 2).alpha() == 255)
+    wall._finish_drag(commit=False)
+    app.processEvents()
+    check_true("取消后快照已销毁", wall._drag_ghost is None)
+
+    # 光有"pixmap 四角 alpha=0"还不够：真正铺到屏幕上的是**容器控件**。
+    # 第一版用 QLabel 装 pixmap，QLabel 是普通子控件，绘制前会先按调色板把矩形
+    # 铺一遍（离屏 #EFEFEF、深色主题下近黑），抠掉的四角就露这层底色——用户
+    # 11-13 二次报"其他几个角还是黑块"就是它。这里把快照铺到**红底**上验：
+    # 四角必须还是红的，不能被容器自己的底色盖掉。
+    def on_backdrop(widget: object, base: str) -> QImage:
+        canvas = QImage(w, h, QImage.Format_ARGB32_Premultiplied)
+        canvas.fill(QColor(base))
+        painter = QPainter(canvas)
+        widget.render(painter, QPoint(0, 0))
+        painter.end()
+        return canvas
+
+    red = "#FF0000"
+    container = DragGhost(None, shot)
+    container.resize(card.width(), card.height())
+    cimg = on_backdrop(container, red)
+    check("容器四角露出的是下层背景（不是自己的底色）",
+          [cimg.pixelColor(x, y).name()
+           for x, y in ((0, 0), (w - 1, 0), (0, h - 1), (w - 1, h - 1))],
+          [red.lower()] * 4)
+    check_true("容器中心画的是卡片", cimg.pixelColor(w // 2, h // 2).name() != red.lower(),
+               cimg.pixelColor(w // 2, h // 2).name())
+
+    # 反向证明：同一张 pixmap 装进 QLabel，四角就被底色吃掉
+    probe = QLabel()
+    probe.setPixmap(shot)
+    probe.resize(card.width(), card.height())
+    limg = on_backdrop(probe, red)
+    check_true("反向证明：QLabel 会把四角铺成自己的底色",
+               limg.pixelColor(0, 0).name() != red.lower(),
+               limg.pixelColor(0, 0).name())
+
+    # 弧线上不许出现"白边/毛边"：卡片是深色，边缘的半透明像素应该还是卡片色，
+    # 而不是 card 内缩 0.5px 露出来的那圈调色板底色（用户说的"锯齿"其实是它）。
+    lightish = [(x, y) for y in range(0, 20) for x in range(0, 20)
+                if 0 < simg.pixelColor(x, y).alpha() < 255
+                and min(simg.pixelColor(x, y).red(), simg.pixelColor(x, y).green(),
+                        simg.pixelColor(x, y).blue()) > 200]
+    check("左上角弧线上没有白色毛边", len(lightish), 0)
 
     print()
     if FAILS:

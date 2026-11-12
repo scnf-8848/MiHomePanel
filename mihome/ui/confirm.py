@@ -17,21 +17,27 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QDialog, QHBoxLayout, QLabel, QPushButton, QVBoxLayout, QWidget
 
 from . import theme
+# 焦点策略与次要按钮样式都是四个自动化窗口 + 这里共用的（理由见各自 docstring）
+from .automation_style import ghost_qss, tab_focus_only
 from .chrome import TitleBar, WindowFrame, exec_with_dim_click, surface_bg, surface_border
 
 
 def _qss(p: theme.Palette, danger: bool) -> str:
-    off = theme.blend(p.bg, p.text, 0.06)
     ok = "#E5484D" if danger else theme.ACCENT_GREEN
+    radius = theme.RADIUS_BUTTON_SOFT
     return (
         "QDialog{background:transparent;}"
         f"QLabel{{color:{p.text};}}"
-        f"QPushButton{{border:none;border-radius:{theme.RADIUS_BUTTON}px;"
-        f"padding:10px 22px;font-size:13px;}}"
-        f"QPushButton#Ghost{{background:{p.bg_soft};color:{p.text_soft};}}"
-        f"QPushButton#Ghost:hover{{background:{off};color:{p.text};}}"
+        # 「圆角矩形」不是胶囊：40px 高的按钮给 20px 圆角就成胶囊了（用户 11-13 定）
+        # padding 11/22 + 无边框，是和 ``ghost_qss`` 里 1px 边框 + 10/21 对齐的
+        # 外框尺寸——两半按钮看起来一样大（用户 11-13 报"尺寸没统一"）。
+        f"QPushButton{{border:none;border-radius:{radius}px;"
+        f"padding:11px 22px;font-size:13px;}}"
         f"QPushButton#Primary{{background:{ok};color:#FFFFFF;font-weight:600;}}"
-    )
+        f"QPushButton#Primary:hover{{background:{theme.blend(ok, '#FFFFFF', 0.12)};}}"
+        f"QPushButton#Primary:pressed{{background:{theme.blend(ok, p.bg, 0.18)};}}"
+        f"QPushButton#Primary:focus{{background:{theme.blend(ok, '#FFFFFF', 0.22)};}}"
+    ) + ghost_qss(p)
 
 
 class ConfirmDialog(QDialog):
@@ -91,6 +97,7 @@ class ConfirmDialog(QDialog):
 
         self.adjustSize()
         self.setFixedWidth(max(400, self.sizeHint().width()))
+        tab_focus_only(self)
 
 
 def confirm(

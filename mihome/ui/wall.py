@@ -18,16 +18,19 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import QEvent, QPoint, QPointF, QRect, Qt, QUrl, Signal
+from PySide6.QtCore import QEvent, QPoint, QPointF, QRect, QRectF, Qt, QUrl, Signal
 from PySide6.QtGui import (
     QColor,
     QDesktopServices,
     QFont,
     QFontMetrics,
     QGuiApplication,
+    QImage,
     QPainter,
     QPainterPath,
     QPen,
+    QPixmap,
+    QRegion,
 )
 from PySide6.QtWidgets import (
     QFrame,
@@ -62,6 +65,82 @@ def matches(state: DeviceState, query: str) -> bool:
     fields = [state.name, state.room, state.card.profile.label, state.node.model]
     fields += [g.label for g in state.card.gangs]
     return any(query in f.lower() for f in fields if f)
+
+
+def rounded_shot(widget: QWidget) -> QPixmap:
+    """把部件画进一张**四角透明**的位图里，给拖动排序时的浮动快照用。
+
+    不能走"先 ``grab()`` 再抠角"那条路（11-13 试过两版都不成）：
+
+    * ``grab()`` 得到的是**不透明**位图。卡片自绘只铺一个圆角矩形，四角那几像素
+      从没被画过，在不透明位图里就是黑的 → 拖动时四块黑角；
+    * 事后用 mask + ``DestinationIn`` 抠掉也不行：卡片自己的圆角**已经在黑底上
+      混过一次色**了，弧线那几像素是 ``卡片色×α + 黑×(1-α)``，再抠一次只会得到
+      一圈更暗的描边 + 明显的阶梯（用户 11-13 二次反馈"边缘不光滑、有锯齿"）。
+
+    所以这里换个顺序：**先备一张透明画布，用圆角路径裁好，再让卡片往上画**。
+    卡片自绘时宁可"画满一个直角"，多出来的部分会被裁掉；弧线上的像素只和
+    透明混一次色，颜色干净、边缘就是 Qt 自己的抗锯齿。
+
+    两个必须一起做的细节：
+
+    * ``RenderFlags(DrawChildren)``——**不带** ``DrawWindowBackground``。默认那面
+      旗子会先按调色板把控件矩形铺一遍（离屏是 ``#EFEFEF``，深色主题下近黑），
+      卡片自己有 0.5px 内缩，那圈铺底色就从弧线边缘透出来，成了一圈浅/深毛边
+      ——正是用户说的"锯齿"。
+    * ``devicePixelRatio`` 通过 ``painter.scale`` 折算：位图是物理像素、控件坐标是
+      逻辑像素，不折的话高 DPI 上会被放大一圈。
+    """
+    dpr = widget.devicePixelRatioF() or 1.0
+    w, h = widget.width(), widget.height()
+    img = QImage(max(1, round(w * dpr)), max(1, round(h * dpr)),
+                 QImage.Format_ARGB32_Premultiplied)
+    img.fill(Qt.transparent)
+    painter = QPainter(img)
+    painter.setRenderHint(QPainter.Antialiasing)
+    painter.setRenderHint(QPainter.SmoothPixmapTransform)
+    painter.scale(dpr, dpr)
+    clip = QPainterPath()
+    clip.addRoundedRect(QRectF(0, 0, w, h), theme.RADIUS_CARD, theme.RADIUS_CARD)
+    painter.setClipPath(clip)
+    widget.render(painter, QPoint(0, 0), QRegion(),
+                  QWidget.RenderFlags(QWidget.DrawChildren))
+    painter.end()
+    out = QPixmap.fromImage(img)
+    out.setDevicePixelRatio(dpr)
+    return out
+
+
+class DragGhost(QWidget):
+    """拖动时的浮动快照：只画那张透明位图，**不铺任何底色**。
+
+    用 ``QLabel`` 装 pixmap 会踩一个很隐蔽的坑：``QLabel`` 是普通子控件，绘制前
+    Qt 会先按调色板把它的矩形铺一遍（离屏默认是浅灰 ``#EFEFEF``，深色主题下接近
+    纯黑）。位图抠掉的那四个角就露出这层底色 —— 看起来"黑块还在"，而且弧线上的
+    半透明像素还要跟这层底色再混一次，边上一圈浅色/深色毛边，像锯齿（用户 11-13
+    二次反馈"只改了左上角、其他角还是黑块、边也不光滑"）。
+
+    ``WA_TranslucentBackground`` 让它不铺底，四角露出的是**下面已经画好的墙**。
+    """
+
+    def __init__(self, parent: QWidget, shot: QPixmap) -> None:
+        super().__init__(parent)
+        self._shot = shot
+        self.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setAttribute(Qt.WA_NoSystemBackground)
+        # 逻辑尺寸（= 控件尺寸）：pixmap 自己带 dpr，resize 按逻辑像素算
+        dpr = shot.devicePixelRatio() or 1.0
+        self.resize(round(shot.width() / dpr), round(shot.height() / dpr))
+
+    def pixmap(self) -> QPixmap:
+        """给验证脚本读四角 alpha 用（别按 QLabel 的接口想它）。"""
+        return self._shot
+
+    def paintEvent(self, event) -> None:  # noqa: N802 - Qt 回调
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.SmoothPixmapTransform)
+        painter.drawPixmap(0, 0, self._shot)
 
 
 class _RoomHeader(QWidget):
@@ -458,7 +537,7 @@ class WallView(QScrollArea):
         self._drag_section: RoomSection | None = None
         self._drag_origin = -1
         self._drag_started = False
-        self._drag_ghost: QLabel | None = None
+        self._drag_ghost: DragGhost | None = None
         self._drag_grab = QPoint()
 
     # -- 构建 ------------------------------------------------------------
@@ -926,13 +1005,11 @@ class WallView(QScrollArea):
         self._drag_started = True
         # 拖动时画面没有意义，而且会一直占着观看位
         self._camera_ctl.stop_active("拖动排序")
-        pix = card.grab()
+        pix = rounded_shot(card)
         card_pos = card.mapTo(self.viewport(), QPoint(0, 0))
         vp_pos = self.viewport().mapFromGlobal(global_pos)
         self._drag_grab = vp_pos - card_pos
-        ghost = QLabel(self.viewport())
-        ghost.setPixmap(pix)
-        ghost.setAttribute(Qt.WA_TransparentForMouseEvents)
+        ghost = DragGhost(self.viewport(), pix)
         ghost.setGeometry(card_pos.x(), card_pos.y(), card.width(), card.height())
         ghost.show()
         ghost.raise_()
@@ -1065,4 +1142,4 @@ class WallView(QScrollArea):
             self.build()
 
 
-__all__ = ["WallView", "matches"]
+__all__ = ["DragGhost", "WallView", "matches", "rounded_shot"]
