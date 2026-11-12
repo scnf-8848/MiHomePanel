@@ -68,7 +68,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable
 
@@ -76,6 +76,7 @@ from PySide6.QtCore import QPoint, QSize, Signal
 from PySide6.QtWidgets import QVBoxLayout, QWidget
 
 from ..core import geek
+from ..core.catalog import format_value
 from . import theme
 from . import card_controls
 from .card_controls import (
@@ -251,6 +252,15 @@ class CardStyle:
     #: 判据是**静态能力**（规格里有没有 ``mode``），不看运行时值：样式菜单不能
     #: 跟着轮询变，否则设备一侧改设置，菜单里就凭空多出/少掉一项。
     hide_wireless: bool = False
+    #: 副标题自己拼一句话（``(card, values) -> str``）。空 = 走
+    #: ``catalog.summary_line`` 的指标摘要，再没有就"已开启 / 已关闭"。
+    #: 风扇是第一个用户：2×1 的第二行要塞「角度 + 风速」两个控件，标签各吃掉
+    #: 30px，五段轨道的每段只剩 26px。把这句"这两格是什么"挪到副标题之后，
+    #: 第二行就不画标签了（见 ``summary_slots`` 与 ``FanBody._hide_label``）。
+    summary: Callable[[Any, Mapping[tuple[int, int], Any]], str] | None = None
+    #: 副标题**已经在说**的槽位。body 不画这些槽位的标签，把宽度让给控件。
+    #: 只在摘要真的在显示时生效（判据收在 ``summary_text`` 里，别在两处各写一遍）。
+    summary_slots: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         # 声明期就炸，别等菜单里显示成"宽卡 3×1"才发现。注册表是模块级常量，
@@ -301,6 +311,20 @@ class CardStyle:
             BODY_FAN,
         )
 
+    def summary_text(self, state: DeviceState) -> str:
+        """副标题这一帧要写的话；空串 = 没有，调用方退回"已开启 / 已关闭"。
+
+        **关着的时候不报**：风扇关了还写「扫风角度 60° · 风速 3 档」，像是它正在
+        吹。所以"关机不报"这条判断放在这里，而不是散在调用方——问这句话的有两处：
+        ``DeviceCard._subtitle``（决定写什么）和 ``FanBody._hide_label``（决定要不
+        要让出标签宽度），两处各写一遍必然漂。
+        """
+        if self.summary is None:
+            return ""
+        if state.power is False:
+            return ""
+        return self.summary(state.card, state.values) or ""
+
     def available(self, card: CardSpec) -> bool:
         """这台设备能不能用这个样式。
 
@@ -346,6 +370,47 @@ class CardStyle:
                 return bool(ctl.prop.value_list)
             return bool(ctl.prop.value_range)
         return bool(ctl.prop.value_range)
+
+
+def fan_summary(card: CardSpec, values: Mapping[tuple[int, int], Any]) -> str:
+    """风扇副标题：「扫风角度 60° · 风速 3 档」。
+
+    为什么搬到副标题：2×1 的内容带只有两行，第二行是「角度 + 风速」。两个标签各
+    吃掉 30px 之后，五段角度的轨道只剩 134 宽（每段 26px，字号掉到 10）。这两格
+    叫什么一旦由副标题讲清楚（``summary_slots``），第二行就能不画标签，轨道拿满
+    整列 168（每段 33px，字回到 12）。
+
+    **风速按当前模式挑槽位**，和 ``FanBody`` 的双选格用同一个判据
+    （``card.speed_slot``）：不这么做，自然风下会同时报出「档位 3」和「风速 40」
+    两个数，用户没法判断哪个在生效。
+    """
+    parts: list[str] = []
+    angle = _slot_text(card, values, "swing_angle", "扫风角度")
+    if angle:
+        parts.append(angle)
+    mode = card.bound("mode")
+    mode_value = values.get(mode.prop.key) if mode is not None and mode.prop else None
+    slot = card.speed_slot(mode_value)
+    if slot is None:
+        # 没有型号规则（或模式值读不到）：和 FanBody 一样"档位优先"，不猜
+        slot = "fan_level" if card.bound("fan_level") is not None else "fan_speed"
+    speed = _slot_text(card, values, slot, "风速")
+    if speed:
+        parts.append(speed)
+    return " · ".join(parts)
+
+
+def _slot_text(card: CardSpec, values: Mapping[tuple[int, int], Any],
+               slot: str, name: str) -> str:
+    """``名字 值``；槽位没绑上或这一轮没读到值就返回空串（别写「角度 —」）。"""
+    ctl = card.bound(slot)
+    prop = ctl.prop if ctl is not None else None
+    if prop is None:
+        return ""
+    value = values.get(prop.key)
+    if value is None:
+        return ""
+    return f"{name} {format_value(prop, value)}"
 
 
 #: 同尺寸内按这里的顺序排列（``available_styles()`` 会先按尺寸升序分组）。
@@ -412,6 +477,11 @@ STYLES: tuple[CardStyle, ...] = (
         ),
         category="fan",
         body=BODY_FAN,
+        # 第二行（角度 / 风速）的文字搬到副标题：这两格是 312 宽里最缺宽度的两处，
+        # 标签一让就是 30px（五段角度从每段 26 → 33）。关灯时副标题退回「已关闭」，
+        # 标签自己会回来，所以关机状态下不会出现"两个控件都没名字"。
+        summary=fan_summary,
+        summary_slots=("swing_angle", "fan_level", "fan_speed"),
     ),
     # 摄像头默认仍是 1×1 标准卡（产品图）；2×2 是用户主动选的查看方式。
     # 没有槽位，body 由 ``CameraCard`` 铺一个 ``CameraView``，播放控件与详情页共用。

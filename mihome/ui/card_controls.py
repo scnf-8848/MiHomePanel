@@ -212,6 +212,7 @@ class CardSlider(WheelSafe, CardControl):
         label: str | None = None,
         gradient: bool = False,
         compact: bool = False,
+        show_value: bool = True,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(prop, palette, accent, label=label, parent=parent)
@@ -221,6 +222,9 @@ class CardSlider(WheelSafe, CardControl):
         #: ``compact`` 给详情页用：左侧不画属性名（那一行已经有名字了），
         #: 轨道从最左边开始，只给右侧数值留固定宽度。
         self._compact = compact
+        #: 右侧要不要画数值。风扇卡把这个数搬进了副标题（「风速 45」），留在
+        #: 轨道右边就是同一句话写两遍，还白占 48px——见 ``set_show_value``。
+        self._show_value = show_value
         self._unknown = False
         self._dragging = False
         self.setFixedHeight(self.HEIGHT)
@@ -257,6 +261,26 @@ class CardSlider(WheelSafe, CardControl):
         self._unknown = True
         self.update()
 
+    @property
+    def show_value(self) -> bool:
+        return self._show_value
+
+    def set_show_value(self, on: bool) -> None:
+        """轨道右侧那格数值要不要画。
+
+        省掉它的理由只有一个：**这个数已经写在别处了**（风扇卡把它搬进了副标题
+        「风速 45」）。省掉之后那 ``VALUE_W``（48px）全部并进轨道——2×1 的右列
+        只有 134 宽，等于轨道长了近六成。
+
+        但**拖动时仍然临时画出来**（见 ``paintEvent``）：数字是拖动唯一的精度
+        反馈，轨道长短只能看出"大/小"；而且它是浮在上面的小药丸，**不参与布局**，
+        否则按下的一瞬间轨道会缩短、拇指跟着跳一格。
+        """
+        on = bool(on)
+        if on != self._show_value:
+            self._show_value = on
+            self.update()
+
     # -- 栅格 ------------------------------------------------------------
     #: thumb 的最大半径（拖动时比静止大 1px）。轨道两端和「圆心可用范围」都按它算：
     #: 圆点的**圆心**必须离控件边缘至少一个半径，否则圆心落在 x0 时圆有一半画到
@@ -269,13 +293,17 @@ class CardSlider(WheelSafe, CardControl):
         注意这里返回的不是轨道两端：轨道要贴边画，见 :meth:`_track_span`。
         点击 / 拖动换算也走这个范围，所以轨道最外侧那几像素会被 clamp 到端点值，
         行为与「整条轨道可点」一致。
+
+        ``show_value`` 关掉时右侧不再留 ``VALUE_W``——省下的宽度直接给轨道
+        （换算也一起变，点是点得准的）。
         """
         r = self._THUMB_R
+        right = VALUE_W if self._show_value else 0
         if self._compact:
             x0 = 1.0 + r
-            return x0, float(max(x0 + 40, self.width() - VALUE_W - 2 - r))
+            return x0, float(max(x0 + 40, self.width() - right - 2 - r))
         x0 = float(LABEL_W + 8 + r)
-        x1 = float(max(x0 + 40, self.width() - VALUE_W - 8 - r))
+        x1 = float(max(x0 + 40, self.width() - right - 8 - r))
         return x0, x1
 
     def _track_span(self) -> tuple[float, float]:
@@ -343,14 +371,36 @@ class CardSlider(WheelSafe, CardControl):
             radius = THUMB_D / 2 + (1 if self._dragging else 0)
             p.drawEllipse(thumb, radius, radius)
 
-        draw_text(
-            p,
-            QRect(self.width() - VALUE_W, 0, VALUE_W, h),
-            "—" if self._unknown else self._fmt(self._value),
-            size=12,
-            color=self._p.text if not self._dimmed and not self._unknown else self._ink(),
-            align=Qt.AlignRight | Qt.AlignVCenter,
-        )
+        if self._show_value:
+            draw_text(
+                p,
+                QRect(self.width() - VALUE_W, 0, VALUE_W, h),
+                "—" if self._unknown else self._fmt(self._value),
+                size=12,
+                color=self._p.text if not self._dimmed and not self._unknown else self._ink(),
+                align=Qt.AlignRight | Qt.AlignVCenter,
+            )
+        elif self._dragging and not self._unknown:
+            # 数字搬去副标题了，但拖动这几百毫秒里它是唯一的精度反馈（轨道长短
+            # 只说明"大/小"）。所以按住时临时浮一个实心小药丸在右端：**不参与
+            # 布局**，松手即消失，轨道长度全程不变（改了布局拇指会在按下那一
+            # 瞬间跟着跳一格）。
+            label = self._fmt(self._value)
+            font = QFont(self.font())
+            font.setPixelSize(12)
+            width = QFontMetrics(font).horizontalAdvance(label) + 14
+            pill = QRect(self.width() - width - 2, int(cy - 9), width, 18)
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(self._accent))
+            p.drawRoundedRect(pill, 9, 9)
+            draw_text(
+                p,
+                pill,
+                label,
+                size=12,
+                color="#101317" if theme.luma(self._accent) > 140 else "#FFFFFF",
+                align=Qt.AlignCenter,
+            )
         p.end()
 
     # -- 交互 ------------------------------------------------------------

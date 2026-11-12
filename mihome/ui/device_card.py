@@ -400,7 +400,10 @@ class DeviceCard(QWidget):
             return "不支持控制"
         if st.card.gangs:
             return self._gang_subtitle(st)
-        text = summary_line(st.card, st.values)
+        # 样式自己拼的摘要优先（风扇：「扫风角度 60° · 风速 3 档」）。它同时是
+        # body 让出标签宽度的判据（``CardStyle.summary_slots``），所以"写什么"
+        # 和"body 少画什么"必须走同一个函数（``summary_text``）。
+        text = self._style.summary_text(st) or summary_line(st.card, st.values)
         if text:
             return text
         if st.power is None:

@@ -5,8 +5,9 @@
 
     ┌─────────────────────┬─────────────────────┐
     │ 左右扫风      [ 开关]│ 模式    [自然风|直吹风]│
-    │ 角度      [− 60°  +] │ 风速   [0–100 滑条]  │
+    │ [30|60|90|120|140]  │  [0 ────●──── 100]   │
     └─────────────────────┴─────────────────────┘
+      扫风角度 60 · 风速 45     ← 副标题（第二行的标签、"风速"右边的数值都搬到这儿）
 
 **列有语义**：左列永远是"往哪儿吹"（扫风开关 + 角度），右列是"吹多大"
 （模式 + 风速）。所以某台设备缺一项时，那一格空着，别的格子**不挪位置**——
@@ -22,6 +23,13 @@
 
 右下的"风速"格因此是个双选格：按当前模式显示滑条或胶囊，同格切换不改变布局
 （两个控件高度不同，各自在本格内垂直居中）。
+
+**第二行不画标签**：这两格的名字由卡片副标题报（「扫风角度 60 · 风速 45」，见
+``CardStyle.summary`` / ``summary_slots``）。2×1 的宽度本来就不够，两个标签各
+吃掉 30px，五段角度的轨道只剩 134 宽；让出去之后轨道拿满整列 168。
+滑条右侧那个数值同理——副标题已经在报风速，它再占 48px 就是白占
+（``CardSlider.set_show_value``，拖动时临时浮出来）。
+判据收在 ``CardStyle.summary_text`` 一处：副标题此刻不报（关机、没值）时标签回来。
 """
 
 from __future__ import annotations
@@ -42,10 +50,12 @@ from .card_controls import (
     make_control,
 )
 
-#: 左右两列的比例。左列要放"四字标签 + 44px 开关"（≈102），以及"角度 + 五段
-#: 轨道"（24 + 6 + 5×24 ≈ 150）；右列要放"两字标签 + 两段轨道"（≈90）和一条
-#: 能拖的滑条（≈120）。取 150/152 是让**五段角度**能放进左列（每段 24px 时
-#: "140" 用 11px 刚好），右列仍够放模式与风速。
+#: 左右两列的比例（312 − 10 间距 = 302 分成 168 / 134）。左列要放"四字标签 +
+#: 44px 开关"，以及**五段角度的轨道**——第二行的标签已经搬到副标题（见
+#: ``_hide_label``），所以那 168 全归轨道，每段 33px，"140" 用 12px 字就够。
+#: 右列留给"两字标签 + 两段模式轨道"和一条能拖的 0–100 滑条：标签与数值也交给
+#: 副标题之后，轨道吃满 134（≈86 → ≈132）。关机时两者都回来，所以建控件、算
+#: 选型时仍按**窄的那种情形**（标签 + 数值都在）算，否则关机后会挤到截字。
 COL_RATIO = (168, 134)
 #: 两列之间、同一列两行之间的间距
 CELL_GAP_X = 10
@@ -77,6 +87,13 @@ class _Cell:
     def current(self) -> CardControl | None:
         for widget in self._visible():
             return widget
+        return None
+
+    def visible_slot(self) -> str | None:
+        """这一格此刻显示的是哪个槽位（双选格会随模式变）。"""
+        for name, widget in self.widgets:
+            if not widget.isHidden():
+                return name
         return None
 
     def _visible(self) -> list[CardControl]:
@@ -115,9 +132,16 @@ class FanBody(QWidget):
         super().__init__(parent)
         self._palette = palette
         self._accent = accent
+        self._style = style
         self.controls: dict[str, CardControl] = {}
         self._cells: list[_Cell] = []
         self._labels: list[tuple[QRect, str]] = []
+        #: 副标题是不是正在替某些槽位"报数"——是的话这些格子不画标签，宽度让给
+        #: 控件。判据走 ``CardStyle.summary_text``（与 ``DeviceCard._subtitle``
+        #: 同一个函数），关灯时副标题退回"已关闭"，这里就自动变回 False。
+        self._labels_off = False
+        #: 最近一次同步的状态快照：``_hide_label`` 要问"这一格的值副标题到底写没写"
+        self._state: object | None = None
         self._build(state)
 
     # -- 构建 ------------------------------------------------------------
@@ -134,6 +158,11 @@ class FanBody(QWidget):
 
     def _build(self, state: object) -> None:
         card = state.card
+        # 标签让不让，第一步就得知道：它决定"这一格给控件多少宽"，而**选哪种控件**
+        # （轨道还是步进器）正是按那个宽度在构造期拍死的。等建完控件再改宽度只是
+        # 缩字，形态不会变。
+        self._labels_off = bool(self._style.summary_text(state))
+        self._state = state
         for col, slots in self.CELLS:
             cell = _Cell(col=col, slots=slots, dual=tuple(slots) == SPEED_SLOTS)
             # 建控件时还不知道真实宽度（Qt 还没给几何），用尺寸档定死的标称宽
@@ -142,9 +171,15 @@ class FanBody(QWidget):
                 ctl = card.bound(slot)
                 if ctl is None or ctl.prop is None:
                     continue
-                # 标签宽度先按"候选里最长那个"估，量控件可用宽度时够用即可
+                # 标签宽度先按"候选里最长那个"估，量控件可用宽度时够用即可。
+                # 副标题正在替这个槽位报数时按 0 算——那才是它的常态宽度
+                # （判据与 ``_hide_label`` 一致：槽位在名单里**且确实有值**）。
                 label_w = min(LABEL_MAX, self._label_width(ctl.label))
-                widget = self._make(ctl, col_w - label_w - LABEL_GAP)
+                if (self._labels_off and slot in self._style.summary_slots
+                        and state.get_prop(ctl.prop) is not None):
+                    label_w = 0
+                gap = LABEL_GAP if label_w else 0
+                widget = self._make(ctl, col_w - label_w - gap)
                 if widget is None:
                     continue
                 cell.widgets.append((slot, widget))
@@ -225,17 +260,48 @@ class FanBody(QWidget):
                 ctl = cell.current()
                 assert ctl is not None
                 h = ctl.height()
+                # 标签已经由副标题说了的格子不画标签，宽度全给控件（见
+                # ``_hide_label``）。没让出的格子照旧，标签宽按文字量出来。
+                hide = self._hide_label(cell)
+                lw = 0 if hide else cell.label_w
+                gap = LABEL_GAP if lw else 0
+                if isinstance(ctl, CardSlider):
+                    # 数值同理：副标题既然在报「风速 45」，轨道右边那个数就是
+                    # 同一句话写第二遍，还白占 48px。让出来之后右列的轨道从
+                    # ≈86 变成 ≈132（见 ``CardSlider.set_show_value``；拖动时
+                    # 会临时浮一个数字，那时它是唯一的精度反馈）。
+                    ctl.set_show_value(not hide)
                 ctl.setGeometry(
-                    x + cell.label_w + LABEL_GAP,
+                    x + lw + gap,
                     y + (ROW_H - h) // 2,
-                    max(40, width - cell.label_w - LABEL_GAP),
+                    max(40, width - lw - gap),
                     h,
                 )
-                self._labels.append(
-                    (QRect(x, y, cell.label_w, ROW_H), cell.label)
-                )
+                if lw:
+                    self._labels.append((QRect(x, y, lw, ROW_H), cell.label))
                 y += ROW_H + CELL_GAP_Y
         self.update()
+
+    def _hide_label(self, cell: _Cell) -> bool:
+        """这一格的标签是不是可以省掉。
+
+        判据三条，缺一不可：
+
+        1. 副标题**此刻真的在写**（``summary_text`` 非空——关机时它是空的）；
+        2. 这一格显示的槽位在 ``summary_slots`` 里（"副标题答应替它报数"）；
+        3. 这一格**确实有值**（副标题只写读到的值，没读到就不提，那标签得留着）。
+
+        三条合起来保证"省掉的标签一定在别处看得见"。也正因如此，这件事必须跟着
+        实时状态走，而不是在 ``_build`` 里一锤定音——控件不重建，只改布局宽度。
+        """
+        if not self._labels_off or self._state is None:
+            return False
+        slot = cell.visible_slot()
+        if slot is None or slot not in self._style.summary_slots:
+            return False
+        widget = dict(cell.widgets).get(slot)
+        prop = getattr(widget, "prop", None)
+        return prop is not None and self._state.get_prop(prop) is not None
 
     def resizeEvent(self, event) -> None:  # noqa: N802
         super().resizeEvent(event)
@@ -288,6 +354,9 @@ class FanBody(QWidget):
             self._layout()
 
     def sync(self, state: object) -> None:
+        # 先定"标签要不要让"：``_sync_speed`` 会顺手重排一次，那之前就得是对的
+        self._labels_off = bool(self._style.summary_text(state))
+        self._state = state
         self._sync_speed(state)
         for slot, widget in self.controls.items():
             ctl = state.card.bound(slot)

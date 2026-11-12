@@ -49,6 +49,14 @@ from mihome.ui.card_controls import (  # noqa: E402
     make_control,
 )
 from mihome.ui.fan_body import FanBody  # noqa: E402
+from mihome.ui.device_card import DeviceCard  # noqa: E402
+
+
+class _Icons:
+    """``DeviceCard`` 只拿它取型号图标；离屏渲染不需要真的图标。"""
+
+    def ensure(self, model: str) -> None:
+        pass
 
 FAILS: list[str] = []
 
@@ -605,6 +613,83 @@ def test_wiring(app: QApplication) -> None:
     check("摘掉接线后同样点击不再发请求（证明上面测的是接线）", idle, [])
 
 
+def test_summary(app: QApplication) -> None:
+    """副标题替第二行报数，第二行就不画标签（2026-11-12 用户提）。
+
+    用户的原话：副标题只写"已开启/已关闭"太浪费——开启时改成「扫风角度 xx
+    风速 xx」同样看得懂，却能把第二行两个标签的宽度让给控件（五段角度从每段
+    26px 回到 33px）。这一组要守住三件事：
+
+    1. 副标题**只在开且有值**时报数（关着报设定值像它正在吹）；
+    2. 让出的只有第二行那两格，开关和模式的名字照旧；
+    3. 关机 / 没值的时候标签会回来——不能出现"标签没了、副标题也没提"的格子。
+    """
+    print("\n9) 副标题替「角度 / 风速」报数")
+    card = build_card(parse_raw(FAN_RAW), did="f1", model="dmaker.fan.p5c")
+    style = ct.style_by_id(ct.FAN_CONTROLS)
+
+    def card_of(**kw) -> DeviceCard:
+        return DeviceCard(state_of(card, values=values_for(card, **kw)), _Icons(),
+                          theme.DARK, style)
+
+    check("开启时副标题报角度与风速",
+          card_of(power=True, mode=0, fan_speed=45, fan_level=2,
+                  swing_h=True, swing_angle=60)._subtitle(),
+          "扫风角度 60 · 风速 45")
+    check("自然风只报档位，不同时报两个数",
+          card_of(power=True, mode=1, fan_level=2, swing_angle=60,
+                  swing_h=True)._subtitle(),
+          "扫风角度 60 · 风速 2挡")
+    check("关着不报设定值（像是它正在吹）",
+          card_of(power=False, mode=0, fan_speed=45, swing_angle=60)._subtitle(),
+          "已关闭")
+
+    # 开着的 body：第二行两格不画标签，控件吃满整列
+    body = _fan_body(card, values_for(card, power=True, mode=0, fan_speed=45,
+                                      fan_level=2, swing_h=True, swing_angle=60))
+    labels = sorted(t for _, t in body._labels)  # noqa: SLF001
+    check("第二行两个标签让出来了（只剩开关和模式）", labels, ["左右扫风", "模式"])
+    cols = FanBody._column_x(312)  # noqa: SLF001
+    angle = body.controls["swing_angle"].geometry()
+    check("角度轨道吃满左列", (angle.left(), angle.width()), (0, cols[0][1]))
+    speed = body.controls["fan_speed"].geometry()
+    check("风速滑条吃满右列", (speed.left(), speed.width()),
+          (cols[1][0], cols[1][1]))
+
+    # 滑条右侧那个数值也交给副标题了：轨道因此长了整整 VALUE_W（48px）。
+    # 用"开/关 show_value 两测"来断言，而不是背一个绝对坐标——这样 VALUE_W
+    # 改了这条依然成立，只有"数值真的不再占位"才会红。
+    slider = body.controls["fan_speed"]
+    check("风速滑条的数值交给副标题了", slider.show_value, False)
+    span_off = slider._span()[1] - slider._span()[0]  # noqa: SLF001
+    slider.set_show_value(True)
+    span_on = slider._span()[1] - slider._span()[0]  # noqa: SLF001
+    slider.set_show_value(False)
+    check_true("为此轨道长了 48px（VALUE_W）", abs(span_on + 48 - span_off) < 1.5,
+               f"{span_off:.0f} vs {span_on:.0f}")
+
+    # 关机：控件不重建，只是把宽度让回去，标签跟着回来
+    body.sync(state_of(card, values=values_for(card, power=False, mode=0,
+                                               fan_speed=45, swing_angle=60)))
+    labels = sorted(t for _, t in body._labels)  # noqa: SLF001
+    check("关机后标签回来", labels, ["左右扫风", "模式", "角度", "风速"])
+    check("关机后数值也回来（副标题不再报它）",
+          body.controls["fan_speed"].show_value, True)
+    angle = body.controls["swing_angle"].geometry()
+    check_true("角度轨道把标签宽度让了回去", angle.left() > 0, str(angle))
+
+    # 槽位绑上了但这一轮没读到值：副标题不提它，标签也不能省
+    empty = dict(values_for(card, power=True, mode=0, swing_angle=60, swing_h=True))
+    body.sync(state_of(card, values=empty))
+    check("风速没值时副标题只报角度",
+          card_of(power=True, mode=0, swing_angle=60, swing_h=True)._subtitle(),
+          "扫风角度 60")
+    labels = [t for _, t in body._labels]  # noqa: SLF001
+    check_true("没值的那格标签留着", "风速" in labels, str(labels))
+    check("没值的那格数值也留着（副标题没提它）",
+          body.controls["fan_speed"].show_value, True)
+
+
 def main() -> int:
     app = QApplication.instance() or QApplication([])
     font = QFont("Microsoft YaHei UI")
@@ -619,6 +704,7 @@ def main() -> int:
     test_seg(app)
     test_fan_body(app)
     test_wiring(app)
+    test_summary(app)
 
     print()
     if FAILS:

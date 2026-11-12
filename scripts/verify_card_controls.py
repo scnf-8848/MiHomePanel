@@ -187,6 +187,21 @@ def test_slider(app: QApplication) -> None:
     check_true("thumb 在最左端不出界", x0 - c._THUMB_R >= 0, f"x0={x0:.1f} r={c._THUMB_R}")
     check_true("thumb 在最右端不出界", x1 + c._THUMB_R <= c.width() - VALUE_W, f"x1={x1:.1f}")
 
+    # show_value=False：数值那格并进轨道（风扇卡把风速搬进了副标题，见
+    # ``FanBody._layout``）。默认必须是 True——详情页和别的卡片照旧画数字，
+    # 这里守住"开关"本身，别哪天默认翻过去把所有人的数字都吞掉。
+    check("滑条默认画数值", c.show_value, True)
+    c.set_show_value(False)
+    x0n, x1n = c._span()
+    check_true("关掉数值后轨道正好长了 VALUE_W",
+               abs((x1n - x0n) - (x1 - x0) - VALUE_W) < 1.5,
+               f"{x1n - x0n:.0f} vs {x1 - x0:.0f}")
+    check_true("轨道右端贴到内边距（不再给数字留位）",
+               c.width() - (x1n + c._THUMB_R) <= 3,
+               f"留白 {c.width() - (x1n + c._THUMB_R):.0f}px")
+    c.set_show_value(True)
+    check("再打开数值，轨道回到原位", round(c._span()[1]), round(x1))
+
     commits: list[int] = []
     c.committed.connect(commits.append)
 
