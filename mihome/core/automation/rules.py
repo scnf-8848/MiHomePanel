@@ -9,7 +9,7 @@
 
     {id, name, enabled, keys, condition_mode, conditions[], actions[], cooldown_ms}
     conditions[] = {type, op, arg}        空数组 = 无条件
-    actions[]    = {type:"virtual_event", name} | {type:"delay", ms}
+    actions[]    = {type:"virtual_event", name} | {type:"delay", ms[, unit:"s"]}
 
 **软删除**：列表里的「删除」只是打 ``deleted`` 标记（连同 ``deleted_at`` 一起落盘），
 规则仍留在 ``rules.json`` 里，但 ``active()`` / ``enabled_keys()`` / ``rules_for()``
@@ -62,6 +62,8 @@ OPS: dict[str, str] = {
     "equals": "等于",
 }
 
+#: 落盘的动作类型。界面上的「延迟（秒）」不新增类型，它是 ``delay`` 的另一种
+#: 录入刻度（见 ``Action.unit``）——两种规格存的是同一个 ``ms``。
 ACTION_TYPES = ("virtual_event", "delay")
 
 
@@ -108,15 +110,26 @@ class Condition:
 
 @dataclass(slots=True)
 class Action:
-    """一个动作。``virtual_event`` 用 ``name``，``delay`` 用 ``ms``。"""
+    """一个动作。``virtual_event`` 用 ``name``，``delay`` 用 ``ms``。
+
+    ``unit`` 只是**输入刻度**，语义永远由 ``ms`` 决定：校验、存盘、引擎执行全按
+    毫秒算。留着它是为了重开编辑页时「延迟（秒）」那一行仍显示 ``30`` 而不是
+    ``30000``——用户 11-13 要的是两种录入规格（毫秒 / 秒），不是两套数据。
+    旧文件没有这个键，读进来就是 ``"ms"``；非 ``"s"`` 的值一律退回 ``"ms"``。
+    """
 
     type: str = "virtual_event"
     name: str = ""
     ms: int = 0
+    unit: str = "ms"
 
     def to_dict(self) -> dict[str, Any]:
         if self.type == "delay":
-            return {"type": "delay", "ms": self.ms}
+            out: dict[str, Any] = {"type": "delay", "ms": self.ms}
+            # 毫秒是默认刻度，不写这个键，rules.json 对旧版本仍然是原样
+            if self.unit == "s":
+                out["unit"] = "s"
+            return out
         return {"type": "virtual_event", "name": self.name}
 
     @classmethod
@@ -125,7 +138,8 @@ class Action:
             return None
         kind = _text(raw.get("type"), 40)
         if kind == "delay":
-            return cls(kind, "", _integer(raw.get("ms"), 0, 0, MAX_DELAY_MS))
+            unit = "s" if _text(raw.get("unit"), 4) == "s" else "ms"
+            return cls(kind, "", _integer(raw.get("ms"), 0, 0, MAX_DELAY_MS), unit)
         if kind == "virtual_event":
             return cls(kind, _text(raw.get("name"), 120), 0)
         return None
@@ -240,7 +254,9 @@ def validate_rule(rule: Rule) -> list[str]:
         if act.type == "virtual_event" and not act.name.strip():
             errors.append(f"动作 {i} 没填虚拟事件名")
         elif act.type == "delay" and not (0 <= act.ms <= MAX_DELAY_MS):
-            errors.append(f"动作 {i} 的延迟超出范围")
+            # 界面上延迟有两种录入刻度，上限只写毫秒的话「秒」档用户得自己换算
+            errors.append(f"动作 {i} 的延迟要在 0–{MAX_DELAY_MS} 毫秒"
+                          f"（{MAX_DELAY_MS // 1000} 秒）之间")
     if not any(a.type == "virtual_event" and a.name.strip() for a in rule.actions):
         errors.append("动作里至少要有一条「发虚拟事件」")
     if not (0 <= rule.cooldown_ms <= MAX_COOLDOWN_MS):

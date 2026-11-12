@@ -212,6 +212,21 @@ check("锁屏参数非法被抓", bool(validate_rule(base_rule(conditions=[
 check("比较符表覆盖所有条件类型", all(k in OPS for k in
       ("is", "is_not", "ge", "le", "contains", "equals")))
 
+# 延迟的两种录入规格（界面「＋ 延迟（毫秒）」/「＋ 延迟（秒）」）：unit 只是刻度，
+# 语义永远由 ms 决定；毫秒档不写这个键，旧 rules.json 与旧版本读者都不受影响。
+check("秒档落盘带 unit", Action("delay", ms=30000, unit="s").to_dict()
+      == {"type": "delay", "ms": 30000, "unit": "s"})
+check("毫秒档落盘没有 unit 键", "unit" not in Action("delay", ms=30000).to_dict())
+check("秒档能原样读回", (lambda a: a.unit == "s" and a.ms == 30000)(
+    Action.from_dict({"type": "delay", "ms": 30000, "unit": "s"})))
+check("没有 unit 的旧数据读成毫秒档",
+      Action.from_dict({"type": "delay", "ms": 30000}).unit == "ms")
+check("坏 unit 退回毫秒档而不是丢动作",
+      Action.from_dict({"type": "delay", "ms": 1000, "unit": "秒"}).unit == "ms")
+check("延迟越界提示写明两个刻度",
+      any("600 秒" in e for e in validate_rule(base_rule(actions=[
+          Action("virtual_event", name="A"), Action("delay", ms=10**9)]))))
+
 path = _TMP / "rules.json"
 rs = RuleSet(path)
 r1 = base_rule(id="a", keys="Ctrl+Alt+F7")
@@ -337,6 +352,16 @@ check("延迟后按序发第二个", emitter3.calls == ["A", "B"])
 check("队列结束有 done 日志", engine3.log[-1].outcome == DONE)
 check("延迟 2s 跑完后冷却也已到点", engine3.cooldown_remaining(seq_rule) == 0.0
       and clock3.t >= 102)
+
+# 日志按用户填的那把尺子写：设「30 秒」的人不该在日志里读到 30000 ms
+sec_rule = base_rule(actions=[Action("virtual_event", name="A"),
+                              Action("delay", ms=30000, unit="s")])
+engine_s, _, _, _ = make_engine(sec_rule)
+engine_s.trigger("Ctrl+Alt+F7")
+check("秒档延迟按秒记日志", any("延迟 30 秒" in x.detail for x in engine_s.log),
+      str([x.detail for x in engine_s.log]))
+check("毫秒档日志保持毫秒写法",
+      any("延迟 2000 ms" in x.detail for x in engine3.log))
 
 # 重入：延迟未跑完时再来一次
 engine4, clock4, sched4, emitter4 = make_engine(base_rule(cooldown_ms=0, actions=[

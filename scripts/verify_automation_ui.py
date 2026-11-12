@@ -22,6 +22,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 import tempfile
@@ -36,7 +37,7 @@ _TMP = Path(tempfile.mkdtemp(prefix="mihome-auto-ui-"))
 os.environ["MIHOME_DATA_DIR"] = str(_TMP / "data")
 
 from PySide6.QtCore import QObject, QPoint, Qt, Signal  # noqa: E402
-from PySide6.QtGui import QColor  # noqa: E402
+from PySide6.QtGui import QColor, QFontMetrics  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import (  # noqa: E402
     QApplication, QDialog, QFrame, QLabel, QLineEdit, QListWidget, QPushButton, QStyle,
@@ -44,7 +45,7 @@ from PySide6.QtWidgets import (  # noqa: E402
 )
 
 from mihome.core.automation import (  # noqa: E402
-    Action, Condition, LogEntry, Rule, RuleSet,
+    Action, Condition, LogEntry, Rule, RuleSet, validate_rule,
 )
 from mihome.ui import automation as A  # noqa: E402
 from mihome.ui import automation_style as AS  # noqa: E402
@@ -798,6 +799,209 @@ check("反向证明：按 p.bg 起算浅色下只剩一圈描边",
       contrast(theme.blend(theme.LIGHT.bg, theme.LIGHT.text, 0.12),
                theme.surface_bg(theme.LIGHT)) < 1.2,
       f"{contrast(theme.blend(theme.LIGHT.bg, theme.LIGHT.text, 0.12), theme.surface_bg(theme.LIGHT)):.2f}:1")
+
+# 15) 延迟两种录入规格（用户 11-13 第五条反馈：③ 里延迟要分「毫秒」「秒」两枚按钮）
+print("\n15) ③ 延迟两种规格：＋ 延迟（毫秒）/ ＋ 延迟（秒）")
+dsvc = FakeService(_TMP / "delay-units.json")
+ddlg = A.AutomationDialog(dsvc, theme.LIGHT)
+ddlg.resize(860, 900)
+ddlg.show()
+app.processEvents()
+texts = {b.text() for b in ddlg.findChildren(QPushButton)}
+check("三枚添加按钮都在",
+      {"＋ 发虚拟事件", "＋ 延迟（毫秒）", "＋ 延迟（秒）"} <= texts, str(sorted(texts)))
+check("旧的「＋ 延迟」不再单独存在", "＋ 延迟" not in texts)
+
+sec_btn, ms_btn = button_text(ddlg, "＋ 延迟（秒）"), button_text(ddlg, "＋ 延迟（毫秒）")
+QTest.mouseClick(sec_btn, Qt.LeftButton)
+app.processEvents()
+sec_row = ddlg._action_rows[-1]
+check("点「＋ 延迟（秒）」加的是秒档",
+      sec_row._unit() == "s" and sec_row.value().unit == "s", sec_row.kind.currentText())
+check("秒档默认值就是 1 秒（和毫秒档 1000 等值）",
+      sec_row.value_edit.text() == "1" and sec_row.value().ms == 1000,
+      sec_row.value_edit.text())
+check("秒档 placeholder 说的是秒", sec_row.value_edit.placeholderText().startswith("秒"),
+      sec_row.value_edit.placeholderText())
+QTest.mouseClick(ms_btn, Qt.LeftButton)
+app.processEvents()
+ms_row = ddlg._action_rows[-1]
+check("点「＋ 延迟（毫秒）」加的是毫秒档",
+      ms_row._unit() == "ms" and ms_row.kind.currentText() == "延迟（毫秒）",
+      ms_row.kind.currentText())
+check("毫秒档默认 1000", ms_row.value_edit.text() == "1000", ms_row.value_edit.text())
+
+# 下拉宽度：6 个全角字 + 左右内边距，窄了会把括号 elide 成省略号
+fm = QFontMetrics(sec_row.kind.font())
+check("下拉放得下「延迟（毫秒）」不省略",
+      sec_row.kind.width() - fm.horizontalAdvance("延迟（毫秒）") - 50 >= 0,
+      f"{sec_row.kind.width()} vs 字宽 {fm.horizontalAdvance('延迟（毫秒）')}")
+
+# 秒 → 毫秒只换算不重置（都是同一个量）；事件 ↔ 延迟才必须清空
+sec_row.value_edit.setText("30")
+check("秒档 30 → 30000 ms", sec_row.value().ms == 30000, str(sec_row.value().ms))
+sec_row.kind.setCurrentIndex(sec_row.kind.findData("delay"))
+check("切到毫秒档只换算成 30000", sec_row.value_edit.text() == "30000",
+      sec_row.value_edit.text())
+check("换算后仍然是同一个延迟", sec_row.value().ms == 30000 and sec_row.value().unit == "ms")
+sec_row.kind.setCurrentIndex(sec_row.kind.findData("delay_s"))
+check("切回秒档还是 30（没被重置成 1）", sec_row.value_edit.text() == "30",
+      sec_row.value_edit.text())
+sec_row.kind.setCurrentIndex(sec_row.kind.findData("virtual_event"))
+check("切到发事件才清空输入框", sec_row.value_edit.text() == "")
+sec_row.kind.setCurrentIndex(sec_row.kind.findData("delay_s"))
+check("从事件切回秒档拿到默认 1", sec_row.value_edit.text() == "1",
+      sec_row.value_edit.text())
+
+sec_row.value_edit.setText("1.5")
+check("秒档支持小数（1.5 秒 = 1500 ms）", sec_row.value().ms == 1500, str(sec_row.value().ms))
+sec_row.value_edit.setText("601")
+check("秒档超上限被拦", sec_row.value().ms > 600_000
+      and bool(validate_rule(Rule(id="u", name="n", keys="Ctrl+Alt+F7",
+                                  actions=[Action("virtual_event", name="A"),
+                                           sec_row.value()]))),
+      str(sec_row.value().ms))
+# 越界以前只有点保存后由 validate_rule 在底部说一句，现在是**就地**红字
+check("秒档超上限行内就说「不能超过 600 秒」",
+      "600 秒" in sec_row.hint.text() and sec_row.hint.isVisible(),
+      sec_row.hint.text())
+check("越界提示写明了多少秒",
+      any("600 秒" in e for e in validate_rule(Rule(
+          id="u", name="n", keys="Ctrl+Alt+F7",
+          actions=[Action("virtual_event", name="A"), sec_row.value()]))))
+
+# 精度（用户 11-13 专门问的）：执行精度是 1 ms → 毫秒档不收小数、秒档收到 3 位，
+# 超了要**明说**，不能静默四舍五入成另一个数。
+sec_row.value_edit.setText("0.5")
+check("秒档 1 位小数（0.5 秒 = 500 ms）", sec_row.value().ms == 500, str(sec_row.value().ms))
+sec_row.value_edit.setText("1.234")
+check("秒档 3 位小数照收（1.234 秒 = 1234 ms）",
+      sec_row.value().ms == 1234 and sec_row.format_error() == "",
+      f"{sec_row.value().ms} / {sec_row.format_error()!r}")
+sec_row.value_edit.setText("1.2345")
+check("秒档第 4 位小数被拦", "3 位小数" in sec_row.format_error(), sec_row.format_error())
+# 行内红字（用户 11-13 第六条反馈）：照①「注册状态：…」的样子长在本行右侧，
+# 边打边出，不再等点保存、也不在底部错误条重复。
+check("超位数立刻在行内出红字",
+      sec_row.hint.isVisible() and "3 位小数" in sec_row.hint.text(), sec_row.hint.text())
+check("行内红字挂在输入框右边（同一行，不是下面一行）",
+      sec_row.hint.geometry().left() >= sec_row.value_edit.geometry().right(),
+      f"edit.right={sec_row.value_edit.geometry().right()} hint.left={sec_row.hint.geometry().left()}")
+check("行内红字带 tooltip 说明为什么", bool(sec_row.hint.toolTip()), sec_row.hint.toolTip())
+check("超位数不是静默舍入（拦下来才算数）", ddlg._save(quiet=True) is False)
+check("保存被拦时底部错误条不再重复一遍", ddlg.error_label.text() == "",
+      ddlg.error_label.text())
+# 点真按钮走一遍：不弹 notice、窗口不关（坏值不许保存，但也不能把编辑内容关掉）
+_poped: list[tuple] = []
+_orig_notice = A.notice
+A.notice = lambda *a, **k: _poped.append(a)
+try:
+    ddlg._on_save()
+    app.processEvents()
+finally:
+    A.notice = _orig_notice
+check("坏值点「保存」不弹 notice", not _poped, str(_poped))
+check("坏值点「保存」窗口也不关（内容还在）", ddlg.isVisible())
+check("保存被拦时焦点回到出错那行的输入框",
+      ddlg.focusWidget() is sec_row.value_edit,
+      type(ddlg.focusWidget()).__name__)
+sec_row.value_edit.setText("1.2")
+check("改对之后红字立刻消失",
+      not sec_row.hint.isVisible() and sec_row.hint.text() == "", sec_row.hint.text())
+sec_row.value_edit.setText("abc")
+check("秒档乱填不会静默变 0", sec_row.value().ms < 0, str(sec_row.value().ms))
+check("秒档乱填报「要填数字」", "数字" in sec_row.format_error(), sec_row.format_error())
+
+ms_row.value_edit.setText("1.5")
+check("毫秒档不收小数点", "整数" in ms_row.format_error(), ms_row.format_error())
+check("毫秒档小数点不静默取整", ms_row.value().ms < 0 and ddlg._save(quiet=True) is False)
+check("毫秒档行内红字说「只能填整数」而不是范围",
+      "整数" in ms_row.hint.text() and "600000" not in ms_row.hint.text(),
+      ms_row.hint.text())
+ms_row.value_edit.setText("-5")
+check("毫秒档负号不当格式错", ms_row.format_error() == "", ms_row.format_error())
+check("负数行内报「不能小于 0」",
+      "小于 0" in ms_row.hint.text() and ddlg._save(quiet=True) is False,
+      ms_row.hint.text())
+ms_row.value_edit.setText("")
+check("空值行内报「要填延迟时间」", "延迟时间" in ms_row.hint.text(), ms_row.hint.text())
+check("空值时保存同样被拦", ddlg._save(quiet=True) is False)
+ms_row.value_edit.setText("2000")
+check("毫秒档正常值无格式问题", ms_row.format_error() == "" and ms_row.value().ms == 2000)
+check("正常值行内没有红字", not ms_row.hint.isVisible(), ms_row.hint.text())
+check("秒档 placeholder 提示可带小数",
+      "1.5" in sec_row.value_edit.placeholderText(),
+      sec_row.value_edit.placeholderText())
+
+# 红字是 11px 小字，压在卡片底（panel_bg）上：只换明度不改色相，两边都过 4.5:1。
+# 以前是写死的 #E5534B（浅 3.9 / 深 3.9），深色下读着明显吃力。
+for pal_name, pal in (("浅色", theme.LIGHT), ("深色", theme.DARK)):
+    tone = A._error_color(pal)
+    check(f"{pal_name}行内红字压在卡片底上 ≥ 4.5:1",
+          contrast(tone, theme.panel_bg(pal)) >= 4.5,
+          f"{tone} → {contrast(tone, theme.panel_bg(pal)):.2f}:1")
+check("两套主题的红字不是同一个值（各按自己的底调明度）",
+      A._error_color(theme.LIGHT) != A._error_color(theme.DARK))
+
+# 行内红字现在是**唯一**提示：出错的行要是滚在视野外，保存被拦时得把它滚进来，
+# 否则用户只看到窗口不关、看不到原因。
+scroll_rule = Rule(id="scroll1", name="很多动作", keys="Ctrl+Alt+F7",
+                   actions=[Action("delay", "", 1000) for _ in range(9)])
+dsvc.rules.add(scroll_rule)
+sd = A.AutomationDialog(dsvc, theme.LIGHT, "scroll1")
+sd.resize(860, 620)  # 最小高度：9 行动作肯定装不下
+sd.show()
+app.processEvents()
+sd._action_rows[-1].value_edit.setText("abc")
+app.processEvents()
+sb = sd.area.verticalScrollBar()
+check("前置：出错那行确实在视野外（滚动条在顶部）", sb.value() == 0, str(sb.value()))
+check("出错行在视野外时保存同样被拦", sd._save(quiet=True) is False)
+app.processEvents()
+check("保存被拦会滚到出错那一行", sb.value() > 0, f"{sb.value()} / {sb.maximum()}")
+check("并且把焦点交给它", sd.focusWidget() is sd._action_rows[-1].value_edit,
+      type(sd.focusWidget()).__name__)
+check("底部错误条依然不重复", sd.error_label.text() == "", sd.error_label.text())
+sd.close()
+
+# 3 位小数不是随便挑的：执行精度 1 ms，所以这个精度**往返无损**，再少就会出现
+# "存 1234 ms → 重开显示 1.2 秒 → 变成 1200 ms"这种自己改自己数据的事。
+lossless = A.ActionRow(Action("delay", ms=1234, unit="s"), theme.LIGHT, lambda: None,
+                       lambda *_: None, lambda *_: None)
+check("秒档 3 位小数往返无损（1234 ms ⇄ 1.234 秒）",
+      lossless.value_edit.text() == "1.234" and lossless.value().ms == 1234,
+      f"{lossless.value_edit.text()} → {lossless.value().ms}")
+check("这个值本身不算格式错（能保存）",
+      lossless.format_error() == "", lossless.format_error())
+lossless.deleteLater()
+
+# 落盘再打开：秒档仍然是秒档（unit 只影响显示，不该在重开时丢）
+saved_rule = Rule(id="unit1", name="秒档落盘", keys="Ctrl+Alt+F7", actions=[
+    Action("virtual_event", "极客版按键自动化执行"),
+    Action("delay", ms=30000, unit="s"),
+    Action("delay", ms=2000),
+])
+check("秒档落盘带 unit:s", '"unit": "s"' in json.dumps(saved_rule.to_dict()))
+dsvc.rules.add(saved_rule)
+reopened = A.AutomationDialog(dsvc, theme.LIGHT, "unit1")
+reopened.resize(860, 900)
+reopened.show()
+app.processEvents()
+check("重开后秒档行还是「延迟（秒）」",
+      reopened._action_rows[1].kind.currentText() == "延迟（秒）",
+      reopened._action_rows[1].kind.currentText())
+check("重开后秒档显示 30 而不是 30000",
+      reopened._action_rows[1].value_edit.text() == "30",
+      reopened._action_rows[1].value_edit.text())
+check("同一份规则里毫秒档行没被带偏",
+      reopened._action_rows[2].kind.currentText() == "延迟（毫秒）"
+      and reopened._action_rows[2].value_edit.text() == "2000",
+      f"{reopened._action_rows[2].kind.currentText()} / "
+      f"{reopened._action_rows[2].value_edit.text()}")
+check("重开后读回的值仍是 30000 ms",
+      reopened._action_rows[1].value().ms == 30000)
+reopened.close()
+ddlg.close()
 
 print(f"\n合计 {N} 项，失败 {len(FAILS)} 项")
 for line in FAILS:

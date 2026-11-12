@@ -25,6 +25,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Any, Callable
 
 from PySide6.QtCore import QSignalBlocker, Qt
@@ -65,15 +66,71 @@ from .confirm import confirm, notice
 from .settings import dialog_qss
 from .settings_rows import SettingsCard
 
-#: 危险 / 错误文字色。QSS 里单独给一个可读的红，深浅主题共用。
-_ERROR_COLOR = "#E5534B"
-
 #: 条件 / 动作行右侧的小图标按钮统一尺寸（命中区 ≥28px，padding 必须为 0）
 _ICON_BTN = 30
 
-#: 下拉里两个动作类型的顺序即列表顺序
-_ACTION_LABELS = (("virtual_event", "发虚拟事件"), ("delay", "延迟"))
+#: 下拉里三个动作类型的顺序即列表顺序。``delay_s`` 不是新动作类型，只是
+#: ``delay`` 的另一种录入刻度（值仍然折算成毫秒存，见 ``Action.unit``）。
+_ACTION_LABELS = (("virtual_event", "发虚拟事件"),
+                  ("delay", "延迟（毫秒）"),
+                  ("delay_s", "延迟（秒）"))
+#: 两种延迟规格，换算只在这两者之间做
+_DELAY_KINDS = ("delay", "delay_s")
+#: 换成延迟档时的默认值：两种规格都是 1 秒，切换规格不跳数量级
+_DELAY_DEFAULTS = {"delay": "1000", "delay_s": "1"}
+#: 秒档最多几位小数。**执行精度是 1 ms，所以 3 位刚好无损**：再多存不进去，
+#: 再少（比如只留 1 位）就会让 1234 ms 之类的值重开一次就变样。改这个数要连着
+#: `_delay_text` 的格式化一起看。
+MAX_DELAY_DECIMALS = 3
+#: 行内红字只放得下一句短的（它压在输入框右边，太长会把输入框挤窄），
+#: 为什么这么规、怎么改，全挂在这张表里当 tooltip。
+_HINT_TIPS = {
+    "只能填整数": "毫秒档以 1 ms 为最小单位，带小数点会被拦；需要小数请换成「延迟（秒）」",
+    "要填数字": "延迟只能填数字，中文、空格、单位后缀都会导致无法执行",
+    f"最多 {MAX_DELAY_DECIMALS} 位小数":
+        f"执行精度是 1 毫秒，第 {MAX_DELAY_DECIMALS + 1} 位以后存不进去"
+        f"（1.234 秒 = 1234 毫秒）",
+    "要填延迟时间": "延迟必须有值；不想等待就删掉这一行动作",
+    "不能小于 0": "延迟不能是负数",
+    f"不能超过 {MAX_DELAY_MS} 毫秒": f"单条延迟上限 {MAX_DELAY_MS} 毫秒（{MAX_DELAY_MS // 1000} 秒）",
+    f"不能超过 {MAX_DELAY_MS // 1000} 秒": f"单条延迟上限 {MAX_DELAY_MS} 毫秒（{MAX_DELAY_MS // 1000} 秒）",
+}
 _MODE_LABELS = (("all", "满足全部状态条件"), ("any", "满足任一状态条件"))
+
+
+def _delay_unit(kind: str) -> str:
+    return "s" if kind == "delay_s" else "ms"
+
+
+def _delay_text(ms: int, unit: str) -> str:
+    """毫秒 → 当前刻度的文本。秒档去掉无意义的小数：2000 → "2"、1500 → "1.5"。"""
+    if unit != "s":
+        return str(ms)
+    text = f"{ms / 1000:.{MAX_DELAY_DECIMALS}f}".rstrip("0").rstrip(".")
+    return text or "0"
+
+
+def _delay_ms(text: str, unit: str) -> int:
+    """当前刻度的文本 → 毫秒。坏输入返回 -1（故意越界，让 validate_rule 报出来）。"""
+    raw = text.strip()
+    if unit == "s":
+        try:
+            seconds = float(raw)
+        except ValueError:
+            return -1
+        if not math.isfinite(seconds):
+            return -1
+        return int(round(seconds * 1000))
+    try:
+        return int(raw)
+    except ValueError:
+        return -1
+
+
+def _decimal_places(raw: str) -> int:
+    """小数点后有几位。"1.234" → 3、"30" → 0、"1." → 0。"""
+    return len(raw.split(".", 1)[1]) if "." in raw else 0
+
 
 #: Qt 的特殊键值 → Win32 VK。字母 / 数字 / F1–F12 本身与 VK 相同，不用列。
 _SPECIAL_KEYS: dict[int, int] = {
@@ -112,6 +169,14 @@ def _qt_mods(modifiers: Qt.KeyboardModifiers) -> int:
     return out
 
 
+def _error_color(p: theme.Palette) -> str:
+    """就地红字的颜色。色相只认主题那支 ``DANGER``（"界面里只允许一种红"），
+    但同一支红在浅底 / 深底上都只有 ~3.9:1，11px 小字读着吃力：浅色压深一档、
+    深色提亮一档，两边都过 4.5:1（验证脚本里钉着这条）。"""
+    return theme.blend(theme.DANGER, "#000000" if not p.is_dark else "#FFFFFF",
+                       0.16 if not p.is_dark else 0.24)
+
+
 def _page_qss(p: theme.Palette) -> str:
     return dialog_qss(p) + f"""
     QLineEdit#Field {{
@@ -120,7 +185,7 @@ def _page_qss(p: theme.Palette) -> str:
     }}
     QLineEdit#Field:focus {{ border-color: {p.accent}; }}
     QLabel#Hint {{ color: {p.text_soft}; font-size: 11px; }}
-    QLabel#Warn {{ color: {_ERROR_COLOR}; font-size: 11px; }}
+    QLabel#Warn {{ color: {_error_color(p)}; font-size: 11px; }}
     QLabel#Ok {{ color: {theme.ACCENT_GREEN}; font-size: 11px; }}
     /* 浅色主题下 text_soft 压在浅灰底上几乎看不见，小按钮统一用主文字色。
        底色从 **panel_bg** 起算：这些按钮压在 SectionCard（panel_bg）上，
@@ -266,7 +331,11 @@ class ConditionRow(QWidget):
 
 
 class ActionRow(QWidget):
-    """一行 = 类型 + 事件名 / 毫秒 + 上移 / 下移 / 删除。"""
+    """一行 = 类型 + 事件名 / 延迟值 + 上移 / 下移 / 删除。
+
+    延迟有两种录入规格（毫秒 / 秒），下拉里就是两档；**存的一律是毫秒**，
+    秒档只是把输入框里的数字 ×1000，见 ``_delay_ms`` / ``_delay_text``。
+    """
 
     def __init__(self, action: Action, palette: theme.Palette,
                  on_change: Callable[[], None], on_remove: Callable[[QWidget], None],
@@ -275,6 +344,7 @@ class ActionRow(QWidget):
         super().__init__(parent)
         self._on_change = on_change
         self._loading = True
+        self._kind = "virtual_event"  # 上一次的类型，_kind_changed 里判"是不是同一把尺子"
         lay = QHBoxLayout(self)
         lay.setContentsMargins(0, 3, 0, 3)
         lay.setSpacing(8)
@@ -287,12 +357,20 @@ class ActionRow(QWidget):
         with QSignalBlocker(self.kind):
             for key, label in _ACTION_LABELS:
                 self.kind.addItem(label, key)
-        self.kind.setFixedWidth(118)
+        # 6 个全角字（延迟（毫秒））+ 左右内边距 12/38，118 会把括号挤成省略号
+        self.kind.setFixedWidth(138)
 
         self.value_edit = QLineEdit(self)
         self.value_edit.setObjectName("Field")
         self.value_edit.setPlaceholderText("虚拟事件名（要和米家自动化里监听的完全一致）")
-        self.value_edit.textChanged.connect(on_change)
+        self.value_edit.textChanged.connect(self._on_text)
+
+        # 就地报错（用户 11-13 第六条反馈）：照①「注册状态：…」的样子长在本行右侧，
+        # 不占行高、不回到底部错误条。**边打边判**，不用等点保存。
+        self.hint = QLabel("", self)
+        self.hint.setObjectName("Warn")
+        self.hint.setWordWrap(False)
+        self.hint.setVisible(False)
 
         self.up_btn = _icon_button("↑", "上移这条动作", self)
         self.up_btn.clicked.connect(lambda: on_move(self, -1))
@@ -304,36 +382,122 @@ class ActionRow(QWidget):
         lay.addWidget(self.index_label)
         lay.addWidget(self.kind)
         lay.addWidget(self.value_edit, 1)
+        lay.addWidget(self.hint)
         for btn in (self.up_btn, self.down_btn, self.delete_btn):
             lay.addWidget(btn)
         self.kind.currentIndexChanged.connect(self._kind_changed)
 
         # 连接已建好：setCurrentIndex 会触发 _kind_changed，构造期用 _loading 挡住，
         # 否则它会把下面刚回填的值清空。
-        idx = self.kind.findData(action.type)
-        self.kind.setCurrentIndex(max(0, idx))
+        kind = "delay_s" if action.type == "delay" and action.unit == "s" else action.type
+        self.kind.setCurrentIndex(max(0, self.kind.findData(kind)))
+        # 记下当前规格：_kind_changed 靠它判断"是不是同一把尺子"，是就只换算不重置
+        self._kind = self._kind_key()
         self.value_edit.setText(action.name if action.type == "virtual_event"
-                                else str(action.ms))
+                                else _delay_text(action.ms, self._unit()))
         self._loading = False
         self._sync_placeholder()
+        self.sync_hint()
+
+    def _on_text(self, *_args: Any) -> None:
+        """输入即校验：红字跟着光标走，不用等点保存才发现填错。"""
+        self.sync_hint()
+        self._on_change()
 
     def _kind_changed(self) -> None:
         if self._loading:
             return
         # 换类型必须换掉旧值：把「发虚拟事件」切成「延迟」后残留的事件名
         # 会被 int() 解析失败，用户看到的是"明明填了东西却报校验错"。
-        self.value_edit.setText("1000" if self._is_delay() else "")
+        # 但毫秒 ↔ 秒是同一个量，换算一下就行，别把刚填的 2000 重置成 1。
+        kind = self._kind_key()
+        if kind in _DELAY_KINDS and self._kind in _DELAY_KINDS:
+            ms = _delay_ms(self.value_edit.text(), _delay_unit(self._kind))
+            self.value_edit.setText(_delay_text(ms, _delay_unit(kind)) if ms >= 0
+                                    else _DELAY_DEFAULTS[kind])
+        elif kind in _DELAY_KINDS:
+            self.value_edit.setText(_DELAY_DEFAULTS[kind])
+        else:
+            self.value_edit.setText("")
+        self._kind = kind
         self._sync_placeholder()
+        self.sync_hint()
         self._on_change()
 
+    def _kind_key(self) -> str:
+        return str(self.kind.currentData())
+
     def _is_delay(self) -> bool:
-        return str(self.kind.currentData()) == "delay"
+        return self._kind_key() in _DELAY_KINDS
+
+    def _unit(self) -> str:
+        """当前录入刻度："ms" / "s"。存盘与校验一律用毫秒。"""
+        return _delay_unit(self._kind_key())
 
     def _sync_placeholder(self) -> None:
         if self._is_delay():
-            self.value_edit.setPlaceholderText("毫秒，如 2000")
+            self.value_edit.setPlaceholderText(
+                "秒，如 30 或 1.5（最多 3 位小数）" if self._unit() == "s"
+                else "毫秒，如 2000（只填整数）")
         else:
             self.value_edit.setPlaceholderText("虚拟事件名（要和米家自动化里监听的完全一致）")
+
+    def format_error(self) -> str:
+        """这一行延迟**填法**的问题，没有则返回空串。
+
+        只能在这一层判：``Action`` 交出去的只有毫秒，core 看不出用户敲的是
+        ``1.5 秒`` 还是 ``1500 毫秒``，更看不出多打了第 4 位小数。两条规矩：
+        毫秒档只收整数（半毫秒没有意义）；秒档最多 3 位小数（执行精度就是 1 ms）。
+        超出就**明说**，不静默四舍五入——用户专门问过精度这件事。
+
+        文案是**行内红字**：挂在输入框右边，得短。来龙去脉进 tooltip。
+        """
+        if not self._is_delay():
+            return ""
+        raw = self.value_edit.text().strip()
+        if not raw:
+            return ""  # 空值交给 error_text 的「要填延迟时间」
+        if self._unit() == "s":
+            try:
+                seconds = float(raw)
+            except ValueError:
+                return "要填数字"
+            if not math.isfinite(seconds):
+                return "要填数字"
+            if _decimal_places(raw) > MAX_DELAY_DECIMALS:
+                return f"最多 {MAX_DELAY_DECIMALS} 位小数"
+            return ""
+        # 毫秒档只收整数：负号先放过去，交给下面的范围判断说「不能小于 0」
+        if not raw.lstrip("+-").isdigit():
+            return "只能填整数"
+        return ""
+
+    def error_text(self) -> str:
+        """行内红字的全文；空串 = 这一行合规矩。
+
+        顺序是先具体后笼统：填法（整数 / 位数）→ 空值 → 范围。**范围也在这层判**，
+        以前只有点保存后由 ``validate_rule`` 在底部说"延迟超出范围"，现在跟填法
+        一样就地红字，用户不用点保存才知道填大了。
+        """
+        err = self.format_error()
+        if err or not self._is_delay():
+            return err
+        raw = self.value_edit.text().strip()
+        if not raw:
+            return "要填延迟时间"
+        ms = _delay_ms(raw, self._unit())
+        if ms < 0:
+            return "不能小于 0"
+        if ms > MAX_DELAY_MS:
+            return (f"不能超过 {MAX_DELAY_MS // 1000} 秒" if self._unit() == "s"
+                    else f"不能超过 {MAX_DELAY_MS} 毫秒")
+        return ""
+
+    def sync_hint(self) -> None:
+        text = self.error_text()
+        self.hint.setText(text)
+        self.hint.setToolTip(_HINT_TIPS.get(text, ""))
+        self.hint.setVisible(bool(text))
 
     def set_index(self, number: int) -> None:
         self.index_label.setText(f"{number}.")
@@ -346,12 +510,10 @@ class ActionRow(QWidget):
         self.down_btn.setToolTip("下移这条动作" if down else "已经是最后一条")
 
     def value(self) -> Action:
+        """读回一条动作。延迟**永远是毫秒**，秒档在这里折算，界面之外没人认"秒"。"""
         if self._is_delay():
-            try:
-                ms = int(self.value_edit.text().strip())
-            except ValueError:
-                ms = -1  # 故意越界，让 validate_rule 报出来
-            return Action("delay", "", ms)
+            unit = self._unit()
+            return Action("delay", "", _delay_ms(self.value_edit.text(), unit), unit)
         return Action("virtual_event", self.value_edit.text().strip(), 0)
 
 
@@ -452,6 +614,7 @@ class AutomationDialog(QDialog):
 
         area = QScrollArea(root)
         area.setWidgetResizable(True)
+        self.area = area  # 保存时要滚到出错的那一行
         content = QWidget(area)
         col = QVBoxLayout(content)
         col.setContentsMargins(0, 2, 8, 2)
@@ -579,8 +742,14 @@ class AutomationDialog(QDialog):
         action_btns = QWidget(content)
         arow = QHBoxLayout(action_btns)
         arow.setContentsMargins(0, 4, 0, 4)
-        for text, act in (("＋ 发虚拟事件", Action("virtual_event", "", 0)),
-                          ("＋ 延迟", Action("delay", "", 1000))):
+        # 延迟两种规格各一枚按钮（用户 11-13 要的）：等量的延迟在「秒」档里好填
+        # （30 秒 vs 30000 毫秒），坏处只有一个——多占一格地方，所以三枚挤在
+        # 一行里，靠文本自适应的 padding 而不是定宽，窄窗也不会被挤成省略号。
+        for text, act in (
+            ("＋ 发虚拟事件", Action("virtual_event", "", 0)),
+            ("＋ 延迟（毫秒）", Action("delay", "", 1000)),
+            ("＋ 延迟（秒）", Action("delay", "", 1000, "s")),
+        ):
             btn = QPushButton(text, action_btns)
             btn.setObjectName("Tool")
             btn.clicked.connect(lambda _=False, a=act: self._add_action(a))
@@ -798,6 +967,17 @@ class AutomationDialog(QDialog):
     # -- 保存 ------------------------------------------------------------
     def _save(self, *, quiet: bool = False) -> bool:
         rule = self._collect()
+        # 填法 / 范围都只在本行报（用户 11-13 指定）：core 只拿到毫秒，看不出
+        # 用户敲了什么，混进 validate_rule 只会得到"要在 0–600000 毫秒之间"这种
+        # 答非所问。这里也不写底部错误条、不弹 notice——红字就在输入框右边亮着，
+        # 再在下面重复一遍是噪音。
+        bad = [row for row in self._action_rows if row.error_text()]
+        if bad:
+            for row in self._action_rows:
+                row.sync_hint()  # 边打边判已经刷过，这里兜住 quiet 保存的路径
+            self._set_error("")
+            self._reveal_row(bad[0])
+            return False
         errors = validate_rule(rule)
         if errors:
             self._set_error("；".join(errors[:3]))
@@ -808,7 +988,9 @@ class AutomationDialog(QDialog):
             self._set_error(f"冷静期要在 0–{MAX_COOLDOWN_MS} 毫秒之间")
             return False
         if any(a.type == "delay" and a.ms > MAX_DELAY_MS for a in rule.actions):
-            self._set_error(f"单条延迟不能超过 {MAX_DELAY_MS} 毫秒")
+            # 两种规格共用一条上限，提示里两个刻度都写出来，免得秒档用户要自己换算
+            self._set_error(f"单条延迟不能超过 {MAX_DELAY_MS} 毫秒"
+                            f"（{MAX_DELAY_MS // 1000} 秒）")
             return False
         # 屏蔽 service 的信号：保存会触发 rules_changed，列表窗的刷新由 _open_editor
         # 返回后统一排一次，别在保存栈里就重建卡片。
@@ -829,6 +1011,17 @@ class AutomationDialog(QDialog):
         """「保存」= 写盘 + **自动关闭**（用户 11-13 定）。列表页负责刷新。"""
         if self._save():
             self.accept()
+
+    def _reveal_row(self, row: QWidget) -> None:
+        """把出错的行滚进视野、焦点交回它的输入框。
+
+        行内红字现在是**唯一**的提示（不在底部重复），所以必须保证看得见：
+        ③ 里动作一多，出错那行很可能正好滚在视野外面。
+        """
+        self.area.ensureWidgetVisible(row, 0, 24)
+        edit = getattr(row, "value_edit", None)
+        if edit is not None:
+            edit.setFocus()
 
     # -- 状态 ------------------------------------------------------------
     def _refresh_status(self) -> None:

@@ -169,7 +169,10 @@ class AutomationEngine:
             return
         act = actions[index]
         if act.type == "delay":
-            self._add_log(rule, SENT, f"延迟 {act.ms} ms")
+            # 按用户填的那把尺子记：设「30 秒」的人不该在日志里读到 30000 ms。
+            # ``unit`` 只影响这行文案，调度永远用 ``ms``。
+            self._add_log(rule, SENT, f"延迟 {act.ms / 1000:g} 秒" if act.unit == "s"
+                          else f"延迟 {act.ms} ms")
             self.call_later(act.ms, lambda: self._step(rule, actions, index + 1))
             return
         if act.type != "virtual_event":
