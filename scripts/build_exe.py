@@ -99,8 +99,9 @@ def resolve_go2rtc(explicit: str) -> Path:
     return binary
 
 
-def fetch_go2rtc_license(dest: Path) -> bool:
-    """取 go2rtc 的 MIT 原文放进包里。取不到就写个指向仓库的说明，不编造版权行。"""
+def fetch_go2rtc_license(dest: Path, fallback: Path | None = None) -> bool:
+    """取 go2rtc 的 MIT 原文放进包里。取不到就用本地已有的原文；
+    再没有就写个指向仓库的说明，不编造版权行。"""
     try:
         req = urllib.request.Request(
             GO2RTC_LICENSE_API,
@@ -113,6 +114,10 @@ def fetch_go2rtc_license(dest: Path) -> bool:
         log(f"  许可证：{data.get('name')}（{(data.get('license') or {}).get('spdx_id')}）")
         return True
     except Exception as exc:  # noqa: BLE001 - 取不到不该让打包失败，但要留痕
+        if fallback is not None and fallback.is_file():
+            shutil.copy2(fallback, dest)
+            log(f"  许可证：API 不可用，用本地原文 {fallback.name}")
+            return True
         dest.write_text(
             f"本目录的 go2rtc.exe 来自 https://github.com/{GO2RTC_REPO}\n"
             "许可证：MIT。原文见该仓库的 LICENSE 文件。\n"
@@ -121,6 +126,29 @@ def fetch_go2rtc_license(dest: Path) -> bool:
         )
         log(f"  许可证：没取到原文，写了指向仓库的说明（{type(exc).__name__}）")
         return False
+
+
+def write_go2rtc_notice(dest: Path, go2rtc: Path) -> None:
+    """go2rtc 子目录自己的来源说明，和程序根目录的 NOTICE 分开。"""
+    record = go2rtc.parent / "BUILD.txt"
+    patched = record.is_file()
+    build = record.read_text(encoding="utf-8").strip() if patched else ""
+    dest.write_text(
+        "go2rtc —— 第三方组件（MIT）\n"
+        f"来源：https://github.com/{GO2RTC_REPO}\n"
+        "用途：把小米摄像头的 P2P 码流转成本机 RTSP；由 MiHomePanel 作为独立进程启动。\n"
+        + (
+            "本发行包内的这一份带有本地补丁：\n"
+            "  · pkg/xiaomi/miss/producer.go::Dial()：probe 之后重起一次视频流，\n"
+            "    消掉「等一个 GOP」的首帧延迟；\n"
+            "  · pkg/xiaomi/miss/client.go：云台控制（0x112 帧 + 命令通道常驻消费），\n"
+            "    对外暴露 GET /api/xiaomi/ptz。\n"
+            f"构建信息：\n{build}\n" if patched else "本发行包内的是上游官方构建。\n"
+        )
+        + "\n许可证原文：同目录 LICENSE。\n"
+        "本项目 MiHomePanel 以 GPL-3.0-or-later 发布，见上一级 LICENSE / NOTICE.txt。\n",
+        encoding="utf-8",
+    )
 
 
 def write_notice(dest: Path, go2rtc: Path) -> None:
@@ -255,7 +283,8 @@ def stage_go2rtc(app_dir: Path, go2rtc: Path) -> Path:
     record = go2rtc.parent / "BUILD.txt"
     if record.is_file():
         shutil.copy2(record, target / "BUILD.txt")
-    fetch_go2rtc_license(target / "LICENSE")
+    fetch_go2rtc_license(target / "LICENSE", go2rtc.parent / "LICENSE")
+    write_go2rtc_notice(target / "NOTICE.txt", go2rtc)
     write_notice(app_dir / "NOTICE.txt", go2rtc)
     ours = ROOT / "LICENSE"
     if ours.is_file():
