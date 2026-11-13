@@ -201,9 +201,18 @@ python -m venv .venv
 **装一次即可**（约 7.7 MB，走 GitHub assets API 下载）：
 
 ```bash
-.venv\Scripts\python.exe scripts\install_go2rtc.py    # 官方构建，首帧约 4.8–6.3 秒，**没有云台**
-.venv\Scripts\python.exe scripts\build_go2rtc.py      # 自己编带补丁的版本，首帧约 2 秒，带云台
+.venv\Scripts\python.exe scripts\install_go2rtc.py             # 官方构建，首帧约 4.8–6.3 秒，**没有云台**
+.venv\Scripts\python.exe scripts\install_go2rtc.py --patched   # 项目 Release 里的补丁版，首帧约 2 秒，带云台
+.venv\Scripts\python.exe scripts\build_go2rtc.py               # 本机自己编同一份补丁版（需要 Go + git）
 ```
+
+`--patched` 从本项目的组件 Release（tag 由 `build_go2rtc.REF` 推导为 `go2rtc-<ref>`，
+当前 `go2rtc-990f4de`，已发布在
+<https://github.com/scnf-8848/MiHomePanel/releases/tag/go2rtc-990f4de>）下载
+`go2rtc_win64_patched.zip`，装 `go2rtc.exe` + `BUILD.txt`
++ MIT `LICENSE` 三件；Release 带 `SHA256SUMS` 时会核对哈希。Release 不存在、网络失败、
+资产缺失、ref 不符或哈希不符都会给中文原因并回退：本地已有 go2rtc 就保留不动，
+没有就尝试装官方版。发布与上游重新对齐的步骤见 [DEVELOPMENT.md](docs/DEVELOPMENT.md) 的「补丁版 Release」小节。
 
 两个脚本都装到 `%LOCALAPPDATA%\MiHomePanel\go2rtc\go2rtc.exe`，也可以用环境变量
 `MIHOME_GO2RTC` 指向别的副本；想回退到官方构建，把留存的 `go2rtc-official.exe` 改名

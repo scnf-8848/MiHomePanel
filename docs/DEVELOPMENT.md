@@ -1056,7 +1056,7 @@ scripts/
   shot_detail.py     详情页截图（关键词 / --dark）
   shot_ui.py         多视图截图：主窗口 / 设置页 / 详情页 / 下拉框 / 胶囊标签 / 卡片样式 / 存在传感器状态卡 / 空调温度控制卡 / 已隐藏设备折叠（34 张）
   shot_states.py     交互态截图：房间标题悬停、详情页底部、离线禁用
-  install_go2rtc.py  下载可选的 go2rtc（MIT，7.7MB，走 GitHub assets API）——官方构建
+  install_go2rtc.py  下载可选的 go2rtc（MIT，7.7MB，走 GitHub assets API）：默认官方构建，--patched 取项目 Release 的补丁版（校验 ref / SHA256SUMS）
   build_go2rtc.py    自己编带补丁的 go2rtc（开播 + 云台两处；取快照 + 打补丁 + 下载 Go + 编译安装）
   build_exe.py       打包成可发布的 Windows 目录：PyInstaller onedir、go2rtc 摆到 exe 旁边并附许可证、裁掉用不到的 Qt 模块、产物自带自检 + 无控制台启动冒烟
   pe_imports.py      读 PE 导入表：某个 DLL 依赖谁 / 谁依赖它（判断打包产物里哪些模块能删）
@@ -2610,10 +2610,18 @@ RTSP，加载态只写一句「加载中…」加一条流动的细条——**�
   （`go2rtc-keyframe.patch` 开播、`go2rtc-ptz.patch` 云台）
   → 用 Go 1.27.3 编译（本机没有 Go 会自动下便携版到 `<data>/go/`，76 MB，只下一次）
   → 装到 `<data>/go2rtc/go2rtc.exe`
+- `git` 先找 PATH；找不到再自动用 GitHub Desktop 自带的
+  `%LOCALAPPDATA%\GitHubDesktop\app-*\resources\app\git\cmd\git.exe`，
+  没装独立 Git 的机器也能构建
+- 构建环境固定 `CGO_ENABLED=0`，产物是不依赖本机 C 运行库的静态二进制；
+  其余参数仍是 `-trimpath -ldflags=-s -w`
 - 装之前把原来的官方构建留成 `go2rtc-official.exe`；**想回退把它改名回 `go2rtc.exe` 即可**，
   两个脚本互不干扰
 - 实测 8 次：1.85 / 1.87 / 1.89 / 2.15 / 2.16 / 2.25 / 2.64 / 3.15 秒，均值 2.18；
   远程（relay）路径同样受益，端到端 2.86–3.07 秒（多出来的是 relay 握手那 0.9 秒）
+- 2026-11-13 用 Go 1.27.3 + `CGO_ENABLED=0` 重打后复测：直接量 RTSP
+  2.20 / 2.56 / 3.47 秒（均值 2.74），详情页端到端 2.09 / 3.51 秒（均值 2.80）；
+  仍远低于官方 4.8–6.3 秒，云台 `op=1..4` 画面差异 36.1–56.5%
 - 代价：**这是一个自建二进制**。上游改了这段代码补丁会打不上，脚本会明确报错并提示手工改；
   想跟进新版本得重跑一遍（补丁与 `producer.go` 的 `Dial()` 一一对应，改动面很小）。
   上游哪天自己修了「probe 吃掉开播 IDR」，删掉补丁和这个脚本即可
@@ -2621,6 +2629,79 @@ RTSP，加载态只写一句「加载中…」加一条流动的细条——**�
   （`Producer.cache`）。裸流里首包确实变成 IDR，但 Qt 端到端只到 4.7 秒且时灵时不灵——
   补发是在 RTSP 还没 PLAY 完时写的，和建流竞争；而且老包的时间戳/POC 落后于追上来的活流，
   ffmpeg 会直接跳过它继续等下一个 IDR
+
+#### 补丁版 Release 与 `install_go2rtc.py --patched`
+
+普通用户不必装 Go / git，直接：
+
+```bash
+.venv\Scripts\python.exe scripts\install_go2rtc.py --patched
+```
+
+- tag **不写死**，由 [build_go2rtc.py](scripts/build_go2rtc.py) 的 `REF` 推导成
+  `go2rtc-<ref>`（当前 `go2rtc-990f4de`）；安装脚本请求
+  `/repos/scnf-8848/MiHomePanel/releases/tags/<tag>`，**不查 `latest`**，避免程序
+  自身的 Release 顶掉组件 Release
+- 资产名：`go2rtc_<平台>_<架构>_patched.zip`，例如 Windows x64 是
+  `go2rtc_win64_patched.zip`，macOS 是 `go2rtc_mac_arm64_patched.zip`，Linux 是
+  `go2rtc_linux_amd64_patched.zip`。zip 内**平铺**三件：
+  `go2rtc.exe`（非 Windows 为 `go2rtc`）、`BUILD.txt`、`LICENSE`；可再带
+  `NOTICE.txt` 说明补丁
+- 安装到 `<data>/go2rtc/`；`BUILD.txt` 的 `ref=` 必须等于当前 `REF`，
+  Release 若带 `SHA256SUMS` 还会核对 zip 的 sha256
+- 失败路径（Release 404、GitHub API 403/限流、断网、资产缺失、ref 不符、哈希不符）
+  都会打印中文原因并回退：本地已有 go2rtc 就原样保留（并说明是官方版还是哪个 ref），
+  没有就尝试装官方版；官方也装不上时给出目录和手动命令，不静默失败
+
+**发布组件 Release（手动，仓库目前没有 GitHub Actions）**：
+
+```powershell
+# 1. 编译到独立的发布目录（--out 不写 BUILD.txt，别用）
+.venv\Scripts\python.exe scripts\build_go2rtc.py --dir dist-go2rtc --keep
+dist-go2rtc\go2rtc.exe -v
+
+# 2. 验证首帧 / 云台（需要登录态和一台在线摄像头）
+.venv\Scripts\python.exe -X utf8 scripts\measure_camera_coldstart.py --binary dist-go2rtc\go2rtc.exe
+.venv\Scripts\python.exe -X utf8 scripts\measure_app_play.py --lane lan --rounds 3
+.venv\Scripts\python.exe -X utf8 scripts\probe_ptz.py
+
+# 3. 组包：exe + BUILD.txt + go2rtc 的 MIT 原文
+New-Item -ItemType Directory -Force dist-go2rtc\release | Out-Null
+Invoke-WebRequest "https://raw.githubusercontent.com/AlexxIT/go2rtc/990f4de/LICENSE" `
+    -OutFile dist-go2rtc\LICENSE
+Compress-Archive -Path dist-go2rtc\go2rtc.exe,dist-go2rtc\BUILD.txt,dist-go2rtc\LICENSE `
+                 -DestinationPath dist-go2rtc\release\go2rtc_win64_patched.zip
+Get-FileHash dist-go2rtc\release\go2rtc_win64_patched.zip -Algorithm SHA256 |
+    ForEach-Object { "$($_.Hash.ToLower())  go2rtc_win64_patched.zip" } |
+    Set-Content dist-go2rtc\release\SHA256SUMS -Encoding ascii
+
+# 4. 发组件 Release（不是程序版本）
+gh release create go2rtc-990f4de dist-go2rtc\release\* `
+  --title "go2rtc 990f4de + keyframe/PTZ patches" --notes-file dist-go2rtc\release\RELEASE.md
+```
+
+已发布（2026-11-13）：<https://github.com/scnf-8848/MiHomePanel/releases/tag/go2rtc-990f4de>。
+两个资产为 `go2rtc_win64_patched.zip`（8,460,003 字节，
+sha256 `5a14a3af074292021412012c373178a6280ce8e6ac91120378dfd876dd56e232`）与
+`SHA256SUMS`（92 字节）；匿名 API、匿名直链下载和哈希都已核对。
+
+> GitHub 匿名 API 是共享的 60 次/小时额度，`--patched` 查询 Release 时可能遇到 403。
+> 这是限流不是 Release 缺失：稍后重试即可；脚本会明确提示并回退官方版 / 保留本地副本。
+
+`RELEASE.md` 至少写：上游 `AlexxIT/go2rtc@990f4de`（2026-11-05，晚于 v1.9.15）、
+Go 1.27.3、两个补丁各自作用、构建日期、实测首帧区间、安装命令
+（`install_go2rtc.py --patched`）、MIT 许可提示，以及「组件 Release，不是 MiHomePanel
+程序版本」。`BUILD.txt` 必须和 exe 同层：`build_exe.py` 靠它判断是不是补丁版，
+`write_notice()` 也靠它把构建信息写进 `NOTICE.txt`。
+
+**上游升级后重新对齐**：
+
+1. 选新 tag / commit，先 `build_go2rtc.py --ref <sha> --keep` 试编；
+2. `git apply` 失败说明上下文变了：在 go2rtc 源码里手工落改动，再用
+   `git diff -- <文件>` 重新生成 `scripts/patches/` 下的两个补丁；
+3. 确认 `PATCH_MARKS`（`StopMedia()`、`func (c *Client) Motor(`）仍命中；
+4. 重跑首帧与云台验证，通过后改 `REF`，再发一个 `go2rtc-<新 ref>` Release；
+5. 上游若自己实现了某项，删掉对应补丁和 mark，程序会按能力探测自动退化。
 
 ### 为什么不再垫上次的画面
 
