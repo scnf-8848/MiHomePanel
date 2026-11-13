@@ -73,16 +73,17 @@ class SettingsRow(QWidget):
 
         # expand 的行（比如"凭据文件"这种长文本）让控件吃掉右边剩余宽度，
         # 文字自己右对齐并打省略号；否则控件只占自己的 sizeHint，贴着右边。
-        lay.addLayout(col, 0 if expand else 1)
-        if control is not None:
-            if expand:
-                # **不能**再传对齐方式：addWidget 一旦带 alignment，布局就按 sizeHint
-                # 摆放而不是铺满单元格；ElidedLabel 的 sizeHint 被 Ignored 策略压成
-                # 十几个像素，整行值会"消失"。右对齐交给控件自己的 alignment。
-                lay.addWidget(control, 1)
-                if isinstance(control, QLabel):
-                    control.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-            else:
+        if control is not None and expand:
+            lay.addLayout(col, 0)
+            # **不能**再传对齐方式：addWidget 一旦带 alignment，布局就按 sizeHint
+            # 摆放而不是铺满单元格；ElidedLabel 的 sizeHint 被 Ignored 策略压成
+            # 十几个像素，整行值会"消失"。右对齐交给控件自己的 alignment。
+            lay.addWidget(control, 1)
+            if isinstance(control, QLabel):
+                control.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        else:
+            lay.addLayout(col, 1)
+            if control is not None:
                 lay.addWidget(control, 0, Qt.AlignVCenter)
         self.setMinimumHeight(ROW_MIN_H)
 
@@ -140,9 +141,15 @@ class SettingsCard(QFrame):
         self._col.addWidget(row, stretch)
         return row
 
-    def add_unit(self, widget: QWidget, *, stretch: int = 0) -> QWidget:
-        """整行铺满的控件：主题预览、树、家庭标签预览。不加左侧标题。"""
-        self._separate()
+    def add_unit(self, widget: QWidget, *, stretch: int = 0,
+                 divider: bool = True) -> QWidget:
+        """整行铺满的控件：主题预览、树、家庭标签预览。不加左侧标题。
+
+        ``divider=False`` 时不在它前面自动补分隔线，留给控件自己在内部画
+        （② 的空态提示要把上下两条线一起缩进，见 ``automation``）。
+        """
+        if divider:
+            self._separate()
         self._col.addWidget(widget, stretch)
         return widget
 

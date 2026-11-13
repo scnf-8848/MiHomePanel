@@ -72,7 +72,10 @@ def make_state(did: str, name: str, room: str) -> DeviceState:
         profile=SimpleNamespace(label="灯"),
         control=lambda slot: None, bound=lambda slot: None,
     )
-    node = DeviceNode(did, name, "m", "light.x", home="我的家", room=room, online=True)
+    node = DeviceNode(
+        did, name, "m", "light.x", home="我的家", room=room,
+        home_id="h", room_id=room or "__unassigned__", online=True,
+    )
     return DeviceState(node=node, spec=None, card=card, values={})
 
 
@@ -143,9 +146,9 @@ def make_wall(prefs: Prefs, tmp: Path, name: str = "p.json",
     hidden1 = make_state("d3", "旧台灯", hidden_rooms[0])
     hidden2 = make_state("d4", "备用插座", hidden_rooms[1])
     views = [
-        RoomView("h", "我的家", "客厅", [shown1]),
-        RoomView("h", "我的家", "餐厅", [shown2]),
-        RoomView("h", "我的家", HIDDEN_ROOM, [hidden1, hidden2], "hidden"),
+        RoomView("h", "我的家", "客厅", [shown1], room_label="客厅"),
+        RoomView("h", "我的家", "餐厅", [shown2], room_label="餐厅"),
+        RoomView("h", "我的家", "__hidden__", [hidden1, hidden2], "hidden", HIDDEN_ROOM),
     ]
     wall = WallView(FakeStore(prefs, views), Icons(), theme.LIGHT)
     wall.resize(900, 600)
@@ -178,7 +181,8 @@ def main() -> int:
     p = Prefs(tmp / "wall.json")
     wall = make_wall(p, tmp)
     sections = wall._sections
-    check(f"三个分区（客厅 / 餐厅 / {HIDDEN_ROOM}）", [s.view.room for s in sections],
+    check(f"三个分区（客厅 / 餐厅 / {HIDDEN_ROOM}）",
+          [s.view.room_label for s in sections],
           ["客厅", "餐厅", HIDDEN_ROOM])
     check("普通房间不可折叠", [s.collapsible for s in sections], [False, False, True])
     check("隐藏分区默认展开", sections[2].collapsed, False)

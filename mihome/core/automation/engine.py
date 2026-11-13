@@ -113,12 +113,16 @@ class AutomationEngine:
         return max(0.0, rule.cooldown_ms / 1000 - (self._now() - last))
 
     def trigger(self, keys: str, *, source: str = "热键") -> int:
-        """一个组合被按下。返回**被接受**的规则条数（被拦截的不算）。"""
+        """一个组合被按下。返回**被接受**的规则条数（被拦截的不算）。
+
+        规则可以有多个触发，``rules_for`` 已按"任一命中"筛过；这里把**实际按下的
+        那个组合**带进日志——一条规则挂了 F7 / F8 两个键时，日志要能分清是哪次。
+        """
         if self._closed:
             return 0
         accepted = 0
         for rule in self.rules.rules_for(keys):
-            if self._fire(rule, source):
+            if self._fire(rule, source, keys=keys):
                 accepted += 1
         return accepted
 
@@ -138,15 +142,17 @@ class AutomationEngine:
         self.log.clear()
 
     # -- 触发 ------------------------------------------------------------
-    def _fire(self, rule: Rule, source: str, *, bypass_cooldown: bool = False) -> bool:
+    def _fire(self, rule: Rule, source: str, *, keys: str = "",
+              bypass_cooldown: bool = False) -> bool:
         wait = 0.0 if bypass_cooldown else self.cooldown_remaining(rule)
         if wait > 0:
             self._add_log(rule, COOLDOWN,
                           f"{source}被冷静期拦截，剩余 {wait:.1f} 秒"
-                          f"（本规则 {rule.cooldown_ms} ms）")
+                          f"（本规则 {rule.cooldown_ms} ms）", keys=keys)
             return False
         if rule.id in self._running:
-            self._add_log(rule, REENTRY, "上一串动作还没跑完，本次触发已丢弃（不排队）")
+            self._add_log(rule, REENTRY, "上一串动作还没跑完，本次触发已丢弃（不排队）",
+                          keys=keys)
             return False
 
         # 条件只在触发瞬间求值一次
@@ -156,14 +162,15 @@ class AutomationEngine:
         if not passed:
             label = "全部" if rule.condition_mode == "all" else "任一"
             self._add_log(rule, CONDITION,
-                          f"条件（{label}）不成立；" + "；".join(notes))
+                          f"条件（{label}）不成立；" + "；".join(notes), keys=keys)
             return False
 
         # **从触发被接受起算**，不是等动作跑完；否则「发事件 → 延迟 5s → 再发」
         # 会在延迟期间被反复重入
         self._last_fired[rule.id] = self._now()
         self._add_log(rule, FIRED,
-                      f"{source}触发" + ("（测试，绕过冷静期）" if bypass_cooldown else ""))
+                      f"{source}触发" + ("（测试，绕过冷静期）" if bypass_cooldown else ""),
+                      keys=keys)
         actions = tuple(rule.actions)  # 快照：队列跑的时候改规则不影响这一串
         self._running.add(rule.id)
         self._step(rule, actions, 0)
@@ -233,10 +240,12 @@ class AutomationEngine:
             self._add_log(rule, FAILED, f"让「{label}」执行异常：{exc}")
 
     # -- 日志 ------------------------------------------------------------
-    def _add_log(self, rule: Rule, outcome: str, detail: str) -> None:
+    def _add_log(self, rule: Rule, outcome: str, detail: str,
+                 *, keys: str = "") -> None:
         entry = LogEntry(
             at=self._wall_now(), rule_id=rule.id, rule_name=rule.name,
-            keys=rule.keys, outcome=outcome, detail=detail,
+            # 多触发时记**本次按下的那个键**；测试 / 无键位时退回第一条
+            keys=keys or rule.keys, outcome=outcome, detail=detail,
         )
         self.log.append(entry)
         if len(self.log) > self.max_log:

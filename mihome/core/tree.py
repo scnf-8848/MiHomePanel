@@ -26,12 +26,20 @@ def parse_virtual_did(did: str) -> tuple[str, int] | None:
     return m.group("parent"), int(m.group("siid"))
 
 
+#: 未分配到任何房间的设备的稳定占位值。云端家庭 / 房间 id 都是数字串，这个值
+#: 不会和真实 id 撞车；排序、分组、显示三处必须统一用它，不能用 0 冒充云端 id。
+UNASSIGNED_ROOM_ID = "__unassigned__"
+UNASSIGNED_ROOM_LABEL = "未分组"
+
+
 @dataclass(frozen=True, slots=True)
 class VirtualChild:
     did: str
     siid: int
     name: str
     room: str
+    home_id: str = ""
+    room_id: str = ""
     model: str = ""
 
 
@@ -43,6 +51,8 @@ class DeviceNode:
     spec_type: str
     home: str = ""
     room: str = ""
+    home_id: str = ""
+    room_id: str = ""
     online: bool = True
     spec_name: str = ""
     children: list[VirtualChild] = field(default_factory=list)
@@ -91,6 +101,8 @@ def group_devices(rows: Iterable[Mapping[str, Any]]) -> list[DeviceNode]:
                 spec_type=r.get("spec_type", "") or "",
                 home=r.get("home", "") or "",
                 room=r.get("room", "") or "",
+                home_id=r.get("home_id", "") or "",
+                room_id=r.get("room_id", "") or UNASSIGNED_ROOM_ID,
                 online=bool(r.get("online", True)),
                 spec_name=r.get("spec_name", "") or "",
                 localip=r.get("localip", "") or "",
@@ -108,6 +120,8 @@ def group_devices(rows: Iterable[Mapping[str, Any]]) -> list[DeviceNode]:
                         siid=siid,
                         name=r.get("name", "") or "",
                         room=r.get("room", "") or "",
+                        home_id=r.get("home_id", "") or "",
+                        room_id=r.get("room_id", "") or UNASSIGNED_ROOM_ID,
                         model=r.get("model", "") or "",
                     ),
                 )
@@ -124,6 +138,8 @@ def group_devices(rows: Iterable[Mapping[str, Any]]) -> list[DeviceNode]:
                 model=child.model,
                 spec_type="",
                 room=child.room,
+                home_id=child.home_id,
+                room_id=child.room_id,
                 online=True,
             )
             parents[parent_did] = node
@@ -134,4 +150,11 @@ def group_devices(rows: Iterable[Mapping[str, Any]]) -> list[DeviceNode]:
     return [parents[d] for d in order]
 
 
-__all__ = ["DeviceNode", "VirtualChild", "group_devices", "parse_virtual_did"]
+__all__ = [
+    "DeviceNode",
+    "UNASSIGNED_ROOM_ID",
+    "UNASSIGNED_ROOM_LABEL",
+    "VirtualChild",
+    "group_devices",
+    "parse_virtual_did",
+]

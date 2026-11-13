@@ -54,12 +54,15 @@ def main() -> int:
 
     print("\n3) 接线：云端 updateTime 真的落进 DeviceState.stamps")
     check("DeviceState 有 stamps 且默认空", DeviceState.__dataclass_fields__["stamps"].default_factory(), {})
-    # 落 stamps 的循环在 ``_apply_poll`` 里（``_on_polled`` 只负责收尾与健康快照）
+    # 落 stamps 的循环在轮询与写入确认共用的 ``_apply_values`` 里
+    # （``_apply_poll`` 只做健康账本，最后转交给它）
     poll_src = inspect.getsource(Store._apply_poll)
+    values_src = inspect.getsource(Store._apply_values)
     adv_src = inspect.getsource(Store.read_props)
-    check("轮询路径记 stamps", "st.stamps[key] = rv.update_time" in poll_src, True)
+    check("轮询路径记 stamps", "st.stamps[key] = rv.update_time" in values_src, True)
+    check("轮询确实走到那一段", "_apply_values(result)" in poll_src, True)
     check("「更多功能」按需读也记 stamps", "st.stamps[key] = rv.update_time" in adv_src, True)
-    check("时间戳缺失时不写入（不覆盖旧值）", "if rv.update_time:" in poll_src, True)
+    check("时间戳缺失时不写入（不覆盖旧值）", "if rv.update_time:" in values_src, True)
 
     print("\n4) ReadValue 的时间戳就是拿它算")
     rv = ReadValue(ref=PropRef(did="1", siid=2, piid=1), value=1, ok=True, update_time=int(time.time() - 5 * day))

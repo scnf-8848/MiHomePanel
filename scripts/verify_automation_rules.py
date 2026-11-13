@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 import tempfile
@@ -56,6 +57,7 @@ from mihome.core.automation import (  # noqa: E402
     Rule,
     RuleSet,
     Snapshot,
+    Trigger,
     availability,
     date_text,
     evaluate_conditions,
@@ -167,10 +169,16 @@ class Speaker:
 
 
 def base_rule(**kw) -> Rule:
+    # 旧用例按单个 keys 写；这里统一折成 triggers（v3 起的数据结构），
+    # 调用点不用全改成 Trigger(...)
+    keys = kw.pop("keys", "Ctrl+Alt+F7")
     data = dict(
-        id="r1", name="测试规则", enabled=True, keys="Ctrl+Alt+F7",
+        id="r1", name="测试规则", enabled=True,
+        triggers=[Trigger("keyboard", keys)] if keys else [],
         condition_mode="all", conditions=[], cooldown_ms=1000,
         actions=[Action("virtual_event", name="事件A")],
+        # 归属家庭是云端 id；空归属的规则不会运行，引擎用例必须有归属
+        home="1001",
     )
     data.update(kw)
     return Rule(**data)
@@ -306,15 +314,43 @@ check("选了类型的规则不受影响（空档只在没选时算错）",
       validate_rule(base_rule(conditions=[Condition("idle_minutes", "ge", "10")],
                               actions=[Action("virtual_event", name="A")])) == [])
 
-# 家庭归属（用户 11-13 第二轮）：「1103 家庭里不显示共享家庭的规则」。
-# home 为空串 = 还没归属（升级前写的 rules.json 没这个键 / 没登录时建的），
-# 那种规则**在任何家庭都可见**——藏起来会让人以为规则丢了，不是隔离是丢数据。
-check("home 非空才落盘", base_rule(home="1103 家").to_dict().get("home") == "1103 家")
-check("没归属时不写 home 键", "home" not in base_rule().to_dict())
+# 家庭归属（用户 11-13 第三轮）：归属存**家庭 id**，空归属 = 未指定家庭。
+check("home 非空才落盘", base_rule(home="1001").to_dict().get("home") == "1001")
+check("没归属时不写 home 键", "home" not in base_rule(home="").to_dict())
 check("home 能原样读回",
-      Rule.from_dict(base_rule(home="共享家庭").to_dict()).home == "共享家庭")
+      Rule.from_dict(base_rule(home="1002").to_dict()).home == "1002")
 check("旧数据没 home 键 → 读成空串",
       Rule.from_dict({"id": "old", "name": "老规则"}).home == "")
+
+# 多触发（用户 11-13 第十条）：triggers 是列表，任一命中即执行
+multi = base_rule(triggers=[Trigger("keyboard", "Ctrl+Alt+F7"),
+                            Trigger("keyboard", "F8")])
+check("多触发规则校验通过", validate_rule(multi) == [], str(validate_rule(multi)))
+check("triggers 落盘是列表", [t["keys"] for t in multi.to_dict()["triggers"]]
+      == ["Ctrl+Alt+F7", "F8"], str(multi.to_dict().get("triggers")))
+check("v3 不再写单个 keys 键", "keys" not in multi.to_dict())
+check("多触发能原样读回",
+      [t.keys for t in Rule.from_dict(multi.to_dict()).triggers] == ["Ctrl+Alt+F7", "F8"])
+check("v2 的单个 keys 自动变成一条 keyboard 触发",
+      [t.keys for t in Rule.from_dict({"id": "old", "keys": "ctrl+alt+f9"}).triggers]
+      == ["Ctrl+Alt+F9"])
+check("空触发列表被拦",
+      any("至少要有一个触发方式" in e
+          for e in validate_rule(base_rule(triggers=[]))))
+check("触发空档被拦，且和「类型未知」分开说",
+      any("还没选触发方式" in e
+          for e in validate_rule(base_rule(triggers=[Trigger("", "")]))))
+check("真正写错的触发类型仍然是「触发方式未知」",
+      any("触发方式未知" in e
+          for e in validate_rule(base_rule(triggers=[Trigger("magic", "F7")]))))
+check("同一规则里两个相同快捷键被拦",
+      any("用了同一个快捷键" in e
+          for e in validate_rule(base_rule(triggers=[Trigger("keyboard", "F7"),
+                                                     Trigger("keyboard", "f7")]))))
+check("触发键位大小写不同也算同一个",
+      any("触发 2 与触发 1" in e
+          for e in validate_rule(base_rule(triggers=[Trigger("keyboard", "Ctrl+Alt+F7"),
+                                                     Trigger("keyboard", "ctrl+alt+f7")]))))
 
 path = _TMP / "rules.json"
 rs = RuleSet(path)
@@ -330,6 +366,15 @@ check("启用第二条后同一组合分发给两条", (
     rs3.set_enabled("b", True), len(rs3.rules_for("ctrl+alt+f7")) == 2)[1])
 check("停用后该组合仍只剩一条", (
     rs3.set_enabled("b", False), len(rs3.rules_for("Ctrl+Alt+F7")) == 1)[1])
+# 多触发：一条规则挂两个键，两个都注册、都命中同一条规则
+rsm = RuleSet(_TMP / "multi-rules.json")
+check("多触发规则能加入", rsm.add(base_rule(
+    id="m1", triggers=[Trigger("keyboard", "F7"), Trigger("keyboard", "F8")])))
+check("两个触发的键位都注册", rsm.enabled_keys() == ["F7", "F8"], str(rsm.enabled_keys()))
+check("任一触发都能命中同一条规则",
+      [r.id for r in rsm.rules_for("F8")] == ["m1"])
+check("停用后多触发的键位一起释放",
+      (rsm.set_enabled("m1", False), rsm.enabled_keys() == [])[1])
 check("remove 生效", rs3.remove("b") and rs3.get("b") is None)
 check("update 生效", rs3.update(base_rule(id="a", name="改名后")) and rs3.get("a").name == "改名后")
 
@@ -423,6 +468,13 @@ engine_t, _, _, _ = make_engine(base_rule())
 engine_t.trigger("Ctrl+Alt+F7")
 check("测试绕过冷静期", engine_t.test("r1") is True)
 check("测试日志标明绕过", any("绕过冷静期" in x.detail for x in engine_t.log))
+
+# 多触发：按哪个键都会执行，日志要记下实际按下的那个
+eng_m, _, _, em_m = make_engine(base_rule(
+    triggers=[Trigger("keyboard", "F7"), Trigger("keyboard", "F8")]))
+check("第二个触发也能执行", eng_m.trigger("F8") == 1 and em_m.calls == ["事件A"])
+check("日志记下实际按下的键", eng_m.log[0].keys == "F8", eng_m.log[0].keys)
+check("冷静期按规则算：换另一个触发也被同一条规则挡住", eng_m.trigger("F7") == 0)
 
 # 动作顺序 + 延迟
 seq_rule = base_rule(actions=[
@@ -604,47 +656,74 @@ check("已删规则不能被热键触发", eng_del.trigger("F9") == 0 and not em
 check("已删规则不能被测试发送", eng_del.test("gone") is False)
 
 # ---------------------------------------------------------------------------
-section("家庭隔离：列表只看本家庭，热键照旧全局")
+section("家庭隔离：归属按 id，未指定家庭可见但不运行")
 # ---------------------------------------------------------------------------
 
 hpath = _TMP / "homes.json"
 hs = RuleSet(hpath)
-hs.add(base_rule(id="h1", name="1103 的规则", keys="F1", home="1103 家"))
-hs.add(base_rule(id="h2", name="共享家庭的规则", keys="F2", home="共享家庭"))
-hs.add(base_rule(id="h3", name="还没归属的老规则", keys="F3"))
-check("1103 家庭只看到自己那条 + 没归属的",
-      {r.id for r in hs.active("1103 家")} == {"h1", "h3"},
-      str([r.id for r in hs.active("1103 家")]))
-check("共享家庭的规则一条都不漏进 1103",
-      all(r.home != "共享家庭" for r in hs.active("1103 家")))
-check("切到共享家庭只剩它自己的 + 没归属的",
-      {r.id for r in hs.active("共享家庭")} == {"h2", "h3"})
-check("不传 home = 不过滤（热键 / 引擎走这条）",
+hs.add(base_rule(id="h1", name="1001 的规则", keys="F1", home="1001"))
+hs.add(base_rule(id="h2", name="1002 的规则", keys="F2", home="1002"))
+hs.add(base_rule(id="h3", name="还没选家庭的老规则", keys="F3", home=""))
+check("1001 家庭只看到自己那条 + 未指定家庭的",
+      {r.id for r in hs.active("1001")} == {"h1", "h3"},
+      str([r.id for r in hs.active("1001")]))
+check("1002 的规则一条都不漏进 1001",
+      all(r.home != "1002" for r in hs.active("1001")))
+check("切到 1002 只剩它自己的 + 未指定家庭的",
+      {r.id for r in hs.active("1002")} == {"h2", "h3"})
+check("不传 home = 不过滤（内部枚举）",
       {r.id for r in hs.active()} == {"h1", "h2", "h3"})
-check("热键仍然全部注册（切家庭不该让快捷键失灵）",
-      set(hs.enabled_keys()) == {"F1", "F2", "F3"}, str(hs.enabled_keys()))
-check("引擎按热键找规则也不看家庭",
+check("未指定家庭的规则不注册热键",
+      set(hs.enabled_keys()) == {"F1", "F2"}, str(hs.enabled_keys()))
+check("引擎按热键也找不到未指定家庭的规则", hs.rules_for("F3") == [])
+check("有归属的规则照旧能触发",
       {r.id for r in hs.rules_for("F2")} == {"h2"})
 
 hs.trash("h1")
-check("回收站按家庭过滤", {r.id for r in hs.trashed("1103 家")} == {"h1"})
-check("别的家庭的回收站看不到它", hs.trashed("共享家庭") == [])
+check("回收站按家庭 id 过滤", {r.id for r in hs.trashed("1001")} == {"h1"})
+check("别的家庭的回收站看不到它", hs.trashed("1002") == [])
 hs.trash("h3")
-check("没归属的规则在哪个家的回收站都能看到（还没认领过）",
-      {r.id for r in hs.trashed("共享家庭")} == {"h3"},
-      str([r.id for r in hs.trashed("共享家庭")]))
+check("未指定家庭的规则在哪个家的回收站都能看到（方便找回）",
+      {r.id for r in hs.trashed("1002")} == {"h3"},
+      str([r.id for r in hs.trashed("1002")]))
 hs.restore("h1")
 hs.restore("h3")
 
-# claim：升级前写的 rules.json 没有 home，登录后一次性认到当时那个家庭
-check("claim 只认领空归属的", hs.claim("1103 家") is True)
-check("认领后老规则有了 home", hs.get("h3").home == "1103 家")
-check("已经归属别家的一动没动", hs.get("h2").home == "共享家庭")
-check("没有可认领的再调返回 False", hs.claim("共享家庭") is False)
-check("claim 落了盘", RuleSet(hpath).get("h3").home == "1103 家")
-check("认领后它不再出现在别的家庭",
-      {r.id for r in hs.active("共享家庭")} == {"h2"},
-      str([r.id for r in hs.active("共享家庭")]))
+# v1 按家庭名存：加载时把归属置空，规则其余字段一个不少
+legacy = _TMP / "legacy-rules.json"
+legacy.write_text(json.dumps({"version": 1, "rules": [{
+    "id": "old1", "name": "老规则", "enabled": False, "keys": "F11",
+    "condition_mode": "any",
+    "conditions": [{"type": "idle_minutes", "op": "ge", "arg": "5"}],
+    "actions": [{"type": "delay", "ms": 300}],
+    "cooldown_ms": 2000, "home": "共享家庭",
+}]}, ensure_ascii=False), encoding="utf-8")
+old = RuleSet(legacy).get("old1", include_deleted=True)
+check("v1 的家庭名归属被置空", old is not None and old.home == "", repr(old.home if old else None))
+check("v1 规则本身全部保留（名称 / 键位 / 条件 / 动作 / 启停 / 冷静期）",
+      old is not None and (old.name, old.keys, old.enabled, old.condition_mode,
+                           old.cooldown_ms) == ("老规则", "F11", False, "any", 2000)
+      and [c.type for c in old.conditions] == ["idle_minutes"]
+      and [a.type for a in old.actions] == ["delay"])
+check("v1 老规则不注册热键",
+      RuleSet(legacy).enabled_keys() == [])
+
+# v2（单个 keys + 家庭 id）：升级到 v3 只把 keys 摊成触发行，归属不能被清空
+v2 = _TMP / "v2-rules.json"
+v2.write_text(json.dumps({"version": 2, "rules": [{
+    "id": "v2r", "name": "v2 规则", "keys": "Ctrl+Alt+F6", "home": "1002",
+    "actions": [{"type": "virtual_event", "name": "A"}],
+}]}, ensure_ascii=False), encoding="utf-8")
+v2r = RuleSet(v2).get("v2r", include_deleted=True)
+check("v2 → v3 保留家庭 id", v2r is not None and v2r.home == "1002",
+      repr(v2r.home if v2r else None))
+check("v2 的 keys 升成一条触发",
+      v2r is not None and [t.keys for t in v2r.triggers] == ["Ctrl+Alt+F6"])
+check("v2 规则的热键继续注册", RuleSet(v2).enabled_keys() == ["Ctrl+Alt+F6"])
+
+# 空归属规则直接进引擎也不会被触发（不能静默按某个家庭执行）
+eng_empty, _, _, em_empty = make_engine(base_rule(id="e1", keys="F12", home=""))
+check("空归属规则热键触发被拒", eng_empty.trigger("F12") == 0 and not em_empty.calls)
 
 # ---------------------------------------------------------------------------
 section("日志：中文结果名 / 筛选查找 / 表格列")

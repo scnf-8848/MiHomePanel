@@ -46,9 +46,6 @@ class AutomationService(QObject):
         self.store = store
         self.rules = RuleSet(path)
         self.rules.on_changed = self._on_rules_changed
-        # 升级前写的老规则没有 home，登录后第一时间认到当时那个家庭。
-        # 必须排在 registry / engine 建好之前（claim 不触发 on_changed，安全）。
-        self.adopt_home()
         self.sender = VirtualEventSender(
             lambda: client.raw(), lambda: store.devices.values())
         self.engine = AutomationEngine(
@@ -84,21 +81,28 @@ class AutomationService(QObject):
     # -- 查询（给页面） --------------------------------------------------
     @property
     def current_home(self) -> str:
-        """当前在看的家庭名（未加载 / 未登录时是空串）。规则归属以它为准。"""
+        """当前在看家庭的**云端 id**（未加载 / 未登录时是空串）。
+
+        规则的 ``home`` 与它同一口径。要显示给用户看时用 :meth:`home_label`，
+        **别在内部拿 id 和家庭名做匹配**。
+        """
         return str(getattr(self.store, "active_home", "") or "")
 
-    def adopt_home(self) -> bool:
-        """把还没归属的规则认到当前家庭。返回是否真改了。
+    def home_label(self, home_id: str = "") -> str:
+        """家庭 id → 显示名。只给界面 / 文案用；匹配一律用 id。"""
+        want = self.current_home if not home_id else home_id
+        label = getattr(self.store, "home_label", None)
+        return str(label(want)) if callable(label) else want
 
-        调用点：构造期（升级前的 ``rules.json``）、切家庭、设备列表加载完成。
-        认领过之后规则就有了 ``home``，切到别的家庭就看不到了——这正是用户要的
-        "1103 家庭里不显示共享家庭的规则"。
+    def home_has_hub(self, home_id: str = "") -> bool:
+        """这个家庭有没有中枢网关（「发虚拟事件」的前提）。
 
-        **只认领空归属的**，已经归属别的家庭的规则原样不动：在 A 家庭建的规则，
-        切到 B 家庭不该被顺手搬过去。
+        判据直接复用极客版入口那套 ``Store.home_has_hub``（``core.geek`` 的探测
+        结论），不另维护型号名单。``home_id`` 收家庭 id，与规则归属同一口径。
         """
-        home = self.current_home
-        return bool(home) and self.rules.claim(home)
+        want = self.current_home if not home_id else home_id
+        check = getattr(self.store, "home_has_hub", None)
+        return bool(check(want)) if callable(check) else False
 
     def status_for(self, keys: str) -> str:
         return self.registry.status(keys)
@@ -110,11 +114,11 @@ class AutomationService(QObject):
     def speaker_targets(self, home: str | None = None) -> list[speaker.Target]:
         """某个家庭里能「执行文本指令」的音箱。默认 = 当前家庭。
 
-        编辑页的「发音箱指令」候选就从这里来——所以 1103 家庭点进自动化，下拉里
-        只有 1103 的音箱。判据与顶栏指令条共用 ``speaker.collect_home``，别在两处
-        各写一份筛选。
+        ``home`` 收家庭 **id**（与规则归属同一口径）；``speaker.collect_home``
+        的筛选语义是**显示名**，所以只在这一层把 id 换成名字——这是用户可见的
+        筛选条件，不是规则归属匹配。编辑页的「发音箱指令」候选就从这里来。
         """
-        want = getattr(self.store, "active_home", "") if home is None else home
+        want = self.home_label(self.current_home if home is None else home)
         return speaker.collect_home(getattr(self.store, "devices", {}).values(), want)
 
     def test(self, rule_id: str) -> bool:

@@ -36,10 +36,15 @@ from .geek import candidates as geek_candidates
 from .geek import fetch as fetch_geek_entry
 from .geek import probe as geek_probe
 from .geek import remember as geek_remember
+from .geek import supports as geek_supports
 from .jobs import PRIORITY_CONTROL, PRIORITY_DATA, SerialWorker
-from .prefs import HIDDEN_ROOM, Prefs
+from .prefs import HIDDEN_ROOM, HIDDEN_ROOM_ID, Prefs
 from .spec import DeviceSpec, PropertySpec, SpecRepository, localize
-from .tree import DeviceNode
+from .tree import (
+    UNASSIGNED_ROOM_ID,
+    UNASSIGNED_ROOM_LABEL,
+    DeviceNode,
+)
 
 # 轮询的**频率**不在这里：它由"谁在看"决定（`ui/main_window.py` 的 `POLL_MS` /
 # `POLL_HIDDEN_MS`），Store 只负责"该发的时候发、上一轮没回来就跳过"。
@@ -142,6 +147,16 @@ class DeviceState:
         return bool(self.power)
 
     @property
+    def home_id(self) -> str:
+        return self.node.home_id
+
+    @property
+    def room_id(self) -> str:
+        # 没分到房间的设备统一落在这个占位值上：排序、分组、显示都靠它对齐，
+        # 不能用 "" / 0 冒充云端 id。
+        return self.node.room_id or UNASSIGNED_ROOM_ID
+
+    @property
     def subtitle(self) -> str:
         return summary_line(self.card, self.values)
 
@@ -152,12 +167,19 @@ class DeviceState:
 
 @dataclass
 class RoomView:
+    """一个房间的展示数据。``home`` / ``room`` 都是云端 id，显示用 label。"""
+
     home: str
     home_label: str
     room: str
     devices: list[DeviceState] = field(default_factory=list)
     #: ``"room"`` 普通房间 / ``"lost"`` 未分组 / ``"hidden"`` 已隐藏设备分组
     kind: str = "room"
+    room_label: str = ""
+
+    @property
+    def display_room(self) -> str:
+        return self.room_label
 
 
 class Store:
@@ -179,7 +201,7 @@ class Store:
         self.scenes: list[dict[str, Any]] = []
         self.scenes_by_home: dict[str, list[dict[str, Any]]] = {}
         self.home_id = ""
-        self.active_home = ""  # 当前正在看的家庭名（首页只有这一个家庭）
+        self.active_home = ""  # 当前正在看的家庭 id（首页只有这一个家庭）
         self.loading = False
         self.polling = False
         self.last_poll = 0.0
@@ -263,7 +285,7 @@ class Store:
         # 切家庭时就不用再等一次网络。
         scenes: dict[str, list[dict[str, Any]]] = {}
         for home in topo.homes:
-            scenes[home.name] = self.client.scenes(home.id)
+            scenes[home.id] = self.client.scenes(home.id)
         return topo, specs, scenes
 
     def _on_loaded(self, result: Any, error: BaseException | None) -> None:
@@ -276,9 +298,9 @@ class Store:
         self.scenes_by_home = scenes
         self.home_id = topo.homes[0].id if topo.homes else ""
         self.apply_topology(topo, specs)
-        names = [h.name for h in self.homes()]
-        if self.active_home not in names:
-            self.active_home = names[0] if names else ""
+        ids = [h.id for h in self.homes()]
+        if self.active_home not in ids:
+            self.active_home = ids[0] if ids else ""
         self.scenes = self.scenes_for(self.active_home)
         self._status(f"已连接 · {len(self.devices)} 台设备")
         if self.on_loaded:
@@ -367,29 +389,36 @@ class Store:
     # -- 视图 ------------------------------------------------------------
     def homes(self) -> list[HomeNode]:
         """按用户偏好排过序的家庭。界面上的家庭切换栏直接用这个顺序。"""
-        by_name = {h.name: h for h in self.topology.homes}
-        return [by_name[name] for name in self.prefs.order_homes(list(by_name))]
+        by_id = {h.id: h for h in self.topology.homes if h.id}
+        return [by_id[hid] for hid in self.prefs.order_homes(list(by_id))]
 
-    def home_label(self, name: str) -> str:
+    def home_label(self, home_id: str) -> str:
         for h in self.topology.homes:
-            if h.name == name:
+            if h.id == home_id:
                 return h.display_name
-        return name or "我的家"
+        return home_id or "我的家"
 
-    def id_for_home(self, name: str) -> str:
-        for h in self.topology.homes:
-            if h.name == name:
-                return h.id
-        return ""
+    def home_has_hub(self, home_id: str) -> bool:
+        """这个家庭有没有中枢网关。
 
-    def _home_of(self, state: DeviceState) -> str:
-        """设备归属的家庭名。个别共享设备的 home 是空的，归到第一个家庭。"""
-        if state.node.home:
-            return state.node.home
-        return self.topology.homes[0].name if self.topology.homes else ""
+        判据与「极客版入口」共用一套：``geek.supports(did, model)`` 的探测结论
+        （不耗码的 RPC 探出来、按 did 落在 ``geek_ability.json``）。还没探出结论
+        的设备不算——"能不能发虚拟事件"必须是**已证实**的能力，不猜。
+        """
+        return any(
+            self._home_id_of(st) == home_id
+            and geek_supports(st.node.did, st.node.model)
+            for st in self.devices.values()
+        )
+
+    def _home_id_of(self, state: DeviceState) -> str:
+        """设备归属的家庭 id。个别共享设备的 home_id 是空的，归到第一个家庭。"""
+        if state.node.home_id:
+            return state.node.home_id
+        return self.topology.homes[0].id if self.topology.homes else ""
 
     def device_room(self, did: str) -> tuple[str, str] | None:
-        """设备所在的 (家庭, 房间)；没有房间的设备记作「未分组」。
+        """设备所在的 (家庭 id, 房间 id)；没有房间的设备用稳定占位值。
 
         隐藏 / 恢复时要把 did 追加到**它自己的房间**末尾，``Prefs`` 不知道
         设备归属，只能由这里解析。设备还没加载出来时返回 ``None``。
@@ -397,92 +426,115 @@ class Store:
         st = self.devices.get(did)
         if st is None:
             return None
-        return self._home_of(st), (st.node.room or "未分组")
+        room_id = st.room_id
+        return self._home_id_of(st), room_id
 
-    def rooms(self, home: str | None = None) -> list[RoomView]:
+    def rooms(self, home_id: str | None = None) -> list[RoomView]:
         """输出某个家庭的 房间 → 设备，顺序是"用户排过的在前，其余跟云端"。
 
         ``hidden`` 分组的设备不会出现在自己的房间里，而是集中到末尾一组，
         这样卡片墙只留真正会去点的东西。
         """
         homes = self.homes()
-        if home:
-            homes = [h for h in homes if h.name == home]
+        if home_id:
+            homes = [h for h in homes if h.id == home_id]
         views: list[RoomView] = []
         for h in homes:
-            names = [r.name for r in h.rooms]
-            for room in self.prefs.order_rooms(h.name, names):
+            by_id = {r.id: r for r in h.rooms}
+            for room_id in self.prefs.order_rooms(h.id, list(by_id)):
+                room_label = by_id[room_id].name
                 items = [
                     d for d in self.devices.values()
-                    if d.node.room == room
-                    and self._home_of(d) == h.name
+                    if d.room_id == room_id
+                    and self._home_id_of(d) == h.id
                     and d.did not in self.prefs.hidden_set
                 ]
-                items = self._ordered_devices(h.name, room, items)
+                items = self._ordered_devices(h.id, room_id, items)
                 if items:
-                    views.append(RoomView(h.name, h.display_name, room, items))
+                    views.append(
+                        RoomView(h.id, h.display_name, room_id, items, room_label=room_label)
+                    )
             lost = [
                 d for d in self.devices.values()
-                if not d.node.room
-                and self._home_of(d) == h.name
+                if d.room_id == UNASSIGNED_ROOM_ID
+                and self._home_id_of(d) == h.id
                 and d.did not in self.prefs.hidden_set
             ]
             if lost:
-                views.append(RoomView(h.name, h.display_name, "未分组",
-                                      self._ordered_devices(h.name, "未分组", lost), "lost"))
-            hidden = self._hidden_devices(h.name)
+                views.append(
+                    RoomView(
+                        h.id,
+                        h.display_name,
+                        UNASSIGNED_ROOM_ID,
+                        self._ordered_devices(h.id, UNASSIGNED_ROOM_ID, lost),
+                        "lost",
+                        UNASSIGNED_ROOM_LABEL,
+                    )
+                )
+            hidden = self._hidden_devices(h.id)
             if hidden:
-                views.append(RoomView(h.name, h.display_name, HIDDEN_ROOM, hidden, "hidden"))
+                views.append(
+                    RoomView(
+                        h.id, h.display_name, HIDDEN_ROOM_ID, hidden, "hidden", HIDDEN_ROOM,
+                    )
+                )
         return views
 
-    def _ordered_devices(self, home: str, room: str, items: list[DeviceState]) -> list[DeviceState]:
-        order = self.prefs.order_devices(home, room, [d.did for d in items])
+    def _ordered_devices(
+        self, home_id: str, room_id: str, items: list[DeviceState],
+    ) -> list[DeviceState]:
+        order = self.prefs.order_devices(home_id, room_id, [d.did for d in items])
         by_did = {d.did: d for d in items}
         return [by_did[did] for did in order]
 
-    def _hidden_devices(self, home: str) -> list[DeviceState]:
+    def _hidden_devices(self, home_id: str) -> list[DeviceState]:
         items = [
             d for d in self.devices.values()
-            if d.did in self.prefs.hidden_set and self._home_of(d) == home
+            if d.did in self.prefs.hidden_set and self._home_id_of(d) == home_id
         ]
         order = self.prefs.order_hidden([d.did for d in items])
         by_did = {d.did: d for d in items}
         return [by_did[did] for did in order]
 
-    def room_names(self, home: str) -> list[str]:
-        """配置页用：这个家庭下所有房间（含空房间与"未分组"）。"""
-        node = next((h for h in self.topology.homes if h.name == home), None)
-        names = [r.name for r in node.rooms] if node else []
-        if any(self._home_of(d) == home and not d.node.room for d in self.devices.values()):
-            names.append("未分组")
-        return self.prefs.order_rooms(home, names)
+    def room_entries(self, home_id: str) -> list[tuple[str, str]]:
+        """配置页用：这个家庭下所有房间 (id, 显示名)，含空房间与「未分组」。"""
+        node = next((h for h in self.topology.homes if h.id == home_id), None)
+        entries = [(r.id, r.name) for r in node.rooms] if node else []
+        if any(
+            self._home_id_of(d) == home_id
+            and d.room_id == UNASSIGNED_ROOM_ID
+            for d in self.devices.values()
+        ):
+            entries.append((UNASSIGNED_ROOM_ID, UNASSIGNED_ROOM_LABEL))
+        by_id = dict(entries)
+        ordered = self.prefs.order_rooms(home_id, [room_id for room_id, _ in entries])
+        return [(room_id, by_id[room_id]) for room_id in ordered]
 
-    def device_states(self, home: str, room: str) -> list[DeviceState]:
+    def room_ids(self, home_id: str) -> list[str]:
+        return [room_id for room_id, _ in self.room_entries(home_id)]
+
+    def device_states(self, home_id: str, room_id: str) -> list[DeviceState]:
         """配置页用：房间内全部设备（含被隐藏的），按当前顺序。"""
-        if room == "未分组":
-            items = [
-                d for d in self.devices.values()
-                if self._home_of(d) == home and not d.node.room
-            ]
-        else:
-            items = [
-                d for d in self.devices.values()
-                if self._home_of(d) == home and d.node.room == room
-            ]
-        return self._ordered_devices(home, room, items)
+        items = [
+            d for d in self.devices.values()
+            if self._home_id_of(d) == home_id and d.room_id == room_id
+        ]
+        return self._ordered_devices(home_id, room_id, items)
 
-    def home_devices(self, home: str) -> list[DeviceState]:
-        items = [d for d in self.devices.values() if self._home_of(d) == home]
-        return sorted(items, key=lambda d: (d.node.room, d.name))
+    def home_devices(self, home_id: str) -> list[DeviceState]:
+        items = [d for d in self.devices.values() if self._home_id_of(d) == home_id]
+        return sorted(items, key=lambda d: (d.room_id, d.name))
 
-    def scenes_for(self, home: str, *, include_hidden: bool = False) -> list[dict[str, Any]]:
+    def scenes_for(self, home_id: str, *, include_hidden: bool = False) -> list[dict[str, Any]]:
         """按用户偏好排过的场景列表。未知的新场景追加在末尾。
 
         默认滤掉被隐藏的场景（首页那排胶囊用）；设置页要 ``include_hidden=True``，
         否则一旦隐藏就再也找不回来。
         """
-        raw = self.scenes_by_home.get(home) or []
-        order = self.prefs.order_scenes(home, [str(s.get("scene_id") or "") for s in raw])
+        raw = self.scenes_by_home.get(home_id) or []
+        order = self.prefs.order_scenes(
+            home_id, [str(s.get("scene_id") or "") for s in raw],
+        )
         by_id = {str(s.get("scene_id") or ""): s for s in raw}
         hidden = self.prefs.hidden_scene_set
         out = []
@@ -494,6 +546,9 @@ class Store:
                 continue
             out.append(scene)
         return out
+
+    def home_ids(self) -> list[str]:
+        return [h.id for h in self.homes()]
 
     def home_names(self) -> list[str]:
         return [h.name for h in self.homes()]
@@ -544,16 +599,16 @@ class Store:
         )
 
     # -- 排序与隐藏 ------------------------------------------------------
-    def set_home_order(self, names: Sequence[str]) -> None:
-        self.prefs.set_home_order(names)
+    def set_home_order(self, home_ids: Sequence[str]) -> None:
+        self.prefs.set_home_order(home_ids)
         self._layout_changed()
 
-    def set_room_order(self, home: str, names: Sequence[str]) -> None:
-        self.prefs.set_room_order(home, names)
+    def set_room_order(self, home_id: str, room_ids: Sequence[str]) -> None:
+        self.prefs.set_room_order(home_id, room_ids)
         self._layout_changed()
 
     def set_device_order(
-        self, home: str, room: str, dids: Sequence[str], *, notify: bool = True
+        self, home_id: str, room_id: str, dids: Sequence[str], *, notify: bool = True
     ) -> None:
         """写入房间内的卡片顺序（只含可见设备）。
 
@@ -561,12 +616,12 @@ class Store:
         ``on_layout_changed`` 会把整面墙重建，滚动位置和刚放下的卡片都会跳。
         隐藏设备不在顺序表里，这一点由 ``Prefs`` 的写入口统一保证。
         """
-        self.prefs.set_device_order(home, room, dids)
+        self.prefs.set_device_order(home_id, room_id, dids)
         if notify:
             self._layout_changed()
 
-    def set_scene_order(self, home: str, scene_ids: Sequence[str]) -> None:
-        self.prefs.set_scene_order(home, scene_ids)
+    def set_scene_order(self, home_id: str, scene_ids: Sequence[str]) -> None:
+        self.prefs.set_scene_order(home_id, scene_ids)
         self._layout_changed()
 
     def set_hidden(self, did: str, hidden: bool) -> None:
@@ -1224,10 +1279,10 @@ class Store:
             callback=done,
         )
 
-    def run_scene(self, scene_id: str, home: str = "") -> None:
+    def run_scene(self, scene_id: str, home_id: str = "") -> None:
         self.worker.submit(
             self.client.run_scene,
-            (scene_id, self.id_for_home(home) or self.home_id),
+            (scene_id, home_id or self.home_id),
             priority=PRIORITY_CONTROL,
             label="scene",
             callback=self._on_scene_done,

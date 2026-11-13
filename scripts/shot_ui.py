@@ -90,10 +90,10 @@ def main() -> int:
         if not cards:
             # 深色那张是在切到第二个家庭之后拍的，那个家庭可能一台多键开关都没有；
             # 临时切回有的家庭，抓完切回去，免得影响后面的步骤。
-            for home_name in win.store.home_names():
-                if any(d.node.home == home_name and d.card.gangs
+            for home_id in win.store.home_ids():
+                if any(d.node.home_id == home_id and d.card.gangs
                        for d in win.store.devices.values()):
-                    win._on_home_selected(home_name)  # noqa: SLF001
+                    win._on_home_selected(home_id)  # noqa: SLF001
                     QApplication.processEvents()
                     cards = collect()
                     restored = True
@@ -191,18 +191,18 @@ def main() -> int:
         ))
 
     def step_home2() -> None:
-        names = win.store.home_names()
-        if len(names) < 2:
+        ids = win.store.home_ids()
+        if len(ids) < 2:
             step_hidden()
             return
-        win._on_home_selected(names[1])  # noqa: SLF001
+        win._on_home_selected(ids[1])  # noqa: SLF001
         QTimer.singleShot(700, lambda: (grab("home2.png"), step_hidden()))
 
     def step_hidden() -> None:
         active = win.store.active_home
         victim = next(
             (d for d in win.store.devices.values()
-             if d.node.home == active and not win.store.prefs.is_hidden(d.did)),
+             if d.node.home_id == active and not win.store.prefs.is_hidden(d.did)),
             None,
         )
         if victim is not None:
@@ -617,9 +617,9 @@ def main() -> int:
 
         # 前面的步骤切到了第二个家庭，那边的灯少；先回设备多的家庭，
         # 并且只认当前墙上真的有卡片的 did（隐藏分组 / 别的家庭都不算）。
-        names = win.store.home_names()
-        if names:
-            win._on_home_selected(names[0])  # noqa: SLF001
+        ids = win.store.home_ids()
+        if ids:
+            win._on_home_selected(ids[0])  # noqa: SLF001
             app.processEvents()
         target = next(
             (d for d in win.store.devices.values()

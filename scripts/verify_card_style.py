@@ -403,7 +403,9 @@ class FakeStore:
         self.prefs = prefs
         self.devices = {s.did: s for s in states}
         self.scenes: list = []
-        self.views = [RoomView("h", "我的家", "客厅", list(states))]
+        self.views = [
+            RoomView("h", "我的家", "r1", list(states), room_label="客厅"),
+        ]
 
     def rooms(self, home: str | None = None):
         return self.views
@@ -473,8 +475,8 @@ def main() -> int:
     check("坏数据 / v3 迁移只留合法项", loaded.card_styles,
           {"new": LIGHT_BRIGHT, "v3_dual": LIGHT_DUAL})
     check("v3 的 2×1 标准退回默认（记录被清掉）", loaded.card_style("v3_wide"), None)
-    check("落盘版本已升到 9（v9 加了顶栏指令条的目标音箱）",
-          json.loads((tmp / "p.json").read_text(encoding="utf-8"))["version"], 10)
+    check("落盘版本已升到 11（v11 排序键改用云端 id）",
+          json.loads((tmp / "p.json").read_text(encoding="utf-8"))["version"], 11)
 
     print("\n2) 样式解析：能力过滤 / 宽度由样式自带")
     check("灯的三个样式", [s.id for s in available_styles(light.card)],

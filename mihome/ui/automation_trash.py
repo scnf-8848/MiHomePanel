@@ -32,6 +32,7 @@ from PySide6.QtWidgets import (
 from ..core.automation import Rule
 from ..core.automation.service import AutomationService
 from . import theme
+from .automation_list import _home_label, trigger_text
 from .automation_style import (
     CARD_H, chip_border, chip_fill, common_qss, fit_height, reserve_scrollbar,
     tab_focus_only,
@@ -109,7 +110,7 @@ class TrashCard(QFrame):
         name = QLabel(rule.name or "未命名规则", self)
         name.setObjectName("TrashName")
         grid.addWidget(name, 0, 0, 1, 2, Qt.AlignLeft | Qt.AlignVCenter)
-        meta = QLabel(f"{rule.keys or '未设置快捷键'}　·　{_deleted_text(rule)}", self)
+        meta = QLabel(f"{trigger_text(rule)}　·　{_deleted_text(rule)}", self)
         meta.setObjectName("TrashMeta")
         grid.addWidget(meta, 1, 0, 1, 1, Qt.AlignLeft | Qt.AlignVCenter)
 
@@ -204,12 +205,13 @@ class AutomationTrashDialog(QDialog):
             if widget is not None:
                 widget.setParent(None)
                 widget.deleteLater()
-        # 规则按家庭隔离：回收站也只放**当前家庭**删掉的规则
+        # 规则按家庭隔离：回收站也只放**当前家庭**删掉的规则（home 是家庭 id）
         home = str(getattr(self.service, "current_home", "") or "")
         rules = self.service.rules.trashed(home)
         self.title_bar.set_subtitle(f"{len(rules)} 条已删除规则")
         if not rules:
-            extra = f"\n只收「{home}」这个家庭删掉的规则" if home else ""
+            label = _home_label(self.service, home)
+            extra = f"\n只收「{label}」这个家庭删掉的规则" if label else ""
             empty = QLabel("回收站是空的\n列表页点「删除」的规则会先放到这里" + extra,
                            self.list_body)
             empty.setObjectName("TrashEmpty")

@@ -46,10 +46,16 @@ class Store(V.LooseStore):
     """设置页要的方法，``LooseStore.__getattr__`` 会返回 None（循环直接崩）。"""
 
     def homes(self):
-        return [SimpleNamespace(name="我的家", display_name="我的家")]
+        return [SimpleNamespace(id="h", name="我的家", display_name="我的家")]
 
-    def room_names(self, home: str) -> list[str]:
-        return ["客厅"]
+    def home_ids(self) -> list[str]:
+        return ["h"]
+
+    def room_entries(self, home_id: str) -> list[tuple[str, str]]:
+        return [("r1", "客厅")]
+
+    def room_ids(self, home_id: str) -> list[str]:
+        return ["r1"]
 
     def device_states(self, home: str, room: str):
         return list(self.devices.values())

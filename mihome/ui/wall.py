@@ -44,6 +44,7 @@ from PySide6.QtWidgets import (
 from ..core.camera import is_camera
 from ..core.geek import Entry
 from ..core.store import DeviceState, RoomView, Store
+from ..core.tree import UNASSIGNED_ROOM_LABEL
 from . import theme, tooltip
 from .camera_card import CameraCard
 from .camera_view import CameraView, playbacks
@@ -175,7 +176,7 @@ class _RoomHeader(QWidget):
     ) -> None:
         super().__init__()
         self._p = palette
-        self._room = view.room
+        self._room = view.room_label
         self._note = note
         self._subtle = view.kind == "hidden"
         self._collapsible = collapsible
@@ -302,17 +303,17 @@ class _GroupLabel(QWidget):
         p.end()
 
 
-def _rooms_in_order(devices) -> list[str]:
-    """按首次出现顺序列出这批设备所属的房间。
+def _rooms_in_order(devices) -> list[tuple[str, str]]:
+    """按首次出现顺序列出这批设备所属的 (房间 id, 显示名)。
 
     隐藏分组的顺序来自 ``prefs.order_hidden``（用户拖过的在前），用首现顺序
     分组就自然沿用了那个顺序，不用再单独排一次房间。
     """
-    seen: list[str] = []
+    seen: list[tuple[str, str]] = []
     for d in devices:
-        room = d.node.room or "未分组"
-        if room not in seen:
-            seen.append(room)
+        room_id = d.room_id
+        if all(room_id != key for key, _ in seen):
+            seen.append((room_id, d.node.room or UNASSIGNED_ROOM_LABEL))
     return seen
 
 
@@ -364,10 +365,9 @@ class RoomSection(QWidget):
             outer = QVBoxLayout(body)
             outer.setContentsMargins(0, 0, 0, 0)
             outer.setSpacing(4)
-            for room in rooms:
-                count = sum(1 for d in view.devices
-                            if (d.node.room or "未分组") == room)
-                label = _GroupLabel(f"{room} · {count} 台", palette)
+            for room_id, room_name in rooms:
+                count = sum(1 for d in view.devices if d.room_id == room_id)
+                label = _GroupLabel(f"{room_name} · {count} 台", palette)
                 host = QWidget()
                 # 卡片流要能把 heightForWidth 传给父布局，否则分组后高度算不出来
                 policy = QSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
@@ -377,7 +377,7 @@ class RoomSection(QWidget):
                 flow = CardGridLayout(host, margin=0, h_gap=8, v_gap=8)
                 outer.addWidget(label)
                 outer.addWidget(host)
-                self._groups[room] = (label, host, flow)
+                self._groups[room_id] = (label, host, flow)
                 self.flows.append(flow)
             outer.addStretch(1)
         else:
@@ -440,8 +440,8 @@ class RoomSection(QWidget):
 
     def add_card(self, card: DeviceCard) -> None:
         self.cards[card.state.did] = card
-        room = card.state.room or "未分组"
-        group = self._groups.get(room)
+        room_id = card.state.room_id
+        group = self._groups.get(room_id)
         (group[2] if group is not None else self.flow).addWidget(card)
 
     def invalidate_flows(self) -> None:
@@ -474,11 +474,11 @@ class RoomSection(QWidget):
             card.setVisible(hit)
             if hit:
                 shown += 1
-                room = card.state.room or "未分组"
-                per_room[room] = per_room.get(room, 0) + 1
+                room_id = card.state.room_id
+                per_room[room_id] = per_room.get(room_id, 0) + 1
         # 没有命中项的房间整块消失，不留一行孤零零的小标题
-        for room, (label, host, _flow) in self._groups.items():
-            on = per_room.get(room, 0) > 0
+        for room_id, (label, host, _flow) in self._groups.items():
+            on = per_room.get(room_id, 0) > 0
             label.setVisible(on)
             host.setVisible(on)
         if shown:

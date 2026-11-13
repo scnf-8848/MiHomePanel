@@ -5,23 +5,37 @@
 ``hotkeys.json`` 或 ``prefs.json`` 副本（Windows 注册热键不需要任何文件，见
 ``docs/reference/automation-hotkeys-and-ui.md`` 第 2 节）。
 
-形状（v1，对应米家 App「创建自动化」页）：
+形状（v3，对应米家 App「创建自动化」页）：
 
-    {id, name, enabled, keys, condition_mode, conditions[], actions[], cooldown_ms[, home]}
+    {id, name, enabled, triggers[], condition_mode, conditions[], actions[], cooldown_ms[, home]}
+    triggers[]   = {type:"keyboard", keys}   至少一条；**任一触发命中即执行**
     conditions[] = {type, op, arg}        空数组 = 无条件
     actions[]    = {type:"virtual_event", name}
                  | {type:"delay", ms[, unit:"s"]}
                  | {type:"speaker", did, name, text[, silent:true]}
 
-**规则按家庭隔离**（用户 11-13）：``home`` 记规则创建时所在的米家家庭名，列表窗 /
+**多触发**（用户 11-13 第十条）：一条规则可以挂多个触发，语义是 **OR**——任何一条
+命中都执行这条规则，条件 / 冷静期 / 动作队列与单触发完全一样。目前只实现
+``keyboard`` 一种触发类型，``triggers[]`` 的 ``type`` 先占住位置，以后加别的
+触发源（进程启动、网络变化）不用再改 schema。
+
+v2 及更早的文件里是单个 ``keys`` 字符串：加载时自动变成 ``triggers`` 里的一条
+``keyboard``，键位不丢；v3 起只写 ``triggers``，不再写 ``keys``。旧版本程序读
+v3 文件会看到 ``version: 3`` 的兼容警告，规则本身仍然可读（只是没有键位）。
+
+**规则按家庭隔离**（用户 11-13）：``home`` 记规则归属的云端**家庭 id**，列表窗 /
 回收站 / 日志的规则筛选只显示**当前家庭**的那几条，免得在 1103 家庭里看到共享家庭
 建的规则。三条约定：
 
-* ``home`` 为**空串 = 还没归属**（旧版本 ``rules.json`` 没这个键、或者没登录时建的）。
-  这种规则在**任何**家庭都可见，不会被藏起来——升级后不能让人以为规则丢了。
-  ``RuleSet.claim()`` 会在登录后把它们一次性认到当时那个家庭（``service.adopt_home``）。
-* **热键与引擎不过滤家庭**：热键是这台电脑的系统资源，被自动化的也是这台电脑，
-  切到别的家庭去看设备不该让自己的快捷键失灵。家庭只决定"在哪个页面能看到和改"。
+* ``home`` 为**空串 = 未指定家庭**（v2 之前按家庭名存的老数据、或者没选家庭就
+  保存的规则）。这种规则在**任何**家庭都可见，方便用户找到并重新选一次；但它
+  **不注册热键、不参与触发**——不能静默按某个家庭执行。
+* 旧版（``rules.json`` v1）按家庭名存的归属在加载时**直接置空**，规则本身
+  （条件、动作、启用状态、名称、id）全部保留；不做名字→id 的迁移。
+  ``RuleSet`` 不再自动"认领"空归属的规则，用户必须在编辑窗里自己选。
+* **热键与引擎不做家庭过滤**：热键是这台电脑的系统资源，被自动化的也是这台电脑，
+  切到别的家庭去看设备不该让自己的快捷键失灵。家庭只决定"在哪个页面能看到和改"，
+  以及执行时这条规则到底算不算数（空归属不算）。
 * 执行时按 ``did`` 全家庭找音箱（见 ``service._say``），所以指向别的家庭音箱的规则
   只要那台设备还在，照样能跑。
 
@@ -48,7 +62,7 @@ from .. import paths
 from ..speaker import MAX_CHARS as MAX_SPEAK_CHARS
 from .hotkeys import normalize, reserved_reason
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 3
 RULES_FILE = "rules.json"
 DEFAULT_COOLDOWN_MS = 1000
 MAX_COOLDOWN_MS = 600_000
@@ -56,6 +70,9 @@ MAX_DELAY_MS = 600_000
 MAX_NAME_LEN = 60
 
 CONDITION_MODES = ("all", "any")
+
+#: 触发类型 → 中文名。目前只有键盘快捷键；多触发行是 OR（任一命中即执行）。
+TRIGGER_TYPES: dict[str, str] = {"keyboard": "键盘快捷键"}
 
 #: type → (中文名, 允许的 op, 参数提示, 参数是不是数值)
 CONDITION_TYPES: dict[str, tuple[str, tuple[str, ...], str, bool]] = {
@@ -97,11 +114,41 @@ def _integer(value: Any, default: int, low: int, high: int) -> int:
 def _in_home(rule: Rule, home: str | None) -> bool:
     """这条规则属不属于 ``home`` 这个家庭。
 
-    ``home is None`` = 不按家庭过滤（热键注册 / 引擎触发走这条）；**空归属的规则
-    在任何家庭都算**——那是升级前的老数据，藏起来会让人以为规则丢了
-    （判据与 ``speaker.collect_home`` 同一套，别分头写）。
+    ``home is None`` = 不按家庭过滤（列表 / 回收站 / 日志传当前家庭 id）。
+    **空归属的规则在任何家庭都算**——那是 v1 老数据或用户没选家庭，藏起来会让人
+    以为规则丢了；但执行路径（``enabled_keys`` / ``rules_for``）会显式跳过它，
+    可见 ≠ 会运行。
     """
     return home is None or not rule.home or rule.home == home
+
+
+@dataclass(slots=True)
+class Trigger:
+    """一条触发方式。目前只有 ``keyboard``，``type`` 先留着给以后的触发源。
+
+    ``type`` 为空串 = 编辑页那档空档「-」（还没选），不是"写错了"：这种行会被
+    ``validate_rule`` 拦下，不会落盘。``keys`` 在构造时统一 ``normalize``，
+    所以 ``Trigger("keyboard", "ctrl+alt+f7")`` 存下来也是规范串。
+    """
+
+    type: str = "keyboard"
+    keys: str = ""
+
+    def __post_init__(self) -> None:
+        self.keys = normalize(self.keys)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"type": self.type, "keys": self.keys}
+
+    @classmethod
+    def from_dict(cls, raw: Any) -> Trigger | None:
+        if not isinstance(raw, dict):
+            return None
+        kind = _text(raw.get("type"), 20)
+        # 未知类型多半是未来版本写的：这一条留不住，但别拖坏整条规则
+        if kind and kind not in TRIGGER_TYPES:
+            return None
+        return cls(kind, _text(raw.get("keys"), 40))
 
 
 @dataclass(slots=True)
@@ -196,17 +243,21 @@ class Action:
 class Rule:
     """一条完整规则。``conditions`` 为空 = 条件块不设限。
 
+    ``triggers`` 是**触发列表**：任意一条命中就执行这条规则（OR），互不排斥。
+    以前的单个 ``keys`` 只是它的一种特例；``keys`` 现在是个只读属性，回第一条
+    键盘触发的键位，给日志 / 旧卡片文案兜底。
+
     ``deleted`` = 在回收站里。它**不是**启停：停用规则还会显示、还能改，删除的规则
     从列表和所有触发路径里消失。``deleted_at`` 是 epoch 秒，只给回收站显示时间用。
 
-    ``home`` = 这条规则属于哪个米家家庭（见模块 docstring）。空串表示还没归属，
-    这种规则在所有家庭都可见——**别把它当成"无家庭的规则"藏起来**。
+    ``home`` = 这条规则归属的**家庭 id**（见模块 docstring）。空串表示未指定家庭，
+    这种规则在所有家庭都可见、可以编辑，但**不会注册热键、不会执行**。
     """
 
     id: str
     name: str = ""
     enabled: bool = True
-    keys: str = ""
+    triggers: list[Trigger] = field(default_factory=list)
     condition_mode: str = "all"
     conditions: list[Condition] = field(default_factory=list)
     actions: list[Action] = field(default_factory=list)
@@ -215,12 +266,22 @@ class Rule:
     deleted_at: float = 0.0
     home: str = ""
 
+    @property
+    def keys(self) -> str:
+        """第一条有键位的键盘触发；多触发请直接读 ``triggers``。
+
+        日志 / 回收站 / 旧调用方还按"一个规则一个键位"用这个属性，语义等价于
+        "这条规则最显眼的那个触发"。
+        """
+        return next((t.keys for t in self.triggers
+                     if t.type == "keyboard" and t.keys), "")
+
     def to_dict(self) -> dict[str, Any]:
         out = {
             "id": self.id,
             "name": self.name,
             "enabled": bool(self.enabled),
-            "keys": self.keys,
+            "triggers": [t.to_dict() for t in self.triggers],
             "condition_mode": self.condition_mode,
             "conditions": [c.to_dict() for c in self.conditions],
             "actions": [a.to_dict() for a in self.actions],
@@ -245,6 +306,16 @@ class Rule:
         mode = _text(raw.get("mode") or raw.get("condition_mode"), 10)
         conds = raw.get("conditions")
         acts = raw.get("actions")
+        raws = raw.get("triggers")
+        triggers: list[Trigger] = []
+        if isinstance(raws, list):
+            triggers = [t for item in raws if (t := Trigger.from_dict(item))]
+        if not triggers:
+            # v2 及更早：单个 keys 字符串。升上来就是一条 keyboard，
+            # 键位 / 注册状态 / 冷静期全按原样继续用，不丢。
+            legacy = normalize(raw.get("keys") or "")
+            if legacy:
+                triggers = [Trigger("keyboard", legacy)]
         try:
             deleted_at = float(raw.get("deleted_at") or 0.0)
         except (TypeError, ValueError):
@@ -253,7 +324,7 @@ class Rule:
             id=rid,
             name=_text(raw.get("name")) or "未命名规则",
             enabled=raw.get("enabled") is not False,
-            keys=normalize(raw.get("keys") or ""),
+            triggers=triggers,
             condition_mode=mode if mode in CONDITION_MODES else "all",
             conditions=[c for item in conds if (c := Condition.from_dict(item))]
             if isinstance(conds, list) else [],
@@ -275,11 +346,27 @@ def validate_rule(rule: Rule) -> list[str]:
     errors: list[str] = []
     if not rule.name.strip():
         errors.append("规则名称不能为空")
-    keys = normalize(rule.keys)
-    if not keys:
-        errors.append("快捷键无效")
-    elif reason := reserved_reason(keys):
-        errors.append(f"快捷键不可用：{reason}")
+    if not rule.triggers:
+        errors.append("至少要有一个触发方式")
+    seen_keys: dict[str, int] = {}
+    for i, trig in enumerate(rule.triggers, 1):
+        if not trig.type:
+            # 编辑页那档空档「-」，和条件 / 动作的空档同一个说法
+            errors.append(f"触发 {i} 还没选触发方式")
+            continue
+        if trig.type not in TRIGGER_TYPES:
+            errors.append(f"触发 {i} 的触发方式未知")
+            continue
+        keys = trig.keys
+        if not keys:
+            errors.append(f"触发 {i} 的快捷键无效")
+            continue
+        if reason := reserved_reason(keys):
+            errors.append(f"触发 {i} 的快捷键不可用：{reason}")
+        if keys in seen_keys:
+            errors.append(f"触发 {i} 与触发 {seen_keys[keys]} 用了同一个快捷键")
+        else:
+            seen_keys[keys] = i
     if rule.condition_mode not in CONDITION_MODES:
         errors.append("条件模式只能是「全部」或「任一」")
     for i, cond in enumerate(rule.conditions, 1):
@@ -366,16 +453,23 @@ class RuleSet:
         items = data.get("rules")
         if not isinstance(items, list):
             return
+        # v1 的 home 是家庭名；v2 起改成家庭 id。旧归属直接置空（不做名字→id
+        # 映射），规则其余字段原样保留，用户下一次打开编辑窗自己重选。
+        # v2 → v3 只是 keys 变 triggers，归属已经是 id，不能再当老数据清空。
+        version = data.get("version")
+        legacy_home = version in (None, 1)
         seen: set[str] = set()
         for raw in items:
             rule = Rule.from_dict(raw)
             if rule is None or rule.id in seen:
                 self.warnings.append("跳过一条结构损坏或重复 id 的规则")
                 continue
+            if legacy_home:
+                rule.home = ""
             seen.add(rule.id)
             self.rules.append(rule)
-        if data.get("version") not in (None, SCHEMA_VERSION):
-            self.warnings.append(f"规则文件版本 {data.get('version')} 不是 {SCHEMA_VERSION}，已按兼容方式读入")
+        if version not in (None, 1, 2, SCHEMA_VERSION):
+            self.warnings.append(f"规则文件版本 {version} 不是 {SCHEMA_VERSION}，已按兼容方式读入")
 
     def save(self) -> bool:
         payload = {
@@ -401,8 +495,9 @@ class RuleSet:
     def active(self, home: str | None = None) -> list[Rule]:
         """列表窗用的规则。**回收站里的不算**。
 
-        ``home`` 传家庭名就只留那个家庭的（列表 / 回收站 / 日志筛选都这么调）；
-        传 ``None`` = 不按家庭过滤（热键注册、引擎触发走这条，见模块 docstring）。
+        ``home`` 传**家庭 id** 就只留那个家庭的（列表 / 回收站 / 日志筛选都这么调）；
+        传 ``None`` = 不按家庭过滤（引擎内部枚举走这条）。空归属规则照样会返回，
+        但执行路径会再挡一次。
         """
         return [r for r in self.rules if not r.deleted and _in_home(r, home)]
 
@@ -418,26 +513,6 @@ class RuleSet:
             rid = uuid.uuid4().hex[:8]
             if rid not in used:
                 return rid
-
-    def claim(self, home: str) -> bool:
-        """把**还没归属**的规则一次性认到 ``home``。返回是否真改了东西。
-
-        什么时候会出现没归属的规则：升级前写的 ``rules.json`` 里没有 ``home``
-        键、或者登录之前就建好了规则。不认领它们，用户升级后会发现"规则全都不
-        见了"——它们会在所有家庭可见，但那不是长久之计，下一次在哪个家庭打开就
-        归到哪儿。
-
-        **不触发 ``on_changed``**：调用方是 ``AutomationService``（构造期注册表还
-        没建好）和切家庭的处理，什么时候刷 UI 由它们决定。要写盘就当场写，
-        否则下次启动又得猜一遍。
-        """
-        touched = [r for r in self.rules if not r.home]
-        if not touched:
-            return False
-        for rule in touched:
-            rule.home = home
-        self.save()
-        return True
 
     def get(self, rule_id: str, *, include_deleted: bool = False) -> Rule | None:
         """默认只返回在用的规则；回收站 UI 才传 ``include_deleted=True``。
@@ -503,20 +578,30 @@ class RuleSet:
 
     # -- 热键注册用 ------------------------------------------------------
     def enabled_keys(self) -> list[str]:
-        """启用规则里出现过的**去重**组合；顺序稳定，便于分配不变的 id。"""
+        """启用规则里出现过的**去重**组合；顺序稳定，便于分配不变的 id。
+
+        一条规则可以有多条触发：这里把它们**摊平**再跨规则去重——同一个组合在
+        几条规则 / 几个触发行里出现，系统层都只注册一次。
+
+        **未指定家庭的规则不注册**：它没有明确的归属，不能静默按某个家庭执行。
+        """
         out: list[str] = []
         for rule in self.active():
-            if not rule.enabled:
+            if not rule.enabled or not rule.home:
                 continue
-            keys = normalize(rule.keys)
-            if keys and keys not in out:
-                out.append(keys)
+            for trig in rule.triggers:
+                if trig.type != "keyboard" or not trig.keys:
+                    continue
+                if trig.keys not in out:
+                    out.append(trig.keys)
         return out
 
     def rules_for(self, keys: str) -> list[Rule]:
+        """按热键找可执行的规则。**任一触发命中即算**，未指定家庭的不返回。"""
         want = normalize(keys)
         return [r for r in self.active()
-                if r.enabled and normalize(r.keys) == want]
+                if r.enabled and r.home and any(
+                    t.type == "keyboard" and t.keys == want for t in r.triggers)]
 
 
 __all__ = [
@@ -531,9 +616,11 @@ __all__ = [
     "OPS",
     "RULES_FILE",
     "SCHEMA_VERSION",
+    "TRIGGER_TYPES",
     "Action",
     "Condition",
     "Rule",
     "RuleSet",
+    "Trigger",
     "validate_rule",
 ]

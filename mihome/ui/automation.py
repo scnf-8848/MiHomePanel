@@ -37,6 +37,7 @@ from PySide6.QtGui import QKeyEvent
 from PySide6.QtWidgets import (
     QCheckBox,
     QDialog,
+    QFrame,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -55,9 +56,11 @@ from ..core.automation import (
     MAX_DELAY_MS,
     MAX_SPEAK_CHARS,
     OPS,
+    TRIGGER_TYPES,
     Action,
     Condition,
     Rule,
+    Trigger,
     normalize,
     parse_native,
     reserved_reason,
@@ -86,12 +89,22 @@ from .settings_rows import SettingsCard
 #: 条件 / 动作行右侧的小图标按钮统一尺寸（命中区 ≥28px，padding 必须为 0）
 _ICON_BTN = 30
 
-#: 动作行最左那格「1.」的宽度，以及行内控件间距（``ActionRow`` 与 ``ConditionRow``
-#: 都用 8）。③底部「＋ 添加动作」要对齐**类型下拉**的左边缘，而不是卡片左边缘：
-#: 动作行比条件行多一格序号，所以按钮得右移这么多（11-13 用户第八条）。
+#: 三块共用的左缘基准 = ③ 序号之后的下拉框位置：卡片内边距 16 + 序号列 20 +
+#: 行距 8 = **44px**。①/② 没有序号，用 **28px** 的左内边距（= 20 + 8）补齐，
+#: 不塞 104px 的空占位列——偏移量只等于序号本身占的宽度。三块底部按钮同样
+#: 缩进 28px，左缘与各自的下拉框严格对齐（11-13 用户第六、七次调整）。
 _INDEX_W = 20
 _ROW_GAP = 8
-_ACTION_INDENT = _INDEX_W + _ROW_GAP
+_ROW_INDENT = _INDEX_W + _ROW_GAP
+
+
+def _rule(parent: QWidget) -> QFrame:
+    """卡内 1px 分隔线；和 ``SettingsCard`` 自动补的那条同一样式，但可单独缩进。"""
+    line = QFrame(parent)
+    line.setObjectName("RowDivider")
+    line.setFrameShape(QFrame.NoFrame)
+    line.setFixedHeight(1)
+    return line
 
 #: 动作类型下拉的四档。首档是**空档**「-」= 还没选（11-13 用户第八条：③ 只留一枚
 #: 「＋ 添加动作」，加出来先落在空档上，用户再挑类型）。**延迟只有一种**，毫秒 / 秒
@@ -122,6 +135,8 @@ _HINT_TIPS = {
     "要先选动作类型": "这一行还没选类型：点左边的下拉挑「发虚拟事件 / 延迟 / 发音箱指令」；"
                     "不想加这条就点右边的 × 删掉",
     "不能小于 0": "延迟不能是负数",
+    "该家庭缺少中枢网关": "「发虚拟事件」由中枢网关执行；这个家庭里没有探测到中枢网关，"
+                    "所以输入框是禁用的。换一个有中枢的家庭再建这条规则",
     f"不能超过 {MAX_DELAY_MS} 毫秒": f"单条延迟上限 {MAX_DELAY_MS} 毫秒（{MAX_DELAY_MS // 1000} 秒）",
     f"不能超过 {MAX_DELAY_MS // 1000} 秒": f"单条延迟上限 {MAX_DELAY_MS} 毫秒（{MAX_DELAY_MS // 1000} 秒）",
     "要先选音箱": "这一行要先挑一台音箱；下拉里只有当前家庭里支持「执行文本指令」的那几台",
@@ -140,6 +155,9 @@ _HINT_TIPS = {
     # 「多了 N 个字」「含 N 个发不出的字符」带数字，由 ActionRow._hint_tip 现拼
 }
 _MODE_LABELS = (("all", "满足全部状态条件"), ("any", "满足任一状态条件"))
+#: ① 触发类型下拉。首档空档「-」= 还没选；目前只有键盘快捷键一种，
+#: 多行触发之间是 **OR**（任一命中即执行），见 ``core.automation.rules``。
+_TRIGGER_LABELS = (("", "-"), ("keyboard", "键盘快捷键"))
 
 
 def _delay_text(ms: int, unit: str) -> str:
@@ -288,8 +306,240 @@ def _icon_button(text: str, tip: str, parent: QWidget) -> QPushButton:
 
 
 # ---------------------------------------------------------------------------
-# 条件行 / 动作行
+# 触发行 / 条件行 / 动作行
 # ---------------------------------------------------------------------------
+
+class TriggerRow(QWidget):
+    """一行触发 = 类型下拉 + 键帽 + 注册状态 / 行内红字 + 手动选键 + 删除。
+
+    ① 允许多行，任意一行命中就执行这条规则（OR）；每行有自己的类型和键位，
+    互不影响。目前只有「键盘快捷键」一种类型，空档「-」= 还没选（保存会被拦）。
+
+    手动选键收在本行里（点「或手动选键」展开）：多行各调各的，不会把键位改到
+    别的行上。录制由对话框统一管（``keyPressEvent`` 只认 ``_recording_row``）。
+    """
+
+    def __init__(self, trig: Trigger, palette: theme.Palette, service: Any,
+                 on_change: Callable[[], None], on_remove: Callable[[QWidget], None],
+                 on_record: Callable[[TriggerRow], None],
+                 parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._p = palette
+        self._service = service
+        self._on_change = on_change
+        self._on_record = on_record
+        self._loading = True
+        self._show_missing = False
+        self._keys_value = trig.keys
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        line = QWidget(self)
+        lay = QHBoxLayout(line)
+        # 和 ②③ 同一套缩进：没有序号列，用 28px 补齐到 ③ 下拉那条 44px 线
+        lay.setContentsMargins(_ROW_INDENT, 3, 0, 3)
+        lay.setSpacing(_ROW_GAP)
+
+        self.kind = Combo(palette, line)
+        # addItem 会发 currentIndexChanged；此时其它控件还没建好，连接放到最后
+        with QSignalBlocker(self.kind):
+            for key, label in _TRIGGER_LABELS:
+                self.kind.addItem(label, key)
+        self.kind.setFixedWidth(160)
+
+        self.keycap = QPushButton("未设置", line)
+        self.keycap.setObjectName("Keycap")
+        self.keycap.setCursor(Qt.PointingHandCursor)
+        self.keycap.clicked.connect(lambda: self._on_record(self))
+
+        self.status = QLabel("", line)
+        self.status.setObjectName("Hint")
+
+        self.hint = QLabel("", line)
+        self.hint.setObjectName("Warn")
+        self.hint.setWordWrap(False)
+        self.hint.setVisible(False)
+
+        self.remove_btn = _icon_button("×", "删除这条触发", line)
+        self.remove_btn.clicked.connect(lambda: on_remove(self))
+
+        lay.addWidget(self.kind)
+        lay.addWidget(self.keycap)
+        lay.addWidget(self.status, 1)
+        lay.addWidget(self.hint)
+        lay.addWidget(self.remove_btn)
+
+        # 手动选键与触发行同一条左缘（44px）
+        self.manual_box = QWidget(self)
+        mcol = QVBoxLayout(self.manual_box)
+        mcol.setContentsMargins(_ROW_INDENT, 0, 0, 0)
+        mcol.setSpacing(4)
+        self.manual_toggle = QPushButton("或手动选键（组合键录不到时展开）", self.manual_box)
+        self.manual_toggle.setObjectName("Disclosure")
+        self.manual_toggle.setCheckable(True)
+        self.manual_toggle.setChecked(False)
+        self.manual_toggle.setCursor(Qt.PointingHandCursor)
+        self.manual = QWidget(self.manual_box)
+        mrow = QHBoxLayout(self.manual)
+        mrow.setContentsMargins(0, 4, 0, 4)
+        mrow.setSpacing(8)
+        self.key_combo = Combo(palette, self.manual)
+        for key in key_choices():
+            self.key_combo.addItem(key, key)
+        self.key_combo.setFixedWidth(96)
+        mrow.addWidget(self.key_combo)
+        self._mod_boxes: dict[str, QCheckBox] = {}
+        for name in ("Ctrl", "Alt", "Shift", "Win"):
+            box = QCheckBox(name, self.manual)
+            self._mod_boxes[name] = box
+            mrow.addWidget(box)
+        mrow.addStretch(1)
+        # 所有控件都建好之后再连：_manual_keys 会遍历 _mod_boxes
+        self.key_combo.currentIndexChanged.connect(self._manual_keys)
+        for box in self._mod_boxes.values():
+            box.stateChanged.connect(self._manual_keys)
+        self.manual.setVisible(False)
+        self.manual_toggle.toggled.connect(self.manual.setVisible)
+        mcol.addWidget(self.manual_toggle)
+        mcol.addWidget(self.manual)
+
+        outer.addWidget(line)
+        outer.addWidget(self.manual_box)
+
+        with QSignalBlocker(self.kind):
+            self.kind.setCurrentIndex(max(0, self.kind.findData(trig.type)))
+        self._apply_keycap()
+        self._set_manual_from_keys(self._keys_value)
+        self._sync_visibility()
+        self.refresh_status(self._service)
+        self.kind.currentIndexChanged.connect(self._kind_changed)
+        # 行是动态创建的，窗口级 tab_focus_only 扫不到：自己收一次，
+        # 免得点一下键帽 / 展开把手就留下焦点框（11-13 用户报）
+        tab_focus_only(self)
+        self._loading = False
+
+    # -- 取值 ------------------------------------------------------------
+    def _kind_key(self) -> str:
+        return str(self.kind.currentData() or "")
+
+    def value(self) -> Trigger:
+        return Trigger(self._kind_key(), self._keys_value)
+
+    def needs_kind(self) -> bool:
+        return self._kind_key() not in TRIGGER_TYPES
+
+    # -- 键位 ------------------------------------------------------------
+    def set_keys(self, keys: str) -> None:
+        """录制得到的新组合。空串 = 清掉。"""
+        self._keys_value = normalize(keys)
+        self._apply_keycap()
+        self._set_manual_from_keys(self._keys_value)
+        if not self._loading:
+            self._on_change()
+
+    def set_recording(self, on: bool) -> None:
+        self.keycap.setProperty("recording", "true" if on else "false")
+        self.keycap.setText("请按下组合键…" if on else (self._keys_value or "未设置"))
+        self.keycap.style().unpolish(self.keycap)
+        self.keycap.style().polish(self.keycap)
+        if on:
+            self.keycap.setFocus()
+
+    def _apply_keycap(self) -> None:
+        if self.keycap.property("recording") == "true":
+            return
+        self.keycap.setText(self._keys_value or "未设置")
+
+    def _manual_keys(self, *_args: Any) -> None:
+        if self._loading:
+            return
+        parts = [name for name in ("Ctrl", "Alt", "Shift", "Win")
+                 if self._mod_boxes[name].isChecked()]
+        parts.append(str(self.key_combo.currentData()))
+        self._keys_value = normalize("+".join(parts))
+        self._apply_keycap()
+        self._on_change()
+
+    def _set_manual_from_keys(self, keys: str) -> None:
+        parts = keys.split("+") if keys else []
+        with QSignalBlocker(self.key_combo):
+            idx = self.key_combo.findData(parts[-1]) if parts else -1
+            self.key_combo.setCurrentIndex(max(0, idx))
+        for name, box in self._mod_boxes.items():
+            with QSignalBlocker(box):
+                box.setChecked(name in parts[:-1])
+
+    # -- 行内状态 --------------------------------------------------------
+    def refresh_status(self, service: Any, conflict: str = "") -> None:
+        """右侧一行小字：注册状态（+ 另一个规则也在用这个键的提示）。
+
+        真正的行内红字归 ``hint`` 管；这里只报"系统层面注册上了没有"，
+        空档 / 没设键时整格留白，不跟红字抢位置。
+        """
+        keys = self._keys_value
+        if self._kind_key() != "keyboard" or not keys:
+            self.status.setText("")
+            return
+        state = service.status_for(keys)
+        reason = reserved_reason(keys)
+        text = f"注册状态：{state}" + (f"（{reason}）" if reason else "")
+        tone = "Warn" if ("占用" in state or "不支持" in state or reason) else "Ok"
+        if conflict:
+            text += f"　·　{conflict}"
+            tone = "Warn"
+        self.status.setText(text)
+        self.status.setObjectName(tone)
+        self.status.style().unpolish(self.status)
+        self.status.style().polish(self.status)
+
+    # -- 行内红字（与 rules.validate_rule 的触发那一段逐条对齐） -----------
+    def error_text(self) -> str:
+        if self.needs_kind():
+            return "要先选触发方式" if self._show_missing else ""
+        if not self._keys_value:
+            return "要先设置快捷键" if self._show_missing else ""
+        if reserved_reason(self._keys_value):
+            return "这个快捷键不可用"
+        return ""
+
+    def reveal_missing(self) -> None:
+        self._show_missing = True
+        self.sync_hint()
+
+    def sync_hint(self) -> None:
+        text = self.error_text()
+        self.hint.setText(text)
+        self.hint.setToolTip(_HINT_TIPS.get(text, ""))
+        self.hint.setVisible(bool(text))
+
+    def focus_widget(self) -> QWidget:
+        if self.needs_kind():
+            return self.kind
+        return self.keycap
+
+    def _kind_changed(self) -> None:
+        if self._kind_key() != "keyboard":
+            # 切离键盘：清掉键位，避免"藏着的旧快捷键"继续注册
+            self._keys_value = ""
+        self._show_missing = False
+        self._apply_keycap()
+        self._set_manual_from_keys(self._keys_value)
+        self._sync_visibility()
+        self.refresh_status(self._service)
+        self.sync_hint()
+        if not self._loading:
+            self._on_change()
+
+    def _sync_visibility(self) -> None:
+        keyboard = self._kind_key() == "keyboard"
+        # 空档时键帽 / 手动选键都没有意义：灰掉但保留位置，行宽别跳
+        self.keycap.setEnabled(keyboard)
+        self.manual_box.setVisible(keyboard)
+        self.status.setVisible(keyboard)
+        if not keyboard:
+            self.status.setText("")
+
 
 class ConditionRow(QWidget):
     """一行 = 类型 + 比较符 + 参数（+ 程序名）+ 行内红字 + 删除。
@@ -314,7 +564,8 @@ class ConditionRow(QWidget):
         # 构造期回填会触发 textChanged；照 ActionRow 的做法挡住标脏
         self._loading = True
         lay = QHBoxLayout(self)
-        lay.setContentsMargins(0, 3, 0, 3)
+        # ② 条件行没有序号列：用 28px 左内边距补齐到 ③ 序号之后的下拉框那条线
+        lay.setContentsMargins(_ROW_INDENT, 3, 0, 3)
         lay.setSpacing(_ROW_GAP)
 
         self.kind = Combo(palette, self)
@@ -502,11 +753,14 @@ class ActionRow(QWidget):
                  on_change: Callable[[], None], on_remove: Callable[[QWidget], None],
                  on_move: Callable[[QWidget, int], None],
                  targets: list[speaker.Target] | None = None,
+                 hub_ready: bool = True,
                  parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._on_change = on_change
         self._loading = True
         self._targets = list(targets or [])
+        #: 当前家庭有没有中枢网关（「发虚拟事件」的前提，判据同极客版入口）
+        self._hub_ready = hub_ready
         self._kind = action.type  # 上一次的类型：判"换的是不是同一种动作"
         self._prev_unit = action.unit if action.unit == "s" else "ms"
         # 空档的"还没选"红字只在点保存后亮（见 needs_kind / reveal_missing）
@@ -518,6 +772,8 @@ class ActionRow(QWidget):
         self.index_label = QLabel("", self)
         self.index_label.setObjectName("Hint")
         self.index_label.setFixedWidth(_INDEX_W)
+        # 序号靠右：它占的是和 ①② 标题列等宽的那一列，贴着右边的类型下拉
+        self.index_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
 
         self.kind = Combo(palette, self)
         for key, label in _ACTION_LABELS:
@@ -696,10 +952,15 @@ class ActionRow(QWidget):
         self.unit.setVisible(kind == "delay")
         self.speaker.setVisible(kind == "speaker")
         self.silent.setVisible(kind == "speaker")
-        self.value_edit.setEnabled(bool(kind))
+        # 发虚拟事件需要家庭里有中枢网关：没有就禁用输入框，红字由 sync_hint 给
+        self.value_edit.setEnabled(bool(kind) and not self._no_hub(kind))
 
     def _kind_key(self) -> str:
         return str(self.kind.currentData() or "")
+
+    def _no_hub(self, kind: str | None = None) -> bool:
+        """这一行是不是「要发虚拟事件，但这个家庭没有中枢网关」。"""
+        return (kind or self._kind_key()) == "virtual_event" and not self._hub_ready
 
     def needs_kind(self) -> bool:
         """还没选动作类型（空档）。空行刚加进来不算错，点保存才算（11-13 用户第八条）。"""
@@ -736,6 +997,8 @@ class ActionRow(QWidget):
                 else "毫秒，如 2000（只填整数）")
         elif kind == "speaker":
             self.value_edit.setPlaceholderText("要说的话，如「打开客厅灯」")
+        elif self._no_hub(kind):
+            self.value_edit.setPlaceholderText("该家庭缺少中枢网关，发不了虚拟事件")
         else:
             self.value_edit.setPlaceholderText("虚拟事件名（要和米家自动化里监听的完全一致）")
 
@@ -753,6 +1016,9 @@ class ActionRow(QWidget):
             # 「还没选类型」只在点过保存之后才说（用户 11-13 第八条）：刚点
             # 「＋ 添加动作」就一片红，等于边让人挑边骂人。
             return "要先选动作类型" if self._show_missing else ""
+        if self._no_hub():
+            # 红字顶掉所有填法错误：家庭没有中枢网关时，填对了也发不出去
+            return "该家庭缺少中枢网关"
         if self._kind_key() == "speaker":
             text = self.value_edit.text()
             # 超长不静默截断（主窗口的发送框才那么干：它没有"存下来再说"的机会）。
@@ -888,30 +1154,31 @@ class AutomationDialog(QDialog):
         self.service = service
         self._p = palette
         self._is_new = rule_id is None
-        # 当前家庭：新建 / 认领归属都用它。``getattr`` 兜底是因为验证脚本里的
-        # 假 service 未必实现这个属性（真 service 上是 property）。
+        # 规则归属在创建时按所在家庭固定：编辑时只读展示，不提供改家庭的能力
+        # （改了家庭，③ 里已选的设备还是旧家庭的，逻辑不成立）。新建取当前家庭；
+        # 老文件里归属为空的规则也在打开时按当前家庭固定，保存即落盘。
         self._home = str(getattr(service, "current_home", "") or "")
         source = service.rules.get(rule_id) if rule_id else None
         self._draft: Rule = (
             source.clone() if source is not None else Rule(
-                id=service.rules.new_id(), name="新规则", keys="", conditions=[],
+                id=service.rules.new_id(), name="新规则", triggers=[], conditions=[],
                 # 新建先给一行**空档**动作：用户自己挑类型（11-13 用户第八条）。
                 # 预选成「发虚拟事件」会让人以为事件是默认动作、找不到音箱那档。
                 actions=[Action("")],
                 cooldown_ms=DEFAULT_COOLDOWN_MS, enabled=True,
-                # 新建时归属**当前家庭**：切到别的家庭就不再列出来（规则按家庭隔离，
-                # 见 core/automation/rules.py 模块 docstring）
                 home=self._home,
             )
         )
-        # 编辑升级前的老规则（没 home）时顺手认到当前家庭——否则它会在所有家庭都
-        # 列出来（规则按家庭隔离，见 core/automation/rules.py）。已归属别的家庭的
-        # 规则**不动**：被翻开编辑不等于要搬到当前家庭。
         if not self._draft.home:
             self._draft.home = self._home
+        # 「发虚拟事件」要求这个家庭有中枢网关，判据与极客版入口共用一套
+        checker = getattr(service, "home_has_hub", None)
+        self._hub_ready = bool(checker(self._draft.home)) if callable(checker) else True
         self._dirty = False
         self._loading = False
-        self._recording = False
+        #: 正在录制的触发行（None = 没在录）。录制只认这一行，多行不会串键。
+        self._recording_row: TriggerRow | None = None
+        self._trigger_rows: list[TriggerRow] = []
         self._cond_rows: list[ConditionRow] = []
         self._action_rows: list[ActionRow] = []
         # 「发音箱指令」的候选：**当前家庭**里能执行文本指令的那几台。
@@ -1006,6 +1273,16 @@ class AutomationDialog(QDialog):
         self.name_edit.textChanged.connect(self._mark_dirty)
         self.name_edit.textChanged.connect(self._sync_title)
         head.add_row("名称", self.name_edit, expand=True)
+
+        # 归属家庭：**只读**。规则在哪个家庭创建就属于哪个家庭，不能改——改了家庭，
+        # ③ 里已经选好的设备还留在旧家庭，执行逻辑不成立（用户 11-13 第四轮）。
+        labeler = getattr(self.service, "home_label", None)
+        home_text = str(labeler(self._draft.home) if callable(labeler) else self._draft.home)
+        self.home_value = QLabel(home_text or "未指定家庭", content)
+        self.home_value.setObjectName("Hint")
+        self.home_value.setToolTip("规则归属于创建时所在的家庭，不能修改")
+        head.add_row("归属家庭", self.home_value,
+                     sub="创建后固定，不能修改；旧规则打开后按当前家庭保存")
         col.addWidget(head)
 
         self.cooldown = QLineEdit(content)
@@ -1019,74 +1296,59 @@ class AutomationDialog(QDialog):
         self.trigger_card = card1
         self._set_step(card1, "1")
 
-        # 注册状态并进快捷键行右侧，不再单独占一行（①里原本塞了四行）
-        key_row = QWidget(content)
-        krow = QHBoxLayout(key_row)
-        krow.setContentsMargins(0, 0, 0, 0)
-        krow.setSpacing(10)
-        self.keycap = QPushButton("未设置", key_row)
-        self.keycap.setObjectName("Keycap")
-        self.keycap.setCursor(Qt.PointingHandCursor)
-        self.keycap.clicked.connect(self._toggle_record)
-        krow.addWidget(self.keycap)
-        self.key_status = QLabel("", key_row)
-        self.key_status.setObjectName("Hint")
-        krow.addWidget(self.key_status, 1)
-        card1.add_row("键盘快捷键", key_row, expand=True)
+        # 触发行：和 ②③ 一样是"一行 = 类型下拉 + 参数"。① 可以挂**多条**，
+        # 语义是 OR：任意一条命中就执行这条规则；新规则点「＋ 添加动作」才加
+        # 第一行。没有序号，用 28px 左内边距对齐到 ③ 序号之后的下拉框（44px）。
+        self.trigger_box = QWidget(content)
+        self.trigger_layout = QVBoxLayout(self.trigger_box)
+        self.trigger_layout.setContentsMargins(0, 0, 0, 0)
+        self.trigger_layout.setSpacing(2)
 
-        # 手动选键是次级操作：默认收起，①块一屏只看得到主路径
-        self.manual_toggle = QPushButton("或手动选键（组合键录不到时展开）", content)
-        self.manual_toggle.setObjectName("Disclosure")
-        self.manual_toggle.setCheckable(True)
-        self.manual_toggle.setChecked(False)
-        self.manual_toggle.setCursor(Qt.PointingHandCursor)
-        manual = QWidget(content)
-        mrow = QHBoxLayout(manual)
-        mrow.setContentsMargins(0, 4, 0, 4)
-        mrow.setSpacing(8)
-        self.key_combo = Combo(self._p, manual)
-        for key in key_choices():
-            self.key_combo.addItem(key, key)
-        self.key_combo.setFixedWidth(96)
-        mrow.addWidget(self.key_combo)
-        self._mod_boxes: dict[str, QCheckBox] = {}
-        for name in ("Ctrl", "Alt", "Shift", "Win"):
-            box = QCheckBox(name, manual)
-            self._mod_boxes[name] = box
-            mrow.addWidget(box)
-        mrow.addStretch(1)
-        # 所有控件都建好之后再连：_manual_keys 会遍历 _mod_boxes
-        self.key_combo.currentIndexChanged.connect(self._manual_keys)
-        for box in self._mod_boxes.values():
-            box.stateChanged.connect(self._manual_keys)
-        manual.setVisible(False)
-        self.manual_toggle.toggled.connect(manual.setVisible)
-        self.manual_keys_widget = manual
-        manual_box = QWidget(content)
-        mcol = QVBoxLayout(manual_box)
-        mcol.setContentsMargins(0, 0, 0, 0)
-        mcol.setSpacing(4)
-        mcol.addWidget(self.manual_toggle)
-        mcol.addWidget(manual)
-        card1.add_unit(manual_box)
+        # 底部一行：左边「＋ 添加动作」，右边冷静期。冷静期标签贴着它自己的
+        # 输入框（不再被弹性标题列推到最左边），语义上仍属于①。
+        trigger_btns = QWidget(content)
+        brow = QHBoxLayout(trigger_btns)
+        brow.setContentsMargins(_ROW_INDENT, 4, 0, 4)
+        brow.setSpacing(8)
+        self.add_trigger_btn = QPushButton("＋ 添加动作", trigger_btns)
+        self.add_trigger_btn.setObjectName("Tool")
+        self.add_trigger_btn.setCursor(Qt.PointingHandCursor)
+        self.add_trigger_btn.clicked.connect(lambda: self._add_trigger())
+        brow.addWidget(self.add_trigger_btn)
+        brow.addStretch(1)
+        cool_label = QLabel("冷静期（毫秒）", trigger_btns)
+        cool_label.setObjectName("RowTitle")
+        cool_label.setToolTip(
+            f"默认 {DEFAULT_COOLDOWN_MS} ms；0 = 关闭。按住不放的自动重复另有内置抑制，不在这里配")
+        brow.addWidget(cool_label)
+        brow.addWidget(self.cooldown)
 
-        # 冷静期是「触发后多久内不重复响应」，属于①的语义，不放在头部通用设置里。
-        # 单位维持毫秒（用户 11-13 定），内部存 ms、rules.json 不变。
-        card1.add_row("冷静期（毫秒）", self.cooldown,
-                      sub=f"默认 {DEFAULT_COOLDOWN_MS} ms；0 = 关闭。按住不放的自动重复另有内置抑制，不在这里配",
-                      expand=False)
+        # 两块合成一个整行单元：触发行一多也不会在它们之间冒出分隔线
+        trigger_section = QWidget(content)
+        tsec = QVBoxLayout(trigger_section)
+        tsec.setContentsMargins(0, 0, 0, 0)
+        tsec.setSpacing(0)
+        tsec.addWidget(self.trigger_box)
+        tsec.addWidget(trigger_btns)
+        card1.add_unit(trigger_section)
         col.addWidget(card1)
 
         # ② 条件
-        col.addLayout(self._step_header(content, "2", "状态条件（可以为空）"))
-        card2 = SettingsCard(content)
-        self._set_step(card2, "2")
+        # 「条件关系」常显在章节标题右侧（用户 11-13 第五次调整）：0 / 1 / 多条都
+        # 显示，不再按条数隐藏。它原本占卡片里一整行、右边一长条空白，现在只占
+        # 标题行，卡片里只剩条件行和按钮；也不再配「条件关系」文字标签。
+        head2 = self._step_header(content, "2", "状态条件（可以为空）")
         self.mode = Combo(self._p, content)
         for key, label in _MODE_LABELS:
             self.mode.addItem(label, key)
         self.mode.setFixedWidth(190)
+        self.mode.setToolTip("多条条件之间的关系：全部满足 / 满足任一")
         self.mode.currentIndexChanged.connect(self._mark_dirty)
-        card2.add_row("条件关系", self.mode)
+        head2.insertWidget(2, self.mode)  # 编号、标题之后，弹性之前
+        col.addLayout(head2)
+        card2 = SettingsCard(content)
+        self._set_step(card2, "2")
+        self.cond_card = card2
         self.cond_box = QWidget(content)
         self.cond_layout = QVBoxLayout(self.cond_box)
         self.cond_layout.setContentsMargins(0, 0, 0, 0)
@@ -1094,19 +1356,42 @@ class AutomationDialog(QDialog):
         card2.add_unit(self.cond_box)
         self.cond_empty = QLabel("没有条件限制，快捷键按下就会执行动作", content)
         self.cond_empty.setObjectName("Hint")
-        card2.add_unit(self.cond_empty)
+        self.cond_empty.setContentsMargins(0, 8, 0, 8)
+        # 空态提示和它**上下两条分隔线**一起缩进到 44px（用户 11-13 第八次调整），
+        # 右缘仍到卡片内边距。这两条线自己做，所以 add_unit 不再自动补线。
+        self.cond_empty_box = QWidget(content)
+        ebox = QVBoxLayout(self.cond_empty_box)
+        ebox.setContentsMargins(_ROW_INDENT, 0, 0, 0)
+        ebox.setSpacing(0)
+        self.cond_empty_top = _rule(self.cond_empty_box)
+        self.cond_empty_bottom = _rule(self.cond_empty_box)
+        ebox.addWidget(self.cond_empty_top)
+        ebox.addWidget(self.cond_empty)
+        ebox.addWidget(self.cond_empty_bottom)
+        card2.add_unit(self.cond_empty_box, divider=False)
         cond_btns = QWidget(content)
-        crow = QHBoxLayout(cond_btns)
-        crow.setContentsMargins(0, 4, 0, 4)
-        add_cond = QPushButton("＋ 添加条件", cond_btns)
+        cbox = QVBoxLayout(cond_btns)
+        cbox.setContentsMargins(0, 0, 0, 0)
+        cbox.setSpacing(0)
+        # 有条件的行时，空态那块整体隐藏；这时用这条全宽线把条件和按钮隔开
+        self.cond_btns_divider = _rule(cond_btns)
+        cbox.addWidget(self.cond_btns_divider)
+        btn_row = QWidget(cond_btns)
+        crow = QHBoxLayout(btn_row)
+        # 和条件行同一条左缘（44px）
+        crow.setContentsMargins(_ROW_INDENT, 4, 0, 4)
+        add_cond = QPushButton("＋ 添加条件", btn_row)
         add_cond.setObjectName("Tool")
         add_cond.setCursor(Qt.PointingHandCursor)
+        self.add_cond_btn = add_cond
         # 加出来落在空档「-」上，用户再挑条件类型（和③一致，用户 11-13 第八条）
         add_cond.clicked.connect(
             lambda: self._add_condition(Condition(type="", op="")))
         crow.addWidget(add_cond)
         crow.addStretch(1)
-        card2.add_unit(cond_btns)
+        cbox.addWidget(btn_row)
+        card2.add_unit(cond_btns, divider=False)
+        self._sync_cond_empty()
         col.addWidget(card2)
 
         # ③ 动作
@@ -1120,15 +1405,15 @@ class AutomationDialog(QDialog):
         card3.add_unit(self.action_box)
         action_btns = QWidget(content)
         arow = QHBoxLayout(action_btns)
-        # 左内边距 = 行首「1.」那格 + 行内间距：按钮左边缘要跟动作行的**类型下拉**
-        # 对齐，不是跟卡片对齐（动作行比条件行多一格序号，用户 11-13 第八条）
-        arow.setContentsMargins(_ACTION_INDENT, 4, 0, 4)
+        # 按钮左缘与 ③ 类型下拉对齐（44px）：缩进 = 序号列 + 行距，不含额外空列
+        arow.setContentsMargins(_ROW_INDENT, 4, 0, 4)
         # 只有一枚按钮（和②的「＋ 添加条件」一样）：加出来的行落在空档「-」上，
         # 用户自己在下拉里挑虚拟事件 / 延迟 / 发音箱指令。以前是三个按钮各加一种，
         # 加完还得回来改类型才知道有别的档。
         add_action = QPushButton("＋ 添加动作", action_btns)
         add_action.setObjectName("Tool")
         add_action.setCursor(Qt.PointingHandCursor)
+        self.add_action_btn = add_action
         add_action.clicked.connect(lambda: self._add_action(Action("")))
         arow.addWidget(add_action)
         arow.addStretch(1)
@@ -1182,9 +1467,11 @@ class AutomationDialog(QDialog):
         self.name_edit.setText(rule.name)
         self.cooldown.setText(str(rule.cooldown_ms))
         self.mode.setCurrentIndex(max(0, self.mode.findData(rule.condition_mode)))
-        self.keycap.setText(rule.keys or "未设置")
-        self._set_manual_from_keys(rule.keys)
         self._clear_rows()
+        # 触发行：规则里有几条就展开几条。旧文件的单个 keys 在 Rule.from_dict
+        # 里已经变成一条 keyboard，所以这里不用再兼容。
+        for trig in rule.triggers:
+            self._add_trigger(trig, quiet=True)
         for cond in rule.conditions:
             self._add_condition(cond, quiet=True)
         for act in rule.actions:
@@ -1196,12 +1483,14 @@ class AutomationDialog(QDialog):
         self._refresh_status()
 
     def _clear_rows(self) -> None:
-        for row in (*self._cond_rows, *self._action_rows):
+        for row in (*self._trigger_rows, *self._cond_rows, *self._action_rows):
             row.setParent(None)
             row.deleteLater()
+        self._trigger_rows.clear()
         self._cond_rows.clear()
         self._action_rows.clear()
-        self.cond_empty.setVisible(True)
+        self._recording_row = None
+        self._sync_cond_empty()
 
     def _set_error(self, text: str) -> None:
         """错误条空的时候连一行高度都不占，把高度让给③动作块。"""
@@ -1214,12 +1503,18 @@ class AutomationDialog(QDialog):
         self._dirty = True
         self._refresh_status()
 
+    def _sync_cond_empty(self) -> None:
+        """空态块（提示 + 上下缩进分隔线）和按钮上方分隔线二选一，避免叠线。"""
+        empty = not self._cond_rows
+        self.cond_empty_box.setVisible(empty)
+        self.cond_btns_divider.setVisible(not empty)
+
     def _add_condition(self, cond: Condition, *, quiet: bool = False) -> None:
         row = ConditionRow(cond, self._p, self._mark_dirty, self._remove_condition,
                            self.cond_box)
         self.cond_layout.addWidget(row)
         self._cond_rows.append(row)
-        self.cond_empty.setVisible(False)
+        self._sync_cond_empty()
         if not quiet:
             self._mark_dirty()
             if not row._kind_key():
@@ -1233,13 +1528,13 @@ class AutomationDialog(QDialog):
             self.cond_layout.removeWidget(row)
             row.setParent(None)
             row.deleteLater()
-            self.cond_empty.setVisible(not self._cond_rows)
+            self._sync_cond_empty()
             self._mark_dirty()
 
     def _add_action(self, action: Action, *, quiet: bool = False) -> None:
         row = ActionRow(action, self._p, self._mark_dirty,
                         self._remove_action, self._move_action,
-                        self._speaker_targets, self.action_box)
+                        self._speaker_targets, self._hub_ready, self.action_box)
         self.action_layout.addWidget(row)
         self._action_rows.append(row)
         self._renumber()
@@ -1289,30 +1584,65 @@ class AutomationDialog(QDialog):
         # enabled 归列表卡片的开关管，这里不碰，免得编辑一次就把停用的规则打开
         self._draft.cooldown_ms = cooldown
         self._draft.condition_mode = str(self.mode.currentData())
+        self._draft.triggers = [r.value() for r in self._trigger_rows]
         self._draft.conditions = [r.value() for r in self._cond_rows]
         self._draft.actions = [r.value() for r in self._action_rows]
         return self._draft
 
+    # -- 触发行 ----------------------------------------------------------
+    def _add_trigger(self, trig: Trigger | None = None, *,
+                     quiet: bool = False) -> None:
+        """加一条触发。空档「-」先落位，用户再选类型（和 ②③ 一致）。
+
+        ① 允许多条：任意一条命中就执行这条规则，``RuleSet.rules_for`` 负责分发。
+        """
+        row = TriggerRow(trig or Trigger("", ""), self._p, self.service,
+                         self._mark_dirty, self._remove_trigger, self._toggle_record,
+                         self.trigger_box)
+        self.trigger_layout.addWidget(row)
+        self._trigger_rows.append(row)
+        if not quiet:
+            self._mark_dirty()
+            if row.needs_kind():
+                self.area.ensureWidgetVisible(row, 0, 24)
+                row.kind.setFocus()
+        else:
+            row.refresh_status(self.service)
+
+    def _remove_trigger(self, row: QWidget) -> None:
+        if row not in self._trigger_rows:
+            return
+        if self._recording_row is row:
+            self._recording_row = None
+        self._trigger_rows.remove(row)
+        self.trigger_layout.removeWidget(row)
+        row.setParent(None)
+        row.deleteLater()
+        self._mark_dirty()
+
+    def _toggle_record(self, row: TriggerRow) -> None:
+        """录制只针对某一行：点哪行的键帽就录哪行，别的行先收工。"""
+        if row not in self._trigger_rows:
+            return
+        if self._recording_row is not None and self._recording_row is not row:
+            self._recording_row.set_recording(False)
+        if self._recording_row is row:
+            self._recording_row = None
+            row.set_recording(False)
+            return
+        self._recording_row = row
+        row.set_recording(True)
+        self._set_error("")
+
     # -- 快捷键 ----------------------------------------------------------
-    def _toggle_record(self) -> None:
-        self._recording = not self._recording
-        self._apply_keycap()
-
-    def _apply_keycap(self) -> None:
-        self.keycap.setProperty("recording", "true" if self._recording else "false")
-        self.keycap.setText("请按下组合键…" if self._recording
-                            else (self._draft.keys or "未设置"))
-        self.keycap.style().unpolish(self.keycap)
-        self.keycap.style().polish(self.keycap)
-        if self._recording:
-            self.keycap.setFocus()
-
     def keyPressEvent(self, event: QKeyEvent) -> None:  # noqa: N802
-        if not self._recording:
+        row = self._recording_row
+        if row is None:
             super().keyPressEvent(event)
             return
         if event.key() == Qt.Key_Escape:
-            self._toggle_record()
+            self._recording_row = None
+            row.set_recording(False)
             event.accept()
             return
         vk = _qt_key_to_vk(event.key())
@@ -1325,49 +1655,32 @@ class AutomationDialog(QDialog):
             self._set_error("没能识别这个组合，请用「手动选键」")
             event.accept()
             return
-        self._recording = False
-        self._draft.keys = keys
-        self._apply_keycap()
-        self._set_manual_from_keys(keys)
-        self._mark_dirty()
+        self._recording_row = None
+        row.set_recording(False)
+        row.set_keys(keys)
         event.accept()
-
-    def _manual_keys(self) -> None:
-        if self._loading:
-            return
-        parts = [name for name in ("Ctrl", "Alt", "Shift", "Win")
-                 if self._mod_boxes[name].isChecked()]
-        parts.append(str(self.key_combo.currentData()))
-        self._draft.keys = normalize("+".join(parts))
-        self.keycap.setText(self._draft.keys or "未设置")
-        self._mark_dirty()
-
-    def _set_manual_from_keys(self, keys: str) -> None:
-        parts = keys.split("+") if keys else []
-        with QSignalBlocker(self.key_combo):
-            idx = self.key_combo.findData(parts[-1]) if parts else -1
-            self.key_combo.setCurrentIndex(max(0, idx))
-        for name, box in self._mod_boxes.items():
-            with QSignalBlocker(box):
-                box.setChecked(name in parts[:-1])
 
     # -- 保存 ------------------------------------------------------------
     def _save(self, *, quiet: bool = False) -> bool:
         rule = self._collect()
         # 还没选类型的行：刚加进来时不亮红字，**点到保存**才亮（11-13 用户第八条）
-        for row in [*self._cond_rows, *self._action_rows]:
+        rows = [*self._trigger_rows, *self._cond_rows, *self._action_rows]
+        for row in rows:
             row.reveal_missing()
         # 填法 / 范围都只在本行报（用户 11-13 指定）：core 只拿到毫秒，看不出
         # 用户敲了什么，混进 validate_rule 只会得到"要在 0–600000 毫秒之间"这种
         # 答非所问。这里也不写底部错误条、不弹 notice——红字就在输入框右边亮着，
         # 再在下面重复一遍是噪音。② 条件行同样走这条路（11-13 第九条）。
-        rows = [*self._cond_rows, *self._action_rows]  # 按从上到下的顺序找第一处
         bad = [row for row in rows if row.error_text()]
         if bad:
             for row in rows:
                 row.sync_hint()  # 边打边判已经刷过，这里兜住 quiet 保存的路径
             self._set_error("")
             self._reveal_row(bad[0])
+            return False
+        if not rule.home:
+            # 正常路径下 __init__ 已按当前家庭固定；只有登录信息还没回来才可能为空
+            self._set_error("当前没有可用家庭，无法保存规则")
             return False
         errors = validate_rule(rule)
         if errors:
@@ -1417,22 +1730,40 @@ class AutomationDialog(QDialog):
 
     # -- 状态 ------------------------------------------------------------
     def _refresh_status(self) -> None:
-        keys = self._draft.keys
-        state = self.service.status_for(keys) if keys else "先设置快捷键"
-        reason = reserved_reason(keys) if keys else ""
-        self.key_status.setText(f"注册状态：{state}" + (f"（{reason}）" if reason else ""))
-        self.key_status.setObjectName(
-            "Warn" if "占用" in state or "不支持" in state or reason else "Ok")
-        self.key_status.style().unpolish(self.key_status)
-        self.key_status.style().polish(self.key_status)
+        for row in self._trigger_rows:
+            row.refresh_status(self.service, self._conflict_note(row))
         self.target_label.setText(f"中枢：{self.service.target_label()}　·　"
                                   "云端返回 code 0 只代表收下，末端动作请听设备反馈")
+
+    def _conflict_note(self, row: TriggerRow) -> str:
+        """这个键还被哪条**启用**的规则用着（非阻塞提示）。
+
+        热键是系统级资源：同一个组合被两条规则用到时，``RuleSet.rules_for`` 会把
+        两条都叫起来（各触发一次）。这不是错误，但用户多半想知道，所以在行内
+        注册状态后面点一句。停用的规则不注册，不算冲突。
+        """
+        keys = row.value().keys
+        if not keys:
+            return ""
+        try:
+            others = self.service.rules.active()
+        except Exception:  # noqa: BLE001  验证用的假 service 可能没有 rules
+            return ""
+        names = [r.name or "未命名规则" for r in others
+                 if r.id != self._draft.id and r.enabled
+                 and any(t.type == "keyboard" and t.keys == keys for t in r.triggers)]
+        if not names:
+            return ""
+        more = f" 等 {len(names)} 条" if len(names) > 1 else ""
+        return f"这个键也被「{names[0]}」{more}使用，按下会各触发一次"
 
     # -- 关闭 ------------------------------------------------------------
     def reject(self) -> None:  # noqa: N802
         """录制态 / 有未保存修改时，别让「点遮罩 = reject」把页面直接关掉。"""
-        if self._recording:
-            self._toggle_record()
+        if self._recording_row is not None:
+            row = self._recording_row
+            self._recording_row = None
+            row.set_recording(False)
             return
         if self._dirty:
             if not confirm(self, "有未保存的修改", "要保存后关闭吗？", self._p,

@@ -17,11 +17,14 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import QModelIndex, QPoint, QRect, QSize, Qt, Signal
-from PySide6.QtGui import QColor, QDrag, QFont, QFontMetrics, QPainter, QPen
+from PySide6.QtCore import QModelIndex, QPoint, QRect, QSize, Qt, QTimer, Signal
+from PySide6.QtGui import QColor, QFont, QFontMetrics, QPainter, QPen
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QApplication,
     QFrame,
+    QGraphicsOpacityEffect,
+    QLabel,
     QStyle,
     QStyledItemDelegate,
     QTreeWidget,
@@ -33,6 +36,9 @@ from . import theme
 
 ROW_H = 32
 INDENT = 16
+#: 拖到上下边缘多少像素内开始自动滚动，以及每次滚多少
+AUTO_SCROLL_EDGE = 30
+AUTO_SCROLL_STEP = 18
 CHEV = 14
 SWITCH_W = 36
 SWITCH_H = 20
@@ -227,16 +233,31 @@ class ReorderTree(QTreeWidget):
             "QTreeWidget::branch { image: none; border-image: none; background: transparent; }"
         )
 
-        if mode == "order":
-            self.setDragEnabled(True)
-            self.setAcceptDrops(True)
-            self.setDropIndicatorShown(True)
-            self.setDragDropMode(QAbstractItemView.DragDrop)
-            self.setDefaultDropAction(Qt.MoveAction)
+        # 不用 QTreeWidget 自带的拖放：它是系统拖影 + 系统落位线，和首页卡片
+        # 那套（幽灵行、自己画的落位线、边缘自动滚、松手才落盘）不一致。
+        self.setDragEnabled(False)
+        self.setAcceptDrops(False)
+        self.setDropIndicatorShown(False)
+
+        self._press_pos: QPoint | None = None
+        self._press_item: QTreeWidgetItem | None = None
+        self._drag_item: QTreeWidgetItem | None = None
+        self._drag_ghost: QLabel | None = None
+        self._drop_line: QWidget | None = None
+        self._drop_parent: QTreeWidgetItem | None = None
+        self._drop_index = -1
+        self._last_drag_pos = QPoint()
+        self._auto_timer = QTimer(self)
+        self._auto_timer.setInterval(16)
+        self._auto_timer.timeout.connect(self._auto_scroll)
 
     def set_palette(self, palette: theme.Palette) -> None:
         self._p = palette
         self._delegate.set_palette(palette)
+        if self._drop_line is not None:
+            self._drop_line.setStyleSheet(
+                f"background: {palette.accent}; border-radius: 1px;"
+            )
         self.viewport().update()
 
     # -- 展开状态 --------------------------------------------------------
@@ -278,7 +299,17 @@ class ReorderTree(QTreeWidget):
         return depth
 
     # -- 交互 ------------------------------------------------------------
+    def mousePressEvent(self, event) -> None:  # noqa: N802
+        if event.button() == Qt.LeftButton:
+            self._press_pos = event.position().toPoint()
+            self._press_item = self.itemAt(self._press_pos)
+        super().mousePressEvent(event)
+
     def mouseReleaseEvent(self, event) -> None:  # noqa: N802
+        if self._drag_item is not None:
+            self._finish_drag()
+            event.accept()
+            return
         if event.button() == Qt.LeftButton:
             pos = event.position().toPoint()
             item = self.itemAt(pos)
@@ -287,14 +318,30 @@ class ReorderTree(QTreeWidget):
                 if item.childCount() and _chevron_hit(rect, self._depth(item)).contains(pos):
                     item.setExpanded(not item.isExpanded())
                     self.viewport().update()
+                    self._clear_press()
                     return
                 if item.data(0, ROLE_SWITCH) is not None and _switch_rect(rect).contains(pos):
                     self.toggle_requested.emit(dict(item.data(0, ROLE_DATA) or {}))
+                    self._clear_press()
                     return
+        self._clear_press()
         super().mouseReleaseEvent(event)
 
     def mouseMoveEvent(self, event) -> None:  # noqa: N802
         pos = event.position().toPoint()
+        if self._drag_item is not None:
+            self._update_drag(pos)
+            event.accept()
+            return
+        if (self._press_item is not None
+                and event.buttons() & Qt.LeftButton
+                and (pos - self._press_pos).manhattanLength()
+                >= QApplication.startDragDistance()):
+            if self._can_drag(self._press_item, self._press_pos):
+                self._begin_drag(self._press_item, pos)
+                event.accept()
+                return
+            self._clear_press()
         item = self.itemAt(pos)
         hot = False
         if item is not None:
@@ -306,73 +353,138 @@ class ReorderTree(QTreeWidget):
         self.viewport().setCursor(Qt.PointingHandCursor if hot else Qt.ArrowCursor)
         super().mouseMoveEvent(event)
 
-    # -- 拖动：只允许同层内重排 --------------------------------------------
-    def startDrag(self, supported_actions) -> None:  # noqa: N802
-        """自己起拖动：**不让 Qt 在松手后删掉源行**。
-
-        ``QAbstractItemView.startDrag`` 在 ``drag.exec()`` 返回 ``MoveAction`` 时会
-        调 ``clearOrRemove()``，按**当前选择集**删行。而这里的 ``dropEvent`` 已经
-        自己把 item 搬到新位置了，选择集跟着 item 走——那一下就正好把刚放下的那行
-        再删一遍。用户看到的是"拖完这个房间就从列表里没了"。
-
-        所以这里只负责把 mime 和拖影递出去，移动完全交给 ``dropEvent``。
-        """
-        indexes = self.selectedIndexes()
-        if not indexes:
-            return
-        model = self.model()
-        mime = model.mimeData(indexes) if model is not None else None
-        if mime is None:
-            return
-        drag = QDrag(self)
-        drag.setMimeData(mime)
-        item = self.currentItem()
-        if item is not None:
-            rect = self.visualItemRect(item)
-            if rect.isValid() and not rect.isEmpty():
-                drag.setPixmap(self.viewport().grab(rect))
-                drag.setHotSpot(QPoint(rect.width() // 2, rect.height() // 2))
-        drag.exec(Qt.MoveAction)
-
-    def _same_parent(self, event) -> bool:
-        src = self.currentItem()
-        if src is None:
+    def _can_drag(self, item: QTreeWidgetItem, pos: QPoint) -> bool:
+        if self._mode != "order":
             return False
-        tgt = self.itemAt(event.position().toPoint())
-        if tgt is None:
-            # 落到空白处 = 挪到这一层的末尾，只有顶层能这么干
-            return src.parent() is None
-        return tgt is not src and tgt.parent() is src.parent()
+        data = item.data(0, ROLE_DATA) or {}
+        if data.get("kind") not in ("home", "room", "scene"):
+            return False
+        rect = self.visualItemRect(item)
+        if item.childCount() and _chevron_hit(rect, self._depth(item)).contains(pos):
+            return False
+        if item.data(0, ROLE_SWITCH) is not None and _switch_rect(rect).contains(pos):
+            return False
+        return True
 
-    def dragMoveEvent(self, event) -> None:  # noqa: N802
-        if self._mode != "order" or not self._same_parent(event):
-            event.ignore()
+    def _begin_drag(self, item: QTreeWidgetItem, pos: QPoint) -> None:
+        rect = self.visualItemRect(item)
+        if not rect.isValid() or rect.isEmpty():
             return
-        super().dragMoveEvent(event)
+        self._drag_item = item
+        self._press_item = None
+        self._last_drag_pos = pos
+        ghost = QLabel(self.viewport())
+        ghost.setPixmap(self.viewport().grab(rect))
+        ghost.adjustSize()
+        ghost.setAttribute(Qt.WA_TransparentForMouseEvents)
+        effect = QGraphicsOpacityEffect(ghost)
+        effect.setOpacity(0.92)
+        ghost.setGraphicsEffect(effect)
+        ghost.show()
+        ghost.raise_()
+        self._drag_ghost = ghost
+        line = QWidget(self.viewport())
+        line.setAttribute(Qt.WA_TransparentForMouseEvents)
+        line.setStyleSheet(f"background: {self._p.accent}; border-radius: 1px;")
+        line.hide()
+        self._drop_line = line
+        self._update_drag(pos)
 
-    def dropEvent(self, event) -> None:  # noqa: N802
-        if self._mode != "order" or not self._same_parent(event):
-            event.ignore()
-            return
-        src = self.currentItem()
+    def _update_drag(self, pos: QPoint) -> None:
+        self._last_drag_pos = pos
+        src = self._drag_item
         if src is None:
-            event.ignore()
             return
-        parent = src.parent()
-        pos = event.position().toPoint()
-        tgt = self.itemAt(pos)
-        old = self._index_of(parent, src)
-        if tgt is None or tgt is src:
-            new = parent.childCount() - 1 if parent is not None else self.topLevelItemCount() - 1
+        ghost = self._drag_ghost
+        if ghost is not None:
+            rect = self.visualItemRect(src)
+            ghost.move(
+                max(0, min(pos.x() + 8, self.viewport().width() - ghost.width())),
+                max(0, min(pos.y() - rect.height() // 2,
+                           self.viewport().height() - ghost.height())),
+            )
+        parent, index, line_y = self._drop_target(src, pos)
+        self._drop_parent, self._drop_index = parent, index
+        line = self._drop_line
+        if line is not None:
+            if line_y < 0:
+                line.hide()
+            else:
+                line.setGeometry(4, max(0, line_y - 1), max(8, self.viewport().width() - 12), 2)
+                line.show()
+                line.raise_()
+        bar = self.verticalScrollBar()
+        y = pos.y()
+        if y < AUTO_SCROLL_EDGE and bar.value() > bar.minimum():
+            self._auto_timer.start()
+        elif y > self.viewport().height() - AUTO_SCROLL_EDGE and bar.value() < bar.maximum():
+            self._auto_timer.start()
         else:
-            anchor = self.visualItemRect(tgt)
-            new = self._index_of(parent, tgt) + (1 if pos.y() > anchor.center().y() else 0)
-            if new > old:
-                new -= 1
-        if new != old:
-            self._move(parent, old, new)
-        event.accept()
-        self.moved.emit()
+            self._auto_timer.stop()
+
+    def _drop_target(
+        self, src: QTreeWidgetItem, pos: QPoint,
+    ) -> tuple[QTreeWidgetItem | None, int, int]:
+        """返回 (父节点, 插入下标, 落位线 y)；y = -1 表示当前位置不允许放。"""
+        parent = src.parent()
+        old = self._index_of(parent, src)
+        tgt = self.itemAt(pos)
+        if tgt is None:
+            # 空白处：顶层可以挪到末尾；子层保持原有约束，不接受落空
+            if parent is not None:
+                return parent, -1, -1
+            return None, self.topLevelItemCount() - 1, self.viewport().height() - 3
+        if tgt is src or tgt.parent() is not parent:
+            return parent, -1, -1
+        rect = self.visualItemRect(tgt)
+        after = pos.y() > rect.center().y()
+        new = self._index_of(parent, tgt) + (1 if after else 0)
+        if new > old:
+            new -= 1
+        return parent, new, rect.bottom() if after else rect.top()
+
+    def _finish_drag(self) -> None:
+        src = self._drag_item
+        new = self._drop_index
+        if src is not None and new >= 0:
+            old = self._index_of(src.parent(), src)
+            if new != old:
+                self._move(src.parent(), old, new)
+                self.moved.emit()
+        self._cleanup_drag()
+
+    def _cleanup_drag(self) -> None:
+        self._auto_timer.stop()
+        for widget in (self._drag_ghost, self._drop_line):
+            if widget is not None:
+                widget.hide()
+                widget.deleteLater()
+        self._drag_ghost = None
+        self._drop_line = None
+        self._drag_item = None
+        self._drop_parent = None
+        self._drop_index = -1
+        self._clear_press()
+
+    def _clear_press(self) -> None:
+        self._press_pos = None
+        self._press_item = None
+
+    def _auto_scroll(self) -> None:
+        if self._drag_item is None:
+            self._auto_timer.stop()
+            return
+        bar = self.verticalScrollBar()
+        y = self._last_drag_pos.y()
+        before = bar.value()
+        if y < AUTO_SCROLL_EDGE:
+            bar.setValue(max(bar.minimum(), bar.value() - AUTO_SCROLL_STEP))
+        elif y > self.viewport().height() - AUTO_SCROLL_EDGE:
+            bar.setValue(min(bar.maximum(), bar.value() + AUTO_SCROLL_STEP))
+        else:
+            self._auto_timer.stop()
+        if bar.value() != before:
+            self._update_drag(self._last_drag_pos)
 
     def _index_of(self, parent: QTreeWidgetItem | None, item: QTreeWidgetItem) -> int:
         if parent is None:
@@ -407,7 +519,9 @@ class ReorderTree(QTreeWidget):
             item.setData(0, ROLE_SUFFIX, suffix)
         if switch is not None:
             item.setData(0, ROLE_SWITCH, switch)
-        item.setFlags(item.flags() | Qt.ItemIsDragEnabled | Qt.ItemIsDropEnabled)
+        # 拖动由 ReorderTree 自己用鼠标事件实现，不再交给 QTreeWidget 的
+        # ItemIsDragEnabled / ItemIsDropEnabled。
+
         if parent is None:
             self.addTopLevelItem(item)
         else:

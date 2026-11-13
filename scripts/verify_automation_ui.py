@@ -46,7 +46,7 @@ from PySide6.QtWidgets import (  # noqa: E402
 
 from mihome.core import speaker as SPK  # noqa: E402
 from mihome.core.automation import (  # noqa: E402
-    Action, Condition, LogEntry, Rule, RuleSet, validate_rule,
+    Action, Condition, LogEntry, Rule, RuleSet, Trigger, validate_rule,
 )
 from mihome.ui import automation as A  # noqa: E402
 from mihome.ui import automation_style as AS  # noqa: E402
@@ -71,23 +71,36 @@ def check(name: str, ok: bool, detail: str = "") -> None:
         FAILS.append(f"{name} {detail}")
 
 
+HOMES = {"1001": "1103 家", "1002": "共享家庭"}
+
+
 class FakeService(QObject):
     log_added = Signal(object)
     status_changed = Signal()
     rules_changed = Signal()
 
-    def __init__(self, path, entries=None, home: str = "测试家庭") -> None:
+    def __init__(self, path, entries=None, home: str = "1001") -> None:
         super().__init__()
         self.rules = RuleSet(path)
         self.rules.on_changed = self._on_rules_changed
         self.engine = SimpleNamespace(log=list(entries or []))
         self.syncs = 0
-        # 真实服务上是 property；这里做成普通属性，方便验证脚本切家庭
+        # 真实服务上是 property（家庭 id）；这里做成普通属性，方便切家庭
         self.current_home = home
+        # 「发虚拟事件」要求家庭有中枢网关；默认有，专门用例里再关掉
+        self.hub_ready = True
+        # 编辑窗的「归属家庭」只读展示要换成显示名
+        self.store = SimpleNamespace(
+            homes=lambda: [SimpleNamespace(id=hid, display_name=label)
+                           for hid, label in HOMES.items()],
+        )
 
-    def adopt_home(self) -> bool:
-        """与 AutomationService 同名：把没归属的规则认到当前家庭。"""
-        return bool(self.current_home) and self.rules.claim(self.current_home)
+    def home_label(self, home_id: str = "") -> str:
+        want = home_id or self.current_home
+        return HOMES.get(want, want)
+
+    def home_has_hub(self, home_id: str = "") -> bool:
+        return self.hub_ready
 
     def _on_rules_changed(self) -> None:
         self.sync()
@@ -118,13 +131,21 @@ def combo_index(combo, data) -> int:
                  if combo.itemData(i) == data), -1)
 
 
+def trig(*keys: str) -> list[Trigger]:
+    """v3 的触发列表；旧用例按单个键位写，这里折成 Trigger 省得每处都展开。"""
+    return [Trigger("keyboard", k) for k in keys]
+
+
 def sample_rules() -> list[Rule]:
     return [
-        Rule(id="r1", name="进门播报", keys="Ctrl+Alt+F7", enabled=True,
+        Rule(id="r1", name="进门播报", triggers=trig("Ctrl+Alt+F7"), enabled=True,
+             home="1001",
              actions=[Action("virtual_event", "极客版按键自动化执行", 0)]),
-        Rule(id="r2", name="离开时关灯", keys="F8", enabled=True,
+        Rule(id="r2", name="离开时关灯", triggers=trig("F8"), enabled=True,
+             home="1001",
              actions=[Action("virtual_event", "全屋关灯", 0)]),
-        Rule(id="r3", name="空规则示例", keys="", enabled=False,
+        Rule(id="r3", name="空规则示例", triggers=[], enabled=False,
+             home="1001",
              actions=[Action("virtual_event", "待填", 0)]),
     ]
 
@@ -179,6 +200,17 @@ check("卡片显示名称与触发键",
 check("未设键位显示占位",
       any(w.objectName() == "RuleKeys" and w.text() == "未设置快捷键"
           for w in cards[2].findChildren(QLabel)))
+# 多触发（用户 11-13 第十条）：卡片上要能看出挂了几个键
+multi_card = AL.RuleCard(Rule(id="mc", name="多触发",
+                              triggers=trig("F7", "F8", "F9", "F10"),
+                              actions=[Action("virtual_event", "A", 0)]),
+                         theme.LIGHT, lambda *_: None, lambda *_: None, lambda *_: None)
+_mkeys = next(w for w in multi_card.findChildren(QLabel) if w.objectName() == "RuleKeys")
+check("列表卡片多触发正确呈现",
+      _mkeys.text() == "F7 / F8 / F9 / …（共 4 个）", _mkeys.text())
+check("多触发卡片的 tooltip 是完整键位",
+      _mkeys.toolTip() == "F7、F8、F9、F10", _mkeys.toolTip())
+multi_card.deleteLater()
 check("启用描边用属性选择器", cards[0].property("on") == "true"
       and cards[2].property("on") == "false")
 check("每张卡有编辑与删除",
@@ -202,13 +234,13 @@ check("排队重建后描边跟着落盘值",
 
 # ---------------------------------------------------------------------------
 print("\n--- 列表窗：规则按家庭隔离（2026-11-13 第二轮用户要求） ---", flush=True)
-home_service = FakeService(_TMP / "home-rules.json", [], home="1103 家")
+home_service = FakeService(_TMP / "home-rules.json", [], home="1001")
 home_service.rules.rules = [
-    Rule(id="a1", name="1103 的规则", keys="F1", home="1103 家",
+    Rule(id="a1", name="1103 的规则", triggers=trig("F1"), home="1001",
          actions=[Action("virtual_event", "开灯", 0)]),
-    Rule(id="a2", name="共享家庭的规则", keys="F2", home="共享家庭",
+    Rule(id="a2", name="共享家庭的规则", triggers=trig("F2"), home="1002",
          actions=[Action("virtual_event", "关灯", 0)]),
-    Rule(id="a3", name="还没归属的老规则", keys="F3",
+    Rule(id="a3", name="未指定家庭的规则", triggers=trig("F3"),
          actions=[Action("virtual_event", "待归", 0)]),
 ]
 home_service.rules.save()
@@ -219,37 +251,44 @@ def _rule_names(dlg) -> list[str]:
     return [w.text() for w in dlg.findChildren(QLabel) if w.objectName() == "RuleName"]
 
 
-check("1103 家庭只列出自己那条 + 没归属的",
-      _rule_names(home_list) == ["1103 的规则", "还没归属的老规则"],
+def _home_badges(dlg) -> list[str]:
+    return [w.text() for w in dlg.findChildren(QLabel) if w.objectName() == "RuleBadge"]
+
+
+check("1103 家庭只列出自己那条 + 未指定家庭的",
+      _rule_names(home_list) == ["1103 的规则", "未指定家庭的规则"],
       str(_rule_names(home_list)))
 check("共享家庭的规则一条都不出现", "共享家庭的规则" not in _rule_names(home_list))
 check("标题栏按本家庭计数", "2 条规则" in home_list.title_bar._sub, home_list.title_bar._sub)
 _list_hint = next((w.text() for w in home_list.findChildren(QLabel)
                    if w.objectName() == "ListHint"), "")
-check("提示条写明只显示本家庭", "1103 家" in _list_hint, _list_hint)
+check("提示条写明只显示本家庭（显示名）", "1103 家" in _list_hint, _list_hint)
+check("提示条写明旧规则保存后会归到当前家庭", "归到当前家庭" in _list_hint, _list_hint)
+check("未指定家庭的卡片有可辨认标记",
+      _home_badges(home_list) == ["未指定家庭 · 保存后归入当前家庭"],
+      str(_home_badges(home_list)))
 
-home_service.current_home = "共享家庭"
+home_service.current_home = "1002"
 home_list._refresh()
-check("切到共享家庭只剩它自己的 + 没归属的",
-      _rule_names(home_list) == ["共享家庭的规则", "还没归属的老规则"],
+check("切到共享家庭只剩它自己的 + 未指定家庭的",
+      _rule_names(home_list) == ["共享家庭的规则", "未指定家庭的规则"],
       str(_rule_names(home_list)))
+check("提示条跟着换成新家庭的显示名", "共享家庭" in home_list.hint.text(),
+      home_list.hint.text())
 
-# 老规则（home 为空）在哪个家庭打开就认到哪儿，认完就不在别处出现
-check("adopt_home 认领了没归属的老规则", home_service.adopt_home() is True)
-check("认领后它归当前家庭", home_service.rules.get("a3").home == "共享家庭")
-home_service.current_home = "1103 家"
+# 未指定家庭的规则不会被自动认领：切几次家庭它还是空的
+home_service.current_home = "1001"
 home_list._refresh()
-check("认领后 1103 家庭只剩自己那条",
-      _rule_names(home_list) == ["1103 的规则"], str(_rule_names(home_list)))
+check("空归属不会被静默认领", home_service.rules.get("a3").home == "")
 
 home_service.rules.trash("a2")
-check("回收站也只放本家庭的", home_service.rules.trashed("1103 家") == []
-      and [r.id for r in home_service.rules.trashed("共享家庭")] == ["a2"])
+check("回收站也只放本家庭的", home_service.rules.trashed("1001") == []
+      and [r.id for r in home_service.rules.trashed("1002")] == ["a2"])
 home_list.close()
 
 # 一条规则都没有时，空态要说明"只显示本家庭"——否则换个家庭看到 0 条会以为规则丢了
-empty_service = FakeService(_TMP / "home-empty.json", [], home="共享家庭")
-empty_service.rules.rules = [Rule(id="x1", name="别家的", keys="F5", home="1103 家",
+empty_service = FakeService(_TMP / "home-empty.json", [], home="1002")
+empty_service.rules.rules = [Rule(id="x1", name="别家的", triggers=trig("F5"), home="1001",
                                   actions=[Action("virtual_event", "开灯", 0)])]
 empty_service.rules.save()
 empty_list = AL.AutomationListDialog(empty_service, theme.LIGHT)
@@ -287,7 +326,7 @@ def bar_strip_colors(dlg, bar) -> set[str]:
 
 scroll_service = FakeService(_TMP / "scroll-rules.json", sample_logs())
 scroll_service.rules.rules = [
-    Rule(id=f"s{i}", name=f"规则 {i}", keys=f"Ctrl+Alt+F{i}", enabled=(i % 2 == 0),
+    Rule(id=f"s{i}", name=f"规则 {i}", triggers=trig(f"Ctrl+Alt+F{i}"), enabled=(i % 2 == 0),
          actions=[Action("virtual_event", "极客版按键自动化执行", 0)])
     for i in range(8)
 ]
@@ -360,7 +399,8 @@ check("不能滚时滑块收起（只剩透明轨道）",
 check("滚动范围归零时 idle 属性置上", sb_bar.property("idle") is True)
 
 scroll_service.rules.rules += [
-    Rule(id=f"t{i}", name=f"补 {i}", keys=f"F{i}", actions=[Action("delay", "", 100)])
+    Rule(id=f"t{i}", name=f"补 {i}", triggers=trig(f"F{i}"),
+         actions=[Action("delay", "", 100)])
     for i in range(6)
 ]
 scroll_service.rules.save()
@@ -374,7 +414,7 @@ many.close()
 
 trash_service = FakeService(_TMP / "scroll-trash.json", sample_logs())
 trash_service.rules.rules = [
-    Rule(id=f"d{i}", name=f"删掉的 {i}", keys=f"Ctrl+Alt+F{i}", enabled=False,
+    Rule(id=f"d{i}", name=f"删掉的 {i}", triggers=trig(f"Ctrl+Alt+F{i}"), enabled=False,
          deleted=True, deleted_at=time.time() - i * 60,
          actions=[Action("virtual_event", "极客版按键自动化执行", 0)])
     for i in range(10)
@@ -418,7 +458,7 @@ try:
 
     button_with(listing, "Primary").click()
     check("点新建打开空白编辑窗", len(opened) == 2
-          and opened[-1]._is_new is True and opened[-1]._draft.keys == "")
+          and opened[-1]._is_new is True and opened[-1]._draft.triggers == [])
     check("新建窗 parent 是列表窗", opened[-1].parentWidget() is listing)
 
     button_text(listing, "回收站").click()
@@ -590,6 +630,18 @@ steps = sorted(str(c.property("step")) for c in dlg.findChildren(QFrame)
                if c.objectName() == "SectionCard" and c.property("step") is not None)
 check("三段卡片各有一条语义竖条", steps == ["1", "2", "3"], str(steps))
 check("冷静期默认 1000ms 且界面明示", dlg.cooldown.text() == "1000")
+check("新建规则默认没有触发行（点按钮才加）", len(dlg._trigger_rows) == 0)
+check("① 的添加按钮文案与 ③ 一致", dlg.add_trigger_btn.text() == "＋ 添加动作",
+      dlg.add_trigger_btn.text())
+check("① 添加按钮和冷静期在同一行",
+      dlg.add_trigger_btn.parentWidget() is dlg.cooldown.parentWidget()
+      and dlg.add_trigger_btn.parentWidget().layout().indexOf(dlg.cooldown) >= 0,
+      type(dlg.cooldown.parentWidget()).__name__)
+check("冷静期标签紧挨输入框（同一行、不是被推到最左）",
+      dlg.cooldown.parentWidget().layout().indexOf(dlg.cooldown) ==
+      dlg.cooldown.parentWidget().layout().indexOf(
+          next(w for w in dlg.cooldown.parentWidget().findChildren(QLabel)
+               if w.text() == "冷静期（毫秒）")) + 1)
 check("冷静期单位仍是毫秒", "冷静期（毫秒）" in
       "".join(t.text() for t in dlg.findChildren(QLabel)))
 check("冷静期在①触发卡内", dlg.cooldown in dlg.trigger_card.findChildren(QLineEdit))
@@ -604,7 +656,12 @@ check("默认一条动作，且停在空档「-」上（不替用户预选类型
       len(dlg._action_rows) == 1 and dlg._action_rows[0]._kind_key() == ""
       and dlg._action_rows[0].kind.currentText() == "-",
       f"{len(dlg._action_rows)} / {dlg._action_rows[0].kind.currentText()!r}")
-check("默认没有条件", len(dlg._cond_rows) == 0 and not dlg.cond_empty.isHidden())
+check("默认没有条件", len(dlg._cond_rows) == 0 and not dlg.cond_empty_box.isHidden())
+check("0 条条件时空态块的按钮上方分隔线让位（不叠线）",
+      dlg.cond_btns_divider.isHidden())
+check("条件关系下拉在 ② 卡片外（标题行里），不占卡片行",
+      not dlg.cond_card.isAncestorOf(dlg.mode))
+check("只有 0 条条件时条件关系也常显", not dlg.mode.isHidden())
 check("状态条写明 code 0 的边界", "code 0" in dlg.target_label.text())
 check("编辑窗不画规则列表", not dlg.findChildren(AL.RuleCard))
 check("编辑窗没有新建规则按钮", button_with(dlg, "Primary") is None
@@ -622,29 +679,118 @@ check("图标按钮都有 tooltip 与无障碍名",
 check("单行时上下移都禁用", not row0.up_btn.isEnabled()
       and not row0.down_btn.isEnabled())
 check("禁用态 tooltip 说明原因", "已经是第一条" in row0.up_btn.toolTip())
-check("注册状态并进快捷键行", dlg.key_status.parentWidget() is dlg.keycap.parentWidget())
-check("手动选键默认收起", dlg.manual_keys_widget.isHidden())
-dlg.manual_toggle.setChecked(True)
-check("点开才展开手动选键", not dlg.manual_keys_widget.isHidden())
-dlg.manual_toggle.setChecked(False)
 dlg.name_edit.setText("改名测试")
 check("标题副标题随名称同步", dlg.title_bar._sub == "改名测试")
 
 print("\n--- 编辑窗：选键 / 条件 / 动作 ---", flush=True)
-dlg._mod_boxes["Ctrl"].setChecked(True)
-dlg._mod_boxes["Alt"].setChecked(True)
-dlg.key_combo.setCurrentIndex(dlg.key_combo.findData("F7"))
-check("手动选键生成规范串", dlg._draft.keys == "Ctrl+Alt+F7", dlg._draft.keys)
-check("键位显示在按钮上", dlg.keycap.text() == "Ctrl+Alt+F7")
+# ① 也改成"点按钮加一行"：加出来停在空档，下拉里目前只有「键盘快捷键」
+dlg._add_trigger()
+tr0 = dlg._trigger_rows[0]
+check("点①的添加按钮后出现一条触发行",
+      len(dlg._trigger_rows) == 1 and tr0.kind.currentData() == "")
+check("触发类型下拉只有空档 + 键盘快捷键两项",
+      tr0.kind.count() == 2
+      and tr0.kind.itemData(1) == "keyboard"
+      and tr0.kind.itemText(1) == "键盘快捷键",
+      f"{tr0.kind.count()} 项")
+check("空档触发行里键帽先禁用", not tr0.keycap.isEnabled())
+tr0.kind.setCurrentIndex(tr0.kind.findData("keyboard"))
+check("选键盘快捷键后键帽可用", tr0.keycap.isEnabled())
+check("注册状态并进快捷键行", tr0.status.parentWidget() is tr0.keycap.parentWidget())
+check("手动选键默认收起", tr0.manual.isHidden())
+tr0.manual_toggle.setChecked(True)
+check("点开才展开手动选键", not tr0.manual.isHidden())
+tr0.manual_toggle.setChecked(False)
+# ① 允许多条触发：再加一条不会把按钮禁掉，删回去也不影响第一条
+dlg._add_trigger()
+check("可以加第二条触发行（多触发 = 任一命中）", len(dlg._trigger_rows) == 2)
+check("第二行是独立的空档行", dlg._trigger_rows[1].kind.currentData() == "")
+dlg._remove_trigger(dlg._trigger_rows[1])
+check("删掉第二条只影响它自己", len(dlg._trigger_rows) == 1
+      and dlg._trigger_rows[0] is tr0 and tr0.kind.currentData() == "keyboard")
 
+# 版式基准：③ 序号之后的下拉框 = 44px（16 内边距 + 20 序号 + 8 行距）。
+# ① 的下拉、② 的条件行/按钮、三块底部按钮都用 28px 左边距对齐到这条线，
+# 不再有 104px 的空占位列（用户 11-13 第六、七次调整）。
+dlg.resize(920, 760)
+dlg.show()
+app.processEvents()
+
+
+def _left(widget) -> int:
+    return widget.mapTo(dlg, QPoint(0, 0)).x()
+
+
+_action_kind = dlg._action_rows[0].kind
+check("①下拉 / ②条件按钮 / ③类型下拉 / 三块按钮都在同一条 44px 线",
+      _left(tr0.kind) == _left(dlg.add_cond_btn) == _left(_action_kind)
+      == _left(dlg.add_action_btn) == _left(dlg.add_trigger_btn),
+      f"{_left(tr0.kind)} / {_left(dlg.add_cond_btn)} / "
+      f"{_left(_action_kind)} / {_left(dlg.add_action_btn)}")
+check("③ 序号仍在最左，只靠 20px 序号列 + 8px 行距形成 28px 偏移",
+      _left(dlg._action_rows[0].index_label) < _left(_action_kind)
+      and _left(_action_kind) - _left(dlg._action_rows[0].index_label) == 28,
+      f"{_left(dlg._action_rows[0].index_label)} → {_left(_action_kind)}")
+check("② 空态提示与添加按钮同一条 44px 左缘",
+      _left(dlg.cond_empty) == _left(dlg.add_cond_btn),
+      f"{_left(dlg.cond_empty)} / {_left(dlg.add_cond_btn)}")
+check("空态提示上下两条分隔线也缩进到 44px、右缘到卡片内边距",
+      _left(dlg.cond_empty_top) == _left(dlg.cond_empty_bottom) == _left(dlg.cond_empty)
+      and dlg.cond_empty_top.width() == dlg.cond_empty.width()
+      == dlg.cond_empty_bottom.width(),
+      f"{_left(dlg.cond_empty_top)} / {_left(dlg.cond_empty_bottom)}")
+check("①底部按钮与冷静期同一行（纵向中心一致）",
+      dlg.add_trigger_btn.mapTo(dlg, QPoint(0, dlg.add_trigger_btn.height() // 2)).y()
+      == dlg.cooldown.mapTo(dlg, QPoint(0, dlg.cooldown.height() // 2)).y(),
+      f"{dlg.add_trigger_btn.mapTo(dlg, QPoint(0, dlg.add_trigger_btn.height() // 2)).y()} / "
+      f"{dlg.cooldown.mapTo(dlg, QPoint(0, dlg.cooldown.height() // 2)).y()}")
+check("冷静期输入框紧跟在它自己的标签右侧",
+      0 < dlg.cooldown.mapTo(dlg, QPoint(0, 0)).x()
+      - max(w.mapTo(dlg, QPoint(0, 0)).x() + w.width()
+            for w in dlg.cooldown.parentWidget().findChildren(QLabel)
+            if w.text() == "冷静期（毫秒）") <= 32)
+dlg.hide()
+
+tr0._mod_boxes["Ctrl"].setChecked(True)
+tr0._mod_boxes["Alt"].setChecked(True)
+tr0.key_combo.setCurrentIndex(tr0.key_combo.findData("F7"))
+check("手动选键生成规范串", tr0.value().keys == "Ctrl+Alt+F7", tr0.value().keys)
+check("键位显示在按钮上", tr0.keycap.text() == "Ctrl+Alt+F7")
+
+# 多触发：第二条行有自己的键位，保存时两条一起进 draft（OR 语义）
+dlg._add_trigger()
+tr1 = dlg._trigger_rows[1]
+tr1.kind.setCurrentIndex(tr1.kind.findData("keyboard"))
+tr1.set_keys("F8")
+check("两条触发行各记各的键位",
+      [t.keys for t in dlg._collect().triggers] == ["Ctrl+Alt+F7", "F8"],
+      str([t.keys for t in dlg._collect().triggers]))
+tr1.set_keys("ctrl+alt+f7")
+check("同一规则里重复键位被校验拦下",
+      any("用了同一个快捷键" in e for e in validate_rule(dlg._collect())),
+      str(validate_rule(dlg._collect())))
+tr1.kind.setCurrentIndex(0)
+check("空档触发行点保存会被拦，行内说「要先选触发方式」",
+      dlg._save(quiet=True) is False and tr1.hint.text() == "要先选触发方式",
+      tr1.hint.text())
+dlg._remove_trigger(tr1)
+check("删掉空档行后只剩原来那条", len(dlg._trigger_rows) == 1)
 dlg._add_condition(Condition("idle_minutes", "ge", "10"))
-check("添加条件后一行", len(dlg._cond_rows) == 1 and dlg.cond_empty.isHidden())
+check("添加条件后一行", len(dlg._cond_rows) == 1 and dlg.cond_empty_box.isHidden())
+check("有条件时空态块隐藏、按钮上方分隔线出现",
+      dlg.cond_empty_box.isHidden() and not dlg.cond_btns_divider.isHidden())
+check("只有一条条件时条件关系仍常显", not dlg.mode.isHidden())
 check("条件行删除按钮也是图标按钮",
       dlg._cond_rows[0].remove_btn.objectName() == "IconTool")
 dlg._cond_rows[0].arg.setText("25")
 check("条件行能读回参数", dlg._cond_rows[0].value().arg == "25")
+dlg._add_condition(Condition("idle_minutes", "ge", "5"))
+check("两条条件时条件关系仍在标题右侧（常显）", not dlg.mode.isHidden())
+dlg._remove_condition(dlg._cond_rows[-1])
+check("删回一条时条件关系不消失", not dlg.mode.isHidden())
 dlg._remove_condition(dlg._cond_rows[0])
-check("删除条件回到空态", len(dlg._cond_rows) == 0 and not dlg.cond_empty.isHidden())
+check("删除条件回到空态", len(dlg._cond_rows) == 0 and not dlg.cond_empty_box.isHidden())
+check("0 条条件时条件关系依旧常显", not dlg.mode.isHidden())
 
 # ② 也改成「加一行 → 落在空档「-」上 → 用户自己选类型」（用户 11-13 第八条）
 dlg._add_condition(Condition(type="", op=""))
@@ -795,25 +941,82 @@ check("落盘内容含键位与冷静期", saved.keys == "Ctrl+Alt+F7" and saved
 check("动作只有一条虚拟事件", len(saved.actions) == 1
       and saved.actions[0].name == "极客版按键自动化执行")
 check("保存触发热键同步", service2.syncs >= 1)
-check("新建规则归到当前家庭（换了家庭就看不到它）",
-      saved.home == service2.current_home, repr(saved.home))
+check("新建规则归到当前家庭（存的是家庭 id）",
+      saved.home == service2.current_home == "1001", repr(saved.home))
 check("编辑窗滚动条也常驻占位（③动作一多不会把内容挤窄）",
       dlg.area.verticalScrollBarPolicy() == Qt.ScrollBarAlwaysOn
       and dlg.area.horizontalScrollBarPolicy() == Qt.ScrollBarAlwaysOff)
+check("落盘的是触发列表", [t.keys for t in saved.triggers] == ["Ctrl+Alt+F7"])
 
-# 升级前的老规则（home 为空）在编辑保存时顺手认到当前家庭
-old_rule = Rule(id="old1", name="老规则", keys="F11",
+# 冲突检测（系统热键被占用 / 同键被别的规则用）：都长在触发行右侧
+conflict_svc = FakeService(_TMP / "conflict-rules.json")
+conflict_svc.rules.rules = [Rule(id="c1", name="占用者", triggers=trig("Ctrl+Alt+F7"),
+                                home="1001",
+                                actions=[Action("virtual_event", "A", 0)])]
+cdlg = A.AutomationDialog(conflict_svc, theme.LIGHT)
+cdlg._add_trigger()
+ctr = cdlg._trigger_rows[0]
+ctr.kind.setCurrentIndex(ctr.kind.findData("keyboard"))
+ctr.set_keys("Ctrl+Alt+F7")
+check("同一键位被别的启用规则占用时行内提示",
+      "占用者" in ctr.status.text(), ctr.status.text())
+conflict_svc.rules.set_enabled("c1", False)
+cdlg._refresh_status()
+check("停用的规则不算冲突", "占用者" not in ctr.status.text(), ctr.status.text())
+# 删到 0 行：界面允许，但保存不能当"无触发规则"存下去
+cdlg._action_rows[0].kind.setCurrentIndex(
+    cdlg._action_rows[0].kind.findData("virtual_event"))
+cdlg._action_rows[0].value_edit.setText("A")
+cdlg._remove_trigger(ctr)
+check("删到 0 行允许，但保存报「至少要有一个触发方式」",
+      cdlg._save(quiet=True) is False
+      and "至少要有一个触发方式" in cdlg.error_label.text(),
+      cdlg.error_label.text())
+cdlg.close()
+
+# 老规则（home 为空）打开时按当前家庭固定：归属只读展示，保存即落盘（开发中间态收口）
+old_rule = Rule(id="old1", name="老规则", triggers=trig("F11"),
                 actions=[Action("virtual_event", "旧事件", 0)])
 service2.rules.rules.append(old_rule)
 ed_old = A.AutomationDialog(service2, theme.LIGHT, "old1")
-check("编辑老规则时草稿临时归属当前家庭",
-      ed_old._draft.home == service2.current_home, repr(ed_old._draft.home))
+check("编辑老规则时归属固定为当前家庭 id",
+      ed_old._draft.home == service2.current_home == "1001", repr(ed_old._draft.home))
+check("归属家庭是只读文本，不是下拉",
+      not hasattr(ed_old, "home_combo"), "还有 home_combo")
+check("只读文本显示家庭名（display_name），不是 id",
+      ed_old.home_value.text() == "1103 家", ed_old.home_value.text())
+check("只读文本不是可编辑控件", isinstance(ed_old.home_value, QLabel))
+check("重开编辑窗后归属仍是旧家庭（不会随查看家庭漂移）",
+      service2.rules.get("old1").home == "", repr(service2.rules.get("old1").home))
 ed_old._save(quiet=True)
-check("保存后老规则也归了当前家庭",
+check("保存后老规则归到当前家庭",
       service2.rules.get("old1") is not None
-      and service2.rules.get("old1").home == service2.current_home,
+      and service2.rules.get("old1").home == "1001",
       repr(service2.rules.get("old1").home if service2.rules.get("old1") else None))
 ed_old.close()
+
+# 「发虚拟事件」需要当前家庭有中枢网关（判据同极客版入口）------------------------
+service2.hub_ready = False
+ed_hub = A.AutomationDialog(service2, theme.LIGHT)
+row = ed_hub._action_rows[0]
+row.kind.setCurrentIndex(row.kind.findData("virtual_event"))
+check("无中枢网关：虚拟事件输入框禁用", not row.value_edit.isEnabled())
+check("无中枢网关：红字提示", row.hint.text() == "该家庭缺少中枢网关",
+      row.hint.text())
+check("无中枢网关：保存被拦", ed_hub._save(quiet=True) is False)
+row.kind.setCurrentIndex(row.kind.findData("delay"))
+check("切到延迟后输入框恢复可用", row.value_edit.isEnabled())
+check("切到延迟后红字撤掉", row.hint.text() == "", row.hint.text())
+ed_hub.close()
+
+# 换到有中枢的家庭（重新打开编辑窗）就实时变回可用
+service2.hub_ready = True
+ed_hub2 = A.AutomationDialog(service2, theme.LIGHT)
+row2 = ed_hub2._action_rows[0]
+row2.kind.setCurrentIndex(row2.kind.findData("virtual_event"))
+check("有中枢网关：虚拟事件输入框可用", row2.value_edit.isEnabled())
+check("有中枢网关：没有红字", row2.hint.text() == "", row2.hint.text())
+ed_hub2.close()
 
 ed2 = A.AutomationDialog(service2, theme.LIGHT, saved.id)
 check("编辑既有规则回填名称", ed2.name_edit.text() == "测试播报")
@@ -826,12 +1029,12 @@ reject_calls: list[int] = []
 _orig_reject = QDialog.reject
 QDialog.reject = lambda self: reject_calls.append(1)  # type: ignore[assignment]
 try:
-    dlg._toggle_record()
-    check("进入录制态", dlg._recording is True)
+    dlg._toggle_record(tr0)
+    check("进入录制态", dlg._recording_row is tr0)
     reject_calls.clear()
     dlg.reject()
     check("录制态点遮罩只取消录制，不关窗",
-          dlg._recording is False and not reject_calls)
+          dlg._recording_row is None and not reject_calls)
 
     dlg._dirty = True
     A.confirm = lambda *a, **k: False  # 「直接关闭」
@@ -881,8 +1084,11 @@ check("设置页两个大按钮都改成圆角矩形（10px，不再有 20px 胶
 # 真点一下按钮：clicked 会带 bool，槽函数必须能吃掉多余参数并走到 accept()
 click_dlg = A.AutomationDialog(service2, theme.LIGHT)
 click_dlg.name_edit.setText("点按钮保存")
-click_dlg._mod_boxes["Ctrl"].setChecked(True)
-click_dlg.key_combo.setCurrentIndex(click_dlg.key_combo.findData("F9"))
+click_dlg._add_trigger()
+c_tr = click_dlg._trigger_rows[0]
+c_tr.kind.setCurrentIndex(c_tr.kind.findData("keyboard"))
+c_tr._mod_boxes["Ctrl"].setChecked(True)
+c_tr.key_combo.setCurrentIndex(c_tr.key_combo.findData("F9"))
 click_dlg._action_rows[0].kind.setCurrentIndex(
     click_dlg._action_rows[0].kind.findData("virtual_event"))
 click_dlg._action_rows[0].value_edit.setText("点按钮事件")
@@ -1039,7 +1245,7 @@ for label, dlg in (("列表窗", listing), ("日志窗", logdlg), ("编辑窗", 
     check(f"{label} {len(btns)} 个按钮都只在 Tab 时拿焦点", not loose, str(loose[:3]))
 # 回收站容器本身没有常驻按钮，还原 / 彻底删除长在卡片上，直接造一张卡来验
 tcard = AT.TrashCard(Rule(id="focustest", name="回收站里的规则",
-                          keys="Ctrl+Alt+F9"), lambda *_: None, lambda *_: None)
+                          triggers=trig("Ctrl+Alt+F9")), lambda *_: None, lambda *_: None)
 tbtns = tcard.findChildren(QPushButton)
 check("回收站卡片 2 个按钮都只在 Tab 时拿焦点",
       len(tbtns) == 2 and all(b.focusPolicy() == Qt.TabFocus for b in tbtns),
@@ -1186,8 +1392,8 @@ check("③ 只剩一枚「＋ 添加动作」（不再是三种动作各一枚�
 check("延迟不再按毫秒 / 秒拆成两枚按钮",
       not any("延迟（" in t for t in texts), str(sorted(texts)))
 check("②③ 两枚添加按钮都是 #Tool，长得一样",
-      all(button_text(ddlg, t).objectName() == "Tool"
-          for t in ("＋ 添加动作", "＋ 添加条件")))
+      ddlg.add_action_btn.objectName() == "Tool"
+      and button_text(ddlg, "＋ 添加条件").objectName() == "Tool")
 
 row = ddlg._action_rows[0]
 check("新建默认那行停在空档上", row._kind_key() == "" and row.kind.currentText() == "-",
@@ -1215,23 +1421,26 @@ check("类型下拉四档：空档 + 三种动作",
       == ["", "virtual_event", "delay", "speaker"],
       str([row.kind.itemText(i) for i in range(row.kind.count())]))
 
-# 「＋ 添加动作」要对齐类型下拉的左边缘（用户 11-13 第八条）：动作行前面有一格
-# 「1.」序号，所以按钮得比卡片左边缘右移 28px，否则看着像浮在序号外面。
+# 三块按钮都在卡片内边距（不再为对齐留空列）；③ 的类型下拉只被窄序号列右推
 app.processEvents()
-add_btn = button_text(ddlg, "＋ 添加动作")
+add_btn = ddlg.add_action_btn
 _btn_x = add_btn.mapTo(ddlg, QPoint(0, 0)).x()
 _kind_x = row.kind.mapTo(ddlg, QPoint(0, 0)).x()
-check("「＋ 添加动作」左边缘和类型下拉对齐（吃掉了序号那格）",
+check("③ 按钮左缘和类型下拉对齐（44px）",
       _btn_x == _kind_x, f"按钮 {_btn_x} vs 下拉 {_kind_x}")
-check("按钮不是贴着卡片左边缘（否则就是没算序号）",
-      _btn_x > button_text(ddlg, "＋ 添加条件").mapTo(ddlg, QPoint(0, 0)).x(),
-      f"{_btn_x} vs 条件按钮 "
-      f"{button_text(ddlg, '＋ 添加条件').mapTo(ddlg, QPoint(0, 0)).x()}")
+check("①/②/③ 的添加按钮共用同一条控件列",
+      ddlg.add_trigger_btn.mapTo(ddlg, QPoint(0, 0)).x()
+      == ddlg.add_cond_btn.mapTo(ddlg, QPoint(0, 0)).x() == _btn_x,
+      f"{ddlg.add_trigger_btn.mapTo(ddlg, QPoint(0, 0)).x()} / "
+      f"{ddlg.add_cond_btn.mapTo(ddlg, QPoint(0, 0)).x()} / {_btn_x}")
 
-# ② 那边没有序号，按钮本来就贴着卡片左边缘（和条件行第一格对齐）
+# ② 的一行没有序号，用 28px 左内边距补齐到 ③ 序号之后的下拉框那条线
 ddlg._add_condition(Condition(type="", op=""))
 app.processEvents()
 _cond_x = ddlg._cond_rows[-1].kind.mapTo(ddlg, QPoint(0, 0)).x()
+check("② 条件行的类型下拉和 ③ 动作下拉 / 三块按钮对齐",
+      _cond_x == _kind_x == _btn_x,
+      f"条件 {_cond_x} / 动作 {_kind_x} / 按钮 {_btn_x}")
 check("「＋ 添加条件」左边缘和条件行下拉对齐",
       button_text(ddlg, "＋ 添加条件").mapTo(ddlg, QPoint(0, 0)).x() == _cond_x,
       f"按钮 {button_text(ddlg, '＋ 添加条件').mapTo(ddlg, QPoint(0, 0)).x()} "
@@ -1252,7 +1461,7 @@ check("空档条件选完类型后：空参数立刻在行内说「要填参数�
       _cond_row.hint.text() == "要填参数", _cond_row.hint.text())
 ddlg._remove_condition(ddlg._cond_rows[-1])
 
-QTest.mouseClick(button_text(ddlg, "＋ 添加动作"), Qt.LeftButton)
+QTest.mouseClick(ddlg.add_action_btn, Qt.LeftButton)
 app.processEvents()
 check("真点「＋ 添加动作」加出空档行、焦点直接在类型下拉上",
       ddlg._action_rows[-1]._kind_key() == ""
@@ -1294,7 +1503,7 @@ check("从事件切回延迟拿到默认值（跟着当前单位走）",
 
 row.value_edit.setText("601")
 check("秒档超上限被拦", row.value().ms > 600_000
-      and bool(validate_rule(Rule(id="u", name="n", keys="Ctrl+Alt+F7",
+      and bool(validate_rule(Rule(id="u", name="n", triggers=trig("Ctrl+Alt+F7"),
                                   actions=[Action("virtual_event", name="A"),
                                            row.value()]))),
       str(row.value().ms))
@@ -1303,7 +1512,7 @@ check("秒档超上限行内就说「不能超过 600 秒」",
       "600 秒" in row.hint.text() and row.hint.isVisible(), row.hint.text())
 check("越界提示写明了多少秒",
       any("600 秒" in e for e in validate_rule(Rule(
-          id="u", name="n", keys="Ctrl+Alt+F7",
+          id="u", name="n", triggers=trig("Ctrl+Alt+F7"),
           actions=[Action("virtual_event", name="A"), row.value()]))))
 
 # 精度（用户 11-13 专门问的）：执行精度是 1 ms → 毫秒档不收小数、秒档收到 3 位，
@@ -1365,7 +1574,7 @@ check("毫秒档正常值无格式问题", row.format_error() == "" and row.valu
 check("正常值行内没有红字", not row.hint.isVisible(), row.hint.text())
 
 # -- 发音箱指令：「选音箱 / 静默 / 指令」三格 ------------------------------
-QTest.mouseClick(button_text(ddlg, "＋ 添加动作"), Qt.LeftButton)
+QTest.mouseClick(ddlg.add_action_btn, Qt.LeftButton)
 app.processEvents()
 sp_row = ddlg._action_rows[-1]
 check("点「＋ 添加动作」加出来的是空档行", sp_row._kind_key() == "")
@@ -1457,7 +1666,7 @@ check("返回值带着 did / text / name 三样",
       json.dumps(with_spk.value().to_dict(), ensure_ascii=False))
 
 # 规则里只有一条音箱动作也能成立（以前硬要求至少一条虚拟事件）
-spk_rule = Rule(id="s1", name="音箱规则", keys="Ctrl+Alt+F7",
+spk_rule = Rule(id="s1", name="音箱规则", triggers=trig("Ctrl+Alt+F7"),
                 actions=[with_spk.value()])
 check("只发音箱指令的规则能通过校验", validate_rule(spk_rule) == [],
       str(validate_rule(spk_rule)))
@@ -1486,7 +1695,7 @@ check("这个值本身不算格式错（能保存）",
 lossless.deleteLater()
 
 # 落盘再打开：秒档仍然是秒档（unit 只影响显示，不该在重开时丢）
-saved_rule = Rule(id="unit1", name="秒档落盘", keys="Ctrl+Alt+F7", actions=[
+saved_rule = Rule(id="unit1", name="秒档落盘", triggers=trig("Ctrl+Alt+F7"), actions=[
     Action("virtual_event", "极客版按键自动化执行"),
     Action("delay", ms=30000, unit="s"),
     Action("delay", ms=2000),

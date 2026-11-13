@@ -36,9 +36,16 @@ from . import paths
 #: 隐藏分组（首页每个家庭末尾那一块）的显示名。用中文常量而不是枚举，因为它要
 #: 直接画在界面上。叫「已隐藏设备」而不是「隐藏设备」：这一组里装的是**已经藏起来
 #: 的**设备，是结果不是动作；「隐藏设备」读起来像右键菜单里那个动作，容易混。
-#: 它只用于显示和 ``RoomView.room`` 标识——隐藏项的顺序走 ``order_hidden``
-#: （``self.hidden`` 列表），不按房间名落盘，所以改名不会丢任何用户数据。
+#: 它只用于显示；隐藏分组的内部标识是 ``HIDDEN_ROOM_ID``。隐藏项的顺序走
+#: ``order_hidden``（``self.hidden`` 列表），不按房间落盘，所以改名不会丢数据。
 HIDDEN_ROOM = "已隐藏设备"
+#: 隐藏分组的内部房间 id。它不是云端房间，只用于 SideNav / WallView 的定位；
+#: 隐藏项的真正顺序走 ``self.hidden``，不落进 ``device_order``。
+HIDDEN_ROOM_ID = "__hidden__"
+
+#: 偏好文件版本。v11 起排序键从「家庭名 / 房间名」换成云端 ``home_id`` /
+#: ``room_id``；旧版顺序直接丢弃，用户重新排一次，不做名字到 id 的迁移。
+PREFS_VERSION = 11
 
 # 家庭切换栏的两种排列方式：
 #   fixed        —— 位置只由用户设定的顺序决定，激活与否不动位置（靠样式区分）
@@ -79,7 +86,7 @@ START_IN_TRAY_DEFAULT = True
 #: ``ui/card_templates.py`` 的样式注册表决定，免得 core 反向依赖 ui。
 CARD_STYLE_DEFAULT = "standard"
 
-_SEP = "\x1f"  # 用作 (家庭, 房间) 组合键的分隔符，不会出现在正常名字里
+_SEP = "\x1f"  # 用作 (home_id, room_id) 组合键的分隔符
 
 
 def _str_list(value: Any) -> list[str]:
@@ -188,12 +195,21 @@ class Prefs:
             return
         if not isinstance(data, dict):
             return
-        self.home_order = _str_list(data.get("home_order"))
-        self.room_order = _order_map(data.get("room_order"))
-        self.device_order = _order_map(data.get("device_order"))
-        self.scene_order = _order_map(data.get("scene_order"))
+        # 排序键在 v11 从名字换成了云端 id。旧版的四份顺序直接丢弃：不做
+        # 名字→id 映射，也不留兼容分支；用户接受重新排一次。按 did 存的数据
+        # （hidden / card_styles / speaker_command_did）照常保留。
+        self.home_order = []
+        self.room_order = {}
+        self.device_order = {}
+        self.scene_order = {}
+        version = data.get("version")
+        if isinstance(version, int) and version >= PREFS_VERSION:
+            self.home_order = _str_list(data.get("home_order"))
+            self.room_order = _order_map(data.get("room_order"))
+            self.device_order = _order_map(data.get("device_order"))
+            self.scene_order = _order_map(data.get("scene_order"))
         self.hidden = _str_list(data.get("hidden"))
-        # 老文件里隐藏设备的 did 可能还留在顺序表里。读入时顺手清掉，
+        # 隐藏设备的 did 可能还留在顺序表里。读入时顺手清掉，
         # 让「顺序表 = 可见设备」从启动那一刻起就成立。
         for key, dids in list(self.device_order.items()):
             kept = [d for d in dids if d not in self.hidden]
@@ -239,7 +255,7 @@ class Prefs:
 
     def save(self) -> None:
         payload = {
-            "version": 10,
+            "version": PREFS_VERSION,
             "card_styles": self.card_styles,
             "home_order": self.home_order,
             "room_order": self.room_order,
@@ -268,36 +284,42 @@ class Prefs:
             pass
 
     # -- 排序：读 --------------------------------------------------------
-    def order_homes(self, names: Sequence[str]) -> list[str]:
-        return apply_order(self.home_order, names)
+    def order_homes(self, home_ids: Sequence[str]) -> list[str]:
+        return apply_order(self.home_order, home_ids)
 
-    def order_rooms(self, home: str, names: Sequence[str]) -> list[str]:
-        return apply_order(self.room_order.get(home, ()), names)
+    def order_rooms(self, home_id: str, room_ids: Sequence[str]) -> list[str]:
+        return apply_order(self.room_order.get(home_id, ()), room_ids)
 
-    def order_devices(self, home: str, room: str, dids: Sequence[str]) -> list[str]:
-        return apply_order(self.device_order.get(self._room_key(home, room), ()), dids)
+    def order_devices(
+        self, home_id: str, room_id: str, dids: Sequence[str],
+    ) -> list[str]:
+        key = self.room_key(home_id, room_id)
+        return apply_order(self.device_order.get(key, ()), dids)
 
-    def order_scenes(self, home: str, scene_ids: Sequence[str]) -> list[str]:
-        return apply_order(self.scene_order.get(home, ()), scene_ids)
+    def order_scenes(self, home_id: str, scene_ids: Sequence[str]) -> list[str]:
+        return apply_order(self.scene_order.get(home_id, ()), scene_ids)
 
     def order_hidden(self, dids: Sequence[str]) -> list[str]:
         return apply_order(self.hidden, dids)
 
     # -- 排序：写 --------------------------------------------------------
-    def set_home_order(self, names: Sequence[str]) -> None:
-        self.home_order = list(names)
+    def set_home_order(self, home_ids: Sequence[str]) -> None:
+        self.home_order = list(home_ids)
         self.save()
 
-    def set_room_order(self, home: str, names: Sequence[str]) -> None:
-        self.room_order[home] = list(names)
+    def set_room_order(self, home_id: str, room_ids: Sequence[str]) -> None:
+        self.room_order[home_id] = list(room_ids)
         self.save()
 
-    def set_device_order(self, home: str, room: str, dids: Sequence[str]) -> None:
-        self.device_order[self._room_key(home, room)] = self._only_visible(dids)
+    def set_device_order(
+        self, home_id: str, room_id: str, dids: Sequence[str],
+    ) -> None:
+        key = self.room_key(home_id, room_id)
+        self.device_order[key] = self._only_visible(dids)
         self.save()
 
-    def set_scene_order(self, home: str, scene_ids: Sequence[str]) -> None:
-        self.scene_order[home] = list(scene_ids)
+    def set_scene_order(self, home_id: str, scene_ids: Sequence[str]) -> None:
+        self.scene_order[home_id] = list(scene_ids)
         self.save()
 
     def set_orders(
@@ -316,22 +338,23 @@ class Prefs:
         if home_order is not None:
             self.home_order = list(home_order)
         if room_orders:
-            for home, names in room_orders.items():
-                self.room_order[home] = list(names)
+            for home_id, room_ids in room_orders.items():
+                self.room_order[home_id] = list(room_ids)
         if device_orders:
-            for (home, room), dids in device_orders.items():
-                self.device_order[self.room_key(home, room)] = self._only_visible(dids)
+            for (home_id, room_id), dids in device_orders.items():
+                key = self.room_key(home_id, room_id)
+                self.device_order[key] = self._only_visible(dids)
         if scene_orders:
-            for home, ids in scene_orders.items():
-                self.scene_order[home] = list(ids)
+            for home_id, ids in scene_orders.items():
+                self.scene_order[home_id] = list(ids)
         self.save()
 
-    def reset_rooms(self, home: str) -> None:
-        self.room_order.pop(home, None)
+    def reset_rooms(self, home_id: str) -> None:
+        self.room_order.pop(home_id, None)
         self.save()
 
-    def reset_devices(self, home: str, room: str) -> None:
-        self.device_order.pop(self._room_key(home, room), None)
+    def reset_devices(self, home_id: str, room_id: str) -> None:
+        self.device_order.pop(self.room_key(home_id, room_id), None)
         self.save()
 
     # -- 家庭标签的排列 / 激活样式 ---------------------------------------
@@ -506,11 +529,11 @@ class Prefs:
         hidden = self.hidden_set
         return [d for d in dids if d not in hidden]
 
-    def _append_device_order(self, home: str, room: str, did: str) -> None:
-        """把一台设备追加到房间末尾；先去掉可能残留的同名项。"""
+    def _append_device_order(self, home_id: str, room_id: str, did: str) -> None:
+        """把一台设备追加到房间末尾；先去掉可能残留的同一 did。"""
         if not did:
             return
-        key = self.room_key(home, room)
+        key = self.room_key(home_id, room_id)
         order = [d for d in self.device_order.get(key, ()) if d != did]
         order.append(did)
         self.device_order[key] = order

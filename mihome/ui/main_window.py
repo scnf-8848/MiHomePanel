@@ -447,9 +447,6 @@ class MainWindow(QMainWindow):
         if s.value("ui/theme", "light") == "dark":
             self.palette_ref = theme.DARK
         self.store.active_home = str(s.value("ui/active_home", "") or "")
-        # 上次看的家庭恢复了，才有得谈"把没归属的老规则认到哪个家庭"。
-        # 自动化服务在构造**早期**就建好了（那时 active_home 还是空），所以这里补一次。
-        self._adopt_rules()
 
     def showEvent(self, event) -> None:  # noqa: N802
         super().showEvent(event)
@@ -905,40 +902,27 @@ class MainWindow(QMainWindow):
     def _on_room_selected(self, home: str, room: str) -> None:
         self.wall.scroll_to_room(home, room)
 
-    def _on_home_selected(self, name: str) -> None:
-        if name == self.store.active_home:
+    def _on_home_selected(self, home_id: str) -> None:
+        if home_id == self.store.active_home:
             return
-        self.store.active_home = name
-        self.store.scenes = self.store.scenes_for(name)
-        self.wall.set_home(name)
-        self.nav.build(self.store, name)
-        self._settings().setValue("ui/active_home", name)
+        self.store.active_home = home_id
+        self.store.scenes = self.store.scenes_for(home_id)
+        self.wall.set_home(home_id)
+        self.nav.build(self.store, home_id)
+        self._settings().setValue("ui/active_home", home_id)
         self._update_header()
         self._refresh_speakers()
-        self._adopt_rules()
         self.store.poll()
-
-    def _adopt_rules(self) -> None:
-        """把还没归属家庭的老规则认到当前家庭（用户 11-13：规则按家庭隔离）。
-
-        只处理 ``home`` 为空的——那是升级前的 ``rules.json``，或者登录之前就建好
-        的规则。已经有归属的原样不动。改了才发 ``rules_changed``，列表窗若开着
-        会自己刷新（模态下多半关着，但下一个窗口读的就是新值）。
-        """
-        # 构造期（家庭标签栏还没建 / 服务还没起）也会走到这里，别硬取
-        service = getattr(self, "automation", None)
-        if service is not None and service.adopt_home():
-            service.rules_changed.emit()
 
     def _refresh_tabs(self) -> None:
         """把家庭列表 + 排列方式重新灌给顶部标签栏（只影响显示，不动设定顺序）。"""
         homes = self.store.homes()
-        active = self.store.active_home or (homes[0].name if homes else "")
+        active = self.store.active_home or (homes[0].id if homes else "")
         self.tabs.configure(self.store.home_placement, self.store.home_active_style)
         # 胶囊档的标签自带 14px 左内边距，从顶栏左边距里扣掉，标签文字才仍与
         # 下方卡片墙左对齐；切回另外两档时 inset 归零，边距自动还原。
         self._head.setContentsMargins(24 - self.tabs.content_inset, 0, 18, 0)
-        self.tabs.set_homes([(h.name, h.display_name) for h in homes], active)
+        self.tabs.set_homes([(h.id, h.display_name) for h in homes], active)
 
     def _on_changed(self, dids: set[str]) -> None:
         self.wall.update_cards(dids)
@@ -954,11 +938,11 @@ class MainWindow(QMainWindow):
         self._update_header()
 
     def _update_header(self) -> None:
-        names = self.store.home_names()
-        active = self.store.active_home or (names[0] if names else "")
+        ids = self.store.home_ids()
+        active = self.store.active_home or (ids[0] if ids else "")
         devices = [
             d for d in self.store.devices.values()
-            if not d.node.home or d.node.home == active
+            if not d.node.home_id or d.node.home_id == active
         ]
         on = sum(1 for d in devices if d.any_on)
         offline = sum(1 for d in devices if not d.online)
@@ -976,9 +960,9 @@ class MainWindow(QMainWindow):
 
     def _on_loaded(self) -> None:
         homes = self.store.homes()
-        names = [h.name for h in homes]
-        if self.store.active_home not in names:
-            self.store.active_home = names[0] if names else ""
+        ids = [h.id for h in homes]
+        if self.store.active_home not in ids:
+            self.store.active_home = ids[0] if ids else ""
         active = self.store.active_home
         self.store.scenes = self.store.scenes_for(active)
         self._refresh_tabs()
@@ -994,7 +978,6 @@ class MainWindow(QMainWindow):
             self.wall.update_cards(set(self.store.devices))
         self._update_header()
         self._refresh_speakers()
-        self._adopt_rules()
         self.store.poll()
 
     # -- 顶栏音箱指令条 --------------------------------------------------
@@ -1010,7 +993,10 @@ class MainWindow(QMainWindow):
         # 只取**当前家庭**的设备：指令条跟着这一屏的卡片墙走，跨家庭把别处的音箱列进来
         # 会让人找不到是哪台。筛选与自动化编辑页共用 ``speaker.collect_home``。
         bar.set_targets(
-            speaker.collect_home(self.store.devices.values(), self.store.active_home),
+            speaker.collect_home(
+                self.store.devices.values(),
+                self.store.home_label(self.store.active_home),
+            ),
             self.prefs.speaker_command_did,
         )
 

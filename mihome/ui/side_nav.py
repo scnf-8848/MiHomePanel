@@ -95,18 +95,21 @@ class SideNav(QWidget):
         self._p = palette
         self.update()
 
-    def build(self, store: Store, home: str) -> None:
-        self._home = home
+    def build(self, store: Store, home_id: str) -> None:
+        self._home = home_id
         rows: list[_Row] = []
         y = TOP
-        items = [d for d in store.devices.values() if not d.node.home or d.node.home == home]
+        items = [
+            d for d in store.devices.values()
+            if not d.node.home_id or d.node.home_id == home_id
+        ]
         rows.append(_Row("all", "全部设备", len(items), "", "*", y))
         y += ITEM_H + 4
 
-        for view in store.rooms(home):
+        for view in store.rooms(home_id):
             rows.append(
                 _Row("hidden" if view.kind == "hidden" else "room",
-                     view.room, len(view.devices), view.home, view.room, y)
+                     view.room_label, len(view.devices), view.home, view.room, y)
             )
             y += ITEM_H + 2
 

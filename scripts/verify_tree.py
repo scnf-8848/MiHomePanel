@@ -23,7 +23,6 @@
 
 from __future__ import annotations
 
-import inspect
 import os
 import sys
 import tempfile
@@ -32,8 +31,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QPoint, QPointF, Qt  # noqa: E402
-from PySide6.QtGui import QColor, QImage  # noqa: E402
+from PySide6.QtCore import QEvent, QPoint, QPointF, Qt  # noqa: E402
+from PySide6.QtGui import QColor, QImage, QMouseEvent  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import (  # noqa: E402
     QAbstractItemView,
@@ -93,20 +92,24 @@ def make_store() -> Store:
         HomeNode("h2", "办公室", [RoomNode("r3", "工位")]),
     ]
     devices = [
-        DeviceNode("d1", "主灯", "m", "light.x", home="我的家", room="客厅"),
-        DeviceNode("d2", "台灯", "m", "light.x", home="我的家", room="客厅"),
-        DeviceNode("d3", "床灯", "m", "light.x", home="我的家", room="卧室", online=False),
-        DeviceNode("d4", "吸顶灯", "m", "light.x", home="办公室", room="工位"),
+        DeviceNode("d1", "主灯", "m", "light.x", home="我的家", room="客厅",
+                   home_id="h1", room_id="r1"),
+        DeviceNode("d2", "台灯", "m", "light.x", home="我的家", room="客厅",
+                   home_id="h1", room_id="r1"),
+        DeviceNode("d3", "床灯", "m", "light.x", home="我的家", room="卧室",
+                   home_id="h1", room_id="r2", online=False),
+        DeviceNode("d4", "吸顶灯", "m", "light.x", home="办公室", room="工位",
+                   home_id="h2", room_id="r3"),
     ]
     store.topology = Topology(homes, devices)
     for node in devices:
         store.devices[node.did] = DeviceState(node=node, spec=None, card=build_card_empty(node))
     store.scenes_by_home = {
-        "我的家": [
+        "h1": [
             {"scene_id": "s1", "name": "回家", "home_id": "h1", "enable": True},
             {"scene_id": "s2", "name": "离家", "home_id": "h1", "enable": True},
         ],
-        "办公室": [],
+        "h2": [],
     }
     return store
 
@@ -138,21 +141,27 @@ def switch(item) -> float | None:
     return None if item is None else item.data(0, ROLE_SWITCH)
 
 
-class _Drop:
-    """只带 ``position()`` / ``accept()`` / ``ignore()`` 的假事件——够判定和丢弃用了。"""
+def _mouse(tree, kind, pos: QPoint, button, buttons) -> None:
+    event = QMouseEvent(
+        kind, QPointF(pos), QPointF(tree.viewport().mapToGlobal(pos)),
+        button, buttons, Qt.NoModifier,
+    )
+    if kind == QEvent.MouseButtonPress:
+        tree.mousePressEvent(event)
+    elif kind == QEvent.MouseMove:
+        tree.mouseMoveEvent(event)
+    else:
+        tree.mouseReleaseEvent(event)
 
-    def __init__(self, pos: QPoint) -> None:
-        self._pos = pos
-        self.accepted = False
 
-    def position(self) -> QPointF:  # noqa: N802
-        return QPointF(self._pos)
-
-    def accept(self) -> None:
-        self.accepted = True
-
-    def ignore(self) -> None:
-        self.accepted = False
+def drag(tree, src, target: QPoint) -> None:
+    """按首页卡片那套手势拖一行：按下 → 超过阈值 → 移动 → 松手。"""
+    rect = tree.visualItemRect(src)
+    start = QPoint(120, rect.center().y())
+    _mouse(tree, QEvent.MouseButtonPress, start, Qt.LeftButton, Qt.LeftButton)
+    _mouse(tree, QEvent.MouseMove, target, Qt.NoButton, Qt.LeftButton)
+    _mouse(tree, QEvent.MouseButtonRelease, target, Qt.LeftButton, Qt.NoButton)
+    QApplication.processEvents()
 
 
 def center(tree, item) -> QPoint:
@@ -166,27 +175,27 @@ def section_structure() -> None:
     rooms, scene, hidden = dlg.tree_rooms, dlg.tree_scenes, dlg.tree_hidden
 
     check("排序树 = 两个家庭", rooms.topLevelItemCount() == 2, f"{rooms.topLevelItemCount()} 行")
-    home = find(rooms, kind="home", key="我的家")
+    home = find(rooms, kind="home", key="h1")
     check("家庭行找得到", home is not None)
     check("家庭下两个房间", home.childCount() == 2,
           str([home.child(i).text(0) for i in range(2)]))
-    living = find(rooms, kind="room", room="客厅")
+    living = find(rooms, kind="room", room="r1")
     check("房间是叶子（设备层已移除）", living.childCount() == 0)
     check("排序树里没有任何设备行", find(rooms, kind="device") is None)
     check("房间行带台数", suffix(living) == "2 台", suffix(living))
 
     check("场景树也是两个家庭", scene.topLevelItemCount() == 2)
-    s_home = find(scene, kind="home", key="我的家")
+    s_home = find(scene, kind="home", key="h1")
     check("场景树只有两层", s_home.child(0).childCount() == 0)
     check("我的家两个场景", s_home.childCount() == 2,
           str([s_home.child(i).text(0) for i in range(2)]))
-    check("没场景的家庭是空行", find(scene, kind="home", key="办公室").childCount() == 0)
+    check("没场景的家庭是空行", find(scene, kind="home", key="h2").childCount() == 0)
 
     check("隐藏树 = 两个家庭", hidden.topLevelItemCount() == 2)
-    h_home = find(hidden, kind="home", home="我的家")
+    h_home = find(hidden, kind="home", home="h1")
     check("隐藏树家庭下 = 两个房间 + 快捷场景", h_home.childCount() == 3,
           str([h_home.child(i).text(0) for i in range(3)]))
-    group = find(hidden, kind="scene_group", home="我的家")
+    group = find(hidden, kind="scene_group", home="h1")
     check("「快捷场景」是个分组行", group is not None and group.childCount() == 2)
     check("分组行的数据是 scene_group", (group.data(0, ROLE_DATA) or {}).get("kind") == "scene_group")
     check("隐藏树家庭行有 5/5（3 设备 + 2 场景）", suffix(h_home) == "5/5", suffix(h_home))
@@ -204,11 +213,11 @@ def section_expand() -> None:
     check("叶子不进展开集合",
           not (all_open & {rooms._item_key(i) for i in rooms._walk() if not i.childCount()}))
 
-    find(rooms, kind="home", key="我的家").setExpanded(False)
+    find(rooms, kind="home", key="h1").setExpanded(False)
     rooms.viewport().update()
     dlg._fill_order_trees_silently()
-    check("重建后仍然收着", find(rooms, kind="home", key="我的家").isExpanded() is False)
-    check("别的家庭不受影响", find(rooms, kind="home", key="办公室").isExpanded() is True)
+    check("重建后仍然收着", find(rooms, kind="home", key="h1").isExpanded() is False)
+    check("别的家庭不受影响", find(rooms, kind="home", key="h2").isExpanded() is True)
 
     # 全折起来 → 在隐藏页点一次开关（会静默重填排序树）→ 不许自己撑开
     for item in rooms._walk():
@@ -224,7 +233,7 @@ def section_expand() -> None:
           f"{len(rooms.expanded_keys())} 个展开")
 
     # 点折角：真的要点在折角上才算，点文字不能把行折起来
-    home = find(rooms, kind="home", key="我的家")
+    home = find(rooms, kind="home", key="h1")
     QTest.mouseClick(rooms.viewport(), Qt.LeftButton, Qt.NoModifier,
                      _chevron_hit(rooms.visualItemRect(home)).center())
     QApplication.processEvents()
@@ -244,45 +253,45 @@ def section_order() -> None:
     # 3.1 家庭重排
     rooms._move(None, 0, 1)
     dlg._commit_room_tree()
-    check("家庭顺序写进 prefs", store.prefs.home_order == ["办公室", "我的家"],
+    check("家庭顺序写进 prefs", store.prefs.home_order == ["h2", "h1"],
           str(store.prefs.home_order))
-    check("store.homes() 跟着变", store.home_names() == ["办公室", "我的家"],
-          str(store.home_names()))
+    check("store.homes() 跟着变", store.home_ids() == ["h2", "h1"],
+          str(store.home_ids()))
 
-    # 3.2 房间重排（只在"我的家"里）
-    home = find(rooms, kind="home", key="我的家")
-    living = find(rooms, kind="room", room="客厅")
+    # 3.2 房间重排（只在 h1 里）
+    home = find(rooms, kind="home", key="h1")
+    living = find(rooms, kind="room", room="r1")
     rooms._move(home, home.indexOfChild(living), 1)
     dlg._commit_room_tree()
-    check("房间顺序写进 prefs", store.prefs.room_order.get("我的家") == ["卧室", "客厅"],
-          str(store.prefs.room_order.get("我的家")))
+    check("房间顺序写进 prefs", store.prefs.room_order.get("h1") == ["r2", "r1"],
+          str(store.prefs.room_order.get("h1")))
     check("房间内的顺序也真的换了",
-          store.room_names("我的家") == ["卧室", "客厅"],
-          str(store.room_names("我的家")))
+          store.room_ids("h1") == ["r2", "r1"],
+          str(store.room_ids("h1")))
     check("排序页不再写设备顺序", store.prefs.device_order == {},
           str(store.prefs.device_order))
     check("设备仍按首页拖好的原顺序",
-          [d.did for d in store.device_states("我的家", "客厅")] == ["d1", "d2"],
-          str([d.did for d in store.device_states("我的家", "客厅")]))
+          [d.did for d in store.device_states("h1", "r1")] == ["d1", "d2"],
+          str([d.did for d in store.device_states("h1", "r1")]))
 
     # 3.3 场景重排
-    s_home = find(scene, kind="home", key="我的家")
+    s_home = find(scene, kind="home", key="h1")
     scene._move(s_home, 1, 0)
     dlg._commit_scene_tree()
-    check("场景顺序写进 prefs", store.prefs.scene_order.get("我的家") == ["s2", "s1"],
-          str(store.prefs.scene_order.get("我的家")))
+    check("场景顺序写进 prefs", store.prefs.scene_order.get("h1") == ["s2", "s1"],
+          str(store.prefs.scene_order.get("h1")))
     check("首页拿到的场景顺序跟着变",
-          [s["scene_id"] for s in store.scenes_for("我的家")] == ["s2", "s1"],
-          str([s["scene_id"] for s in store.scenes_for("我的家")]))
+          [s["scene_id"] for s in store.scenes_for("h1")] == ["s2", "s1"],
+          str([s["scene_id"] for s in store.scenes_for("h1")]))
 
     # 3.4 一次拖动只落一次盘
     reloaded = Prefs(PATH)
     check("三样都落盘了",
-          reloaded.home_order == ["办公室", "我的家"]
-          and reloaded.room_order.get("我的家") == ["卧室", "客厅"]
-          and reloaded.scene_order.get("我的家") == ["s2", "s1"],
-          f"{reloaded.home_order} / {reloaded.room_order.get('我的家')} / "
-          f"{reloaded.scene_order.get('我的家')}")
+          reloaded.home_order == ["h2", "h1"]
+          and reloaded.room_order.get("h1") == ["r2", "r1"]
+          and reloaded.scene_order.get("h1") == ["s2", "s1"],
+          f"{reloaded.home_order} / {reloaded.room_order.get('h1')} / "
+          f"{reloaded.scene_order.get('h1')}")
 
     # 3.5 房间重排：拖完这一行不能没了
     #     Qt 的 startDrag 在 exec 返回 MoveAction 时会按**当前选择集**调
@@ -290,21 +299,54 @@ def section_order() -> None:
     #     那一下就正好把刚放下的行再删一遍。所以 startDrag 必须自己实现。
     store, dlg = fresh()
     rooms = dlg.tree_rooms
-    home = find(rooms, kind="home", key="我的家")
-    living = find(rooms, kind="room", room="客厅")
-    bed = find(rooms, kind="room", room="卧室")
+    home = find(rooms, kind="home", key="h1")
+    living = find(rooms, kind="room", room="r1")
+    bed = find(rooms, kind="room", room="r2")
     want = {home.child(i).text(0) for i in range(home.childCount())}
-    rooms.setCurrentItem(living)
-    rooms.dropEvent(_Drop(QPoint(300, rooms.visualItemRect(bed).bottom() - 4)))
-    QApplication.processEvents()
+    drag(rooms, living, QPoint(300, rooms.visualItemRect(bed).bottom() - 4))
     got = [home.child(i).text(0) for i in range(home.childCount())]
     check("房间拖完顺序变了", got == ["卧室", "客厅"], str(got))
     check("房间一个都没少", set(got) == want, f"{sorted(got)} vs {sorted(want)}")
-    check("房间顺序落盘", store.prefs.room_order.get("我的家") == ["卧室", "客厅"],
-          str(store.prefs.room_order.get("我的家")))
-    src_drag = inspect.getsource(type(rooms).startDrag)
-    check("startDrag 是自己实现的", type(rooms).startDrag is not QAbstractItemView.startDrag)
-    check("startDrag 不调基类（基类会把源行删掉）", "super().startDrag" not in src_drag)
+    check("房间顺序落盘", store.prefs.room_order.get("h1") == ["r2", "r1"],
+          str(store.prefs.room_order.get("h1")))
+    check("拖动结束后幽灵行已清理", rooms._drag_ghost is None)
+    check("拖动结束后落位线已清理", rooms._drop_line is None)
+    check("不再启用 Qt 原生拖放",
+          rooms.dragDropMode() == QAbstractItemView.NoDragDrop,
+          str(rooms.dragDropMode()))
+
+    # 3.5b 拖动过程中的幽灵行 / 落位线 / 边缘自动滚
+    store, dlg = fresh()
+    dlg.show()
+    dlg.nav.setCurrentRow(1)
+    for _ in range(3):
+        QApplication.processEvents()
+    rooms = dlg.tree_rooms
+    rooms.clear()
+    for i in range(40):
+        rooms.add_row(None, f"家庭{i}", {"kind": "home", "key": f"h{i}"})
+    rooms.resize(320, 180)
+    QApplication.processEvents()
+    src = rooms.topLevelItem(0)
+    start = QPoint(120, rooms.visualItemRect(src).center().y())
+    edge = QPoint(120, rooms.viewport().height() - 4)
+    _mouse(rooms, QEvent.MouseButtonPress, start, Qt.LeftButton, Qt.LeftButton)
+    _mouse(rooms, QEvent.MouseMove, edge, Qt.NoButton, Qt.LeftButton)
+    QApplication.processEvents()
+    check("拖动时出现幽灵行",
+          rooms._drag_ghost is not None and rooms._drag_ghost.isVisible())
+    check("拖动时出现落位线",
+          rooms._drop_line is not None and rooms._drop_line.isVisible())
+    before = rooms.verticalScrollBar().value()
+    rooms._auto_scroll()
+    check("拖到边缘会自动滚动",
+          rooms.verticalScrollBar().value() > before,
+          f"{before} → {rooms.verticalScrollBar().value()}")
+    _mouse(rooms, QEvent.MouseButtonRelease, edge, Qt.LeftButton, Qt.NoButton)
+    QApplication.processEvents()
+    check("松手后幽灵行 / 落位线都清掉",
+          rooms._drag_ghost is None and rooms._drop_line is None)
+    dlg.close()
 
     # 3.6 重填中不写盘
     store, dlg = fresh()
@@ -317,17 +359,17 @@ def section_order() -> None:
     check("重填过程中拖动不落盘", list(store.prefs.home_order) == before, str(store.prefs.home_order))
 
     # 3.7 恢复默认仍然清得掉设备顺序（设备层不在页面上，但能力不能丢）
-    store.prefs.set_device_order("我的家", "客厅", ["d2", "d1"])
-    store.prefs.set_room_order("我的家", ["卧室", "客厅"])
+    store.prefs.set_device_order("h1", "r1", ["d2", "d1"])
+    store.prefs.set_room_order("h1", ["r2", "r1"])
     dlg._reset_layout()
     check("恢复默认清空家庭 / 房间顺序",
-          store.prefs.home_order == [] and "我的家" not in store.prefs.room_order,
+          store.prefs.home_order == [] and "h1" not in store.prefs.room_order,
           f"{store.prefs.home_order} / {store.prefs.room_order}")
     check("恢复默认也清空各房间设备顺序", store.prefs.device_order == {},
           str(store.prefs.device_order))
     check("设备回到云端顺序",
-          [d.did for d in store.device_states("我的家", "客厅")] == ["d1", "d2"],
-          str([d.did for d in store.device_states("我的家", "客厅")]))
+          [d.did for d in store.device_states("h1", "r1")] == ["d1", "d2"],
+          str([d.did for d in store.device_states("h1", "r1")]))
     dlg.close()
 
 
@@ -335,29 +377,31 @@ def section_cross_layer() -> None:
     print("\n4) 跨层拖动被拒")
     store, dlg = fresh()
     rooms = dlg.tree_rooms
-    living = find(rooms, kind="room", room="客厅")
-    bed = find(rooms, kind="room", room="卧室")
-    office = find(rooms, kind="home", key="办公室")
-    desk = find(rooms, kind="room", room="工位")
+    living = find(rooms, kind="room", room="r1")
+    bed = find(rooms, kind="room", room="r2")
+    office = find(rooms, kind="home", key="h2")
+    desk = find(rooms, kind="room", room="r3")
 
-    rooms.setCurrentItem(living)
-    check("拖到同家庭另一房间：允许", rooms._same_parent(_Drop(center(rooms, bed))) is True)
-    check("拖到自己身上：不算", rooms._same_parent(_Drop(center(rooms, living))) is False)
-    check("拖到别的家庭：拒绝", rooms._same_parent(_Drop(center(rooms, office))) is False)
-    check("拖到别的家庭的房间：拒绝", rooms._same_parent(_Drop(center(rooms, desk))) is False)
+    check("拖到同家庭另一房间：允许",
+          rooms._drop_target(living, center(rooms, bed))[1] >= 0)
+    check("拖到自己身上：不算",
+          rooms._drop_target(living, center(rooms, living))[1] < 0)
+    check("拖到别的家庭：拒绝",
+          rooms._drop_target(living, center(rooms, office))[1] < 0)
+    check("拖到别的家庭的房间：拒绝",
+          rooms._drop_target(living, center(rooms, desk))[1] < 0)
     check("拖到空白处（房间）：拒绝",
-          rooms._same_parent(_Drop(QPoint(10, rooms.viewport().height() - 4))) is False)
-
-    rooms.setCurrentItem(office)
+          rooms._drop_target(
+              living, QPoint(10, rooms.viewport().height() - 4))[1] < 0)
     check("拖到空白处（家庭）：挪到末尾",
-          rooms._same_parent(_Drop(QPoint(10, rooms.viewport().height() - 4))) is True)
+          rooms._drop_target(
+              office, QPoint(10, rooms.viewport().height() - 4))[1] >= 0)
 
     # 跨层拖动真的不会改 prefs
     before_rooms = {k: list(v) for k, v in store.prefs.room_order.items()}
     before_homes = list(store.prefs.home_order)
-    rooms.setCurrentItem(living)
-    rooms.dropEvent(_Drop(center(rooms, desk)))
-    check("跨层 dropEvent 不改偏好",
+    drag(rooms, living, center(rooms, desk))
+    check("跨层拖动不改偏好",
           store.prefs.room_order == before_rooms and store.prefs.home_order == before_homes,
           f"{store.prefs.room_order} / {store.prefs.home_order}")
     dlg.close()
@@ -368,8 +412,8 @@ def section_hidden() -> None:
     store, dlg = fresh()
     tree = dlg.tree_hidden
 
-    home = find(tree, kind="home", home="我的家")
-    living = find(tree, kind="room", room="客厅")
+    home = find(tree, kind="home", home="h1")
+    living = find(tree, kind="room", room="r1")
     check("初始全显示", switch(home) == 1.0 and switch(living) == 1.0,
           f"{switch(home)}/{switch(living)}")
 
@@ -377,8 +421,8 @@ def section_hidden() -> None:
     QTest.mouseClick(tree.viewport(), Qt.LeftButton, Qt.NoModifier,
                      _switch_rect(tree.visualItemRect(living)).center())
     QApplication.processEvents()
-    living = find(tree, kind="room", room="客厅")
-    home = find(tree, kind="home", home="我的家")
+    living = find(tree, kind="room", room="r1")
+    home = find(tree, kind="home", home="h1")
     check("房间开关 → 0", switch(living) == 0.0, str(switch(living)))
     check("房间行变成 0/2", suffix(living) == "0/2", suffix(living))
     check("两台设备都关上了",
@@ -390,9 +434,9 @@ def section_hidden() -> None:
 
     # 再点一次 → 全显示
     QTest.mouseClick(tree.viewport(), Qt.LeftButton, Qt.NoModifier,
-                     _switch_rect(tree.visualItemRect(find(tree, kind="room", room="客厅"))).center())
+                     _switch_rect(tree.visualItemRect(find(tree, kind="room", room="r1"))).center())
     QApplication.processEvents()
-    living = find(tree, kind="room", room="客厅")
+    living = find(tree, kind="room", room="r1")
     check("再点一次回到全显", switch(living) == 1.0 and suffix(living) == "2/2",
           f"{switch(living)} / {suffix(living)}")
 
@@ -400,16 +444,16 @@ def section_hidden() -> None:
     QTest.mouseClick(tree.viewport(), Qt.LeftButton, Qt.NoModifier,
                      _switch_rect(tree.visualItemRect(find(tree, kind="device", id="d1"))).center())
     QApplication.processEvents()
-    living = find(tree, kind="room", room="客厅")
+    living = find(tree, kind="room", room="r1")
     check("只藏一台时房间是半开", abs(float(switch(living)) - 0.5) < 1e-6, str(switch(living)))
     check("半开时的计数是 1/2", suffix(living) == "1/2", suffix(living))
     check("半开状态不是 0 也不是 1", 0.02 < float(switch(living)) < 0.98)
 
     # 家庭开关：还有没显示的 → 全部显示
     QTest.mouseClick(tree.viewport(), Qt.LeftButton, Qt.NoModifier,
-                     _switch_rect(tree.visualItemRect(find(tree, kind="home", home="我的家"))).center())
+                     _switch_rect(tree.visualItemRect(find(tree, kind="home", home="h1"))).center())
     QApplication.processEvents()
-    home = find(tree, kind="home", home="我的家")
+    home = find(tree, kind="home", home="h1")
     check("部分隐藏时点家庭 = 全部显示", switch(home) == 1.0 and suffix(home) == "5/5",
           f"{switch(home)} / {suffix(home)}")
 
@@ -417,7 +461,7 @@ def section_hidden() -> None:
     QTest.mouseClick(tree.viewport(), Qt.LeftButton, Qt.NoModifier,
                      _switch_rect(tree.visualItemRect(home)).center())
     QApplication.processEvents()
-    home = find(tree, kind="home", home="我的家")
+    home = find(tree, kind="home", home="h1")
     check("全显时点家庭 = 设备全隐藏", suffix(home) == "2/5", suffix(home))
     check("场景没受影响", suffix(find(tree, kind="scene", id="s1")) == "",
           f"'{suffix(find(tree, kind='scene', id='s1'))}'")
@@ -426,7 +470,7 @@ def section_hidden() -> None:
     QTest.mouseClick(tree.viewport(), Qt.LeftButton, Qt.NoModifier,
                      _switch_rect(tree.visualItemRect(find(tree, kind="scene_group"))).center())
     QApplication.processEvents()
-    home = find(tree, kind="home", home="我的家")
+    home = find(tree, kind="home", home="h1")
     check("场景组一点全藏", switch(find(tree, kind="scene_group")) == 0.0)
     check("家庭行跟着变 0/5", suffix(home) == "0/5", suffix(home))
     check("场景隐藏进了 prefs",
@@ -435,7 +479,7 @@ def section_hidden() -> None:
     # 全部恢复显示
     dlg.btn_show_all.click()
     QApplication.processEvents()
-    home = find(tree, kind="home", home="我的家")
+    home = find(tree, kind="home", home="h1")
     check("「全部恢复显示」拉回 5/5", suffix(home) == "5/5", suffix(home))
     check("prefs 两侧都清空了", store.prefs.hidden == [] and store.prefs.hidden_scenes == [],
           f"{store.prefs.hidden} / {store.prefs.hidden_scenes}")
@@ -462,8 +506,8 @@ def section_geometry() -> None:
     # 的方底色，选中时就是文字块左边那块深蓝。改由 delegate 自己算。
     check("控件自身不缩进（缩进交给 delegate）", tree.indentation() == 0,
           str(tree.indentation()))
-    home = find(tree, kind="home", home="我的家")
-    room = find(tree, kind="room", room="客厅")
+    home = find(tree, kind="home", home="h1")
+    room = find(tree, kind="room", room="r1")
     leaf = find(tree, kind="device", id="d1")
     check("实际行高 = 32", tree.visualItemRect(home).height() == ROW_H,
           str(tree.visualItemRect(home).height()))
@@ -510,7 +554,7 @@ def section_geometry() -> None:
     dlg._fill_hidden_tree()
     QApplication.processEvents()
     img = tree.viewport().grab().toImage()
-    half = track(find(tree, kind="room", room="客厅"))
+    half = track(find(tree, kind="room", room="r1"))
     check("半开的开关不是绿的", _diff(half, QColor(theme.TOGGLE_ON)) > 24, half.name())
     off = track(find(tree, kind="device", id="d1"))
     check("关掉的开关也是灰轨", _diff(off, QColor(theme.TOGGLE_ON)) > 24, off.name())
@@ -518,7 +562,7 @@ def section_geometry() -> None:
     # 选中一块看行首：QTreeView 曾经把缩进区铺成 palette.highlight() 的方底色
     # （浅色主题下是 #3d7eff），和这边自绘的圆角块并排，就成了"蓝色方块 + 浅蓝
     # 长条"两个选中指示打架。缩进改由 delegate 自算后，整行都归圆角块。
-    room = find(tree, kind="room", room="客厅")  # 重填过，旧 item 已经没了
+    room = find(tree, kind="room", room="r1")  # 重填过，旧 item 已经没了
     tree.setCurrentItem(room)
     QApplication.processEvents()
     img = tree.viewport().grab().toImage()
@@ -602,24 +646,27 @@ def section_panels() -> None:
 
         check(f"{pal.name}：外观页三张卡（主题 / 家庭标签 / 摄像头）", len(cards_of(0)) == 3,
               f"{len(cards_of(0))} 张")
-        check(f"{pal.name}：排序页两张卡（家庭 / 房间树、场景树）", len(cards_of(1)) == 2,
+        check(f"{pal.name}：排序页一张卡（两棵树用 tab 切换）", len(cards_of(1)) == 1,
               f"{len(cards_of(1))} 张")
         check(f"{pal.name}：隐藏页一张卡", len(cards_of(2)) == 1, f"{len(cards_of(2))} 张")
         check(f"{pal.name}：账号页一张卡", len(cards_of(3)) == 1, f"{len(cards_of(3))} 张")
 
-        # 分区标题必须在卡片外面：父控件不是卡，纵坐标在卡上方
+        # 排序页：两个 tab 互斥，各自吃满卡片高度
         show_page(1)
-        order_page = dlg.pages.widget(1)
-        scene_card = dlg.tree_scenes.parentWidget()
-        titles = [lab for lab in order_page.findChildren(QLabel, "SectionTitle")]
-        check(f"{pal.name}：排序页两条分区标题", len(titles) == 2, f"{len(titles)} 条")
-        if titles and scene_card is not None:
-            check(f"{pal.name}：分区标题不装在卡片里",
-                  all(lab.parentWidget() is not scene_card for lab in titles))
-            last = max(titles, key=lambda lab: lab.mapTo(dlg, QPoint(0, 0)).y())
-            gap = (scene_card.mapTo(dlg, QPoint(0, 0)).y()
-                   - last.mapTo(dlg, QPoint(0, 0)).y())
-            check(f"{pal.name}：标题在卡片上方", 0 < gap <= 40, f"间距 {gap}")
+        check(f"{pal.name}：默认显示房间树",
+              dlg.order_stack.currentWidget() is dlg.tree_rooms)
+        dlg._switch_order_tab("scenes")
+        QApplication.processEvents()
+        check(f"{pal.name}：切到场景 tab 只显示场景树",
+              dlg.order_stack.currentWidget() is dlg.tree_scenes)
+        check(f"{pal.name}：场景树铺满卡片高度",
+              abs(dlg.tree_scenes.height() - dlg.order_stack.height()) <= 2,
+              f"树 {dlg.tree_scenes.height()} / 栈 {dlg.order_stack.height()}")
+        dlg._switch_order_tab("rooms")
+        QApplication.processEvents()
+        check(f"{pal.name}：房间树铺满卡片高度",
+              abs(dlg.tree_rooms.height() - dlg.order_stack.height()) <= 2,
+              f"树 {dlg.tree_rooms.height()} / 栈 {dlg.order_stack.height()}")
 
         # 外观页："家庭标签"卡里两行（排列 / 激活样式）+ 预览；三段 → 两条线
         show_page(0)
@@ -672,39 +719,34 @@ def section_panels() -> None:
             pt = widget.mapTo(dlg, QPoint(int(x), int(y)))
             return _px(img, dpr, pt.x(), pt.y())
 
-        dev = dlg.tree_rooms.parentWidget()
-        check(f"{pal.name}：树住在 SectionCard 里",
-              dev is not None and dev.objectName() == "SectionCard")
-        if dev is None or scene_card is None:
+        card = dlg.order_stack.parentWidget()
+        check(f"{pal.name}：tab 栈住在 SectionCard 里",
+              card is not None and card.objectName() == "SectionCard")
+        if card is None:
             dlg.close()
             continue
 
-        # 卡底：取右侧那条 10px 内缩留白（树在里面，行画不到这里），
+        # 卡底：取右侧那条留白（栈在里面，树行画不到这里），
         # y 取底部往上 20——已经离开圆角弧线，横向是直的
-        bar = px(dev, dev.width() - 4, dev.height() - 20)
+        bar = px(card, card.width() - 4, card.height() - 20)
         # 窗口底色：卡片右边那一条页边距（页右边距 26，取 8 进去仍在底色上）
-        base = dev.mapTo(dlg, QPoint(dev.width() + 8, 300))
+        base = card.mapTo(dlg, QPoint(card.width() + 8, 300))
         canvas = _px(img, dpr, base.x(), base.y())
         gap = abs(bar.lightness() - canvas.lightness())
         check(f"{pal.name}：卡片与窗口底色不同（Δ ≥ 12）", gap >= 12,
               f"卡 {bar.name()} L={bar.lightness()} / 底 {canvas.name()} L={canvas.lightness()}")
 
-        # 两块要一个颜色，不能一块白一块灰
-        bar2 = px(scene_card, scene_card.width() - 4, scene_card.height() - 20)
-        check(f"{pal.name}：两块卡片同色", _diff(bar, bar2) <= 3,
-              f"{bar.name()} vs {bar2.name()}")
-
         # 圆角：角上那点仍是窗口底色，说明画的是圆角而不是一块方底
-        for corner, (dx, dy) in (("左上", (1, 1)), ("右上", (dev.width() - 2, 1)),
-                                 ("左下", (1, dev.height() - 2))):
-            got = px(dev, dx, dy)
+        for corner, (dx, dy) in (("左上", (1, 1)), ("右上", (card.width() - 2, 1)),
+                                 ("左下", (1, card.height() - 2))):
+            got = px(card, dx, dy)
             check(f"{pal.name}：卡片{corner}角是圆的", _diff(got, canvas) <= 8,
                   f"{got.name()} vs 底 {canvas.name()}")
 
-        # 树被内缩进卡片里（padding 10）
-        dev_in = dlg.tree_rooms.geometry()
-        right = dev.width() - dev_in.x() - dev_in.width()
-        check(f"{pal.name}：树在卡片内缩进 10 / 10", (dev_in.x(), right) == (10, 10),
+        # tab 栈被内缩进卡片里（padding 10）
+        dev_in = dlg.order_stack.geometry()
+        right = card.width() - dev_in.x() - dev_in.width()
+        check(f"{pal.name}：tab 栈在卡片内缩进 10 / 10", (dev_in.x(), right) == (10, 10),
               f"左 {dev_in.x()} / 右 {right}")
 
         # 选中行在卡片上仍然读得出来（深色下 accent_soft 比卡底还暗就毁了）

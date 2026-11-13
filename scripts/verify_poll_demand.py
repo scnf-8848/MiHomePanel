@@ -195,6 +195,21 @@ def _confirm() -> None:
         check("写入成功的回调挂在 on_write_done",
               win.store.on_write_done == win._start_confirm, "")  # noqa: SLF001
 
+        # 走一遍**真实启动回调**：Store 加载完成后 ``MainWindow._on_loaded`` 必须能跑完。
+        # 这层平时只由 jobs.drain 从主线程事件循环里调，脚本只建窗口不会触发——
+        # 2026-11-13 删除 adopt_home 后这里残留的 ``self._adopt_rules()`` 就是这么漏掉的。
+        polls: list[int] = []
+        win.store.poll = lambda *a, **k: polls.append(1)
+        detail = ""
+        try:
+            win._on_loaded()
+            ok = True
+        except Exception as exc:  # noqa: BLE001
+            ok = False
+            detail = f"{type(exc).__name__}: {exc}"
+        check("真实启动路径 _on_loaded 能跑完（无残留方法调用）", ok, detail)
+        check("_on_loaded 末尾仍会发起轮询", len(polls) == 1, str(len(polls)))
+
         # mute 3.0 → 3.2 秒后开始
         win._start_confirm("did-a", {(2, 1): True}, 3.0)  # noqa: SLF001
         left = win._confirm_timers["did-a"].remainingTime()  # noqa: SLF001

@@ -35,7 +35,6 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QPushButton,
-    QSplitter,
     QStackedWidget,
     QVBoxLayout,
     QWidget,
@@ -549,19 +548,43 @@ class SettingsDialog(QDialog):
         self.tree_scenes = ReorderTree(self._p, mode="order")
         self.tree_scenes.moved.connect(self._commit_scene_tree)
 
-        # 两棵树的高度让用户自己调：家庭 / 房间多的人把上面拉大，场景多的人反过来。
-        # 分隔条留 14：两块各自是圆角卡，紧贴在一起会读成"一块被切开"
-        split = QSplitter(Qt.Vertical)
-        split.setChildrenCollapsible(False)
-        split.setHandleWidth(14)
-        split.addWidget(self._tree_section("家庭 → 房间", self.tree_rooms,
-                                           "恢复默认", self._reset_layout)[0])
-        split.addWidget(self._tree_section("家庭 → 快捷场景", self.tree_scenes,
-                                           "恢复默认", self._reset_scenes)[0])
-        split.setSizes([420, 200])
-        split.setStyleSheet("QSplitter::handle { background: transparent; }")
-        col.addWidget(split, 1)
+        # 两块排序不再上下各占一半：同一时间只看一块，各自吃满卡片高度。
+        # 切换沿用首页家庭标签那套分段控件的胶囊样式。
+        self.order_tabs = HomeTabs(self._p)
+        self.order_tabs.configure(PLACEMENT_FIXED, STYLE_PILL)
+        self.order_tabs.set_homes(
+            [("rooms", "家庭 → 房间"), ("scenes", "家庭 → 快捷场景")], "rooms",
+        )
+        self.order_tabs.home_selected.connect(self._switch_order_tab)
+
+        self.btn_reset_rooms = link_button("恢复默认")
+        self.btn_reset_rooms.clicked.connect(self._reset_layout)
+        self.btn_reset_scenes = link_button("恢复默认")
+        self.btn_reset_scenes.clicked.connect(self._reset_scenes)
+
+        bar = QHBoxLayout()
+        bar.setContentsMargins(0, 0, 0, 0)
+        bar.setSpacing(8)
+        bar.addWidget(self.order_tabs)
+        bar.addStretch(1)
+        bar.addWidget(self.btn_reset_rooms)
+        bar.addWidget(self.btn_reset_scenes)
+        col.addLayout(bar)
+
+        self.order_stack = QStackedWidget()
+        self.order_stack.addWidget(self.tree_rooms)
+        self.order_stack.addWidget(self.tree_scenes)
+        card = SettingsCard(pad=(10, 8, 10, 8))
+        card.add_unit(self.order_stack, stretch=1)
+        col.addWidget(card, 1)
+        self._switch_order_tab("rooms")
         return page
+
+    def _switch_order_tab(self, key: str) -> None:
+        scenes = key == "scenes"
+        self.order_stack.setCurrentIndex(1 if scenes else 0)
+        self.btn_reset_rooms.setVisible(not scenes)
+        self.btn_reset_scenes.setVisible(scenes)
 
     def _tree_section(self, title: str, tree: ReorderTree, action: str,
                       reset) -> tuple[QWidget, QPushButton]:
@@ -592,25 +615,25 @@ class SettingsDialog(QDialog):
 
         for home in self.store.homes():
             h_item = self.tree_rooms.add_row(
-                None, home.display_name, {"kind": "home", "key": home.name}
+                None, home.display_name, {"kind": "home", "key": home.id}
             )
-            for room in self.store.room_names(home.name):
+            for room_id, room_name in self.store.room_entries(home.id):
                 # 台数只数可见设备：顺序表的含义是「可见设备的顺序」，
                 # 隐藏项不在表里，也不该算进这个数字里。
                 states = [
-                    st for st in self.store.device_states(home.name, room)
+                    st for st in self.store.device_states(home.id, room_id)
                     if not self.store.prefs.is_hidden(st.did)
                 ]
                 self.tree_rooms.add_row(
-                    h_item, room,
-                    {"kind": "room", "home": home.name, "room": room},
+                    h_item, room_name,
+                    {"kind": "room", "home": home.id, "room": room_id},
                     suffix=f"{len(states)} 台",
                 )
 
             s_item = self.tree_scenes.add_row(
-                None, home.display_name, {"kind": "home", "key": home.name}
+                None, home.display_name, {"kind": "home", "key": home.id}
             )
-            scenes = self.store.scenes_for(home.name, include_hidden=True)
+            scenes = self.store.scenes_for(home.id, include_hidden=True)
             for scene in scenes:
                 sid = str(scene.get("scene_id") or "")
                 name = str(scene.get("name") or "")
@@ -622,7 +645,7 @@ class SettingsDialog(QDialog):
                 elif not scene.get("enable", True):
                     suffix = "已停用"
                 self.tree_scenes.add_row(
-                    s_item, name, {"kind": "scene", "home": home.name, "id": sid}, suffix=suffix
+                    s_item, name, {"kind": "scene", "home": home.id, "id": sid}, suffix=suffix
                 )
 
         self.tree_rooms.restore_expanded(None if first_rooms else keep_rooms)
@@ -649,9 +672,9 @@ class SettingsDialog(QDialog):
         self.tree_hidden.clear()
         prefs = self.store.prefs
         for home in self.store.homes():
-            states = [d for d in self.store.home_devices(home.name)]
+            states = [d for d in self.store.home_devices(home.id)]
             scenes = [
-                s for s in self.store.scenes_for(home.name, include_hidden=True)
+                s for s in self.store.scenes_for(home.id, include_hidden=True)
                 if str(s.get("scene_id") or "") and str(s.get("name") or "")
             ]
             shown_dev = sum(1 for st in states if not prefs.is_hidden(st.did))
@@ -662,26 +685,26 @@ class SettingsDialog(QDialog):
             shown = shown_dev + shown_scene
             h_item = self.tree_hidden.add_row(
                 None, home.display_name,
-                {"kind": "home", "home": home.name},
+                {"kind": "home", "home": home.id},
                 suffix=f"{shown}/{total}",
                 switch=shown / total if total else 0.0,
             )
 
-            for room in self.store.room_names(home.name):
-                room_states = self.store.device_states(home.name, room)
+            for room_id, room_name in self.store.room_entries(home.id):
+                room_states = self.store.device_states(home.id, room_id)
                 if not room_states:
                     continue
                 visible = sum(1 for st in room_states if not prefs.is_hidden(st.did))
                 r_item = self.tree_hidden.add_row(
-                    h_item, room,
-                    {"kind": "room", "home": home.name, "room": room},
+                    h_item, room_name,
+                    {"kind": "room", "home": home.id, "room": room_id},
                     suffix=f"{visible}/{len(room_states)}",
                     switch=visible / len(room_states),
                 )
                 for st in room_states:
                     self.tree_hidden.add_row(
                         r_item, st.name,
-                        {"kind": "device", "home": home.name, "room": room, "id": st.did},
+                        {"kind": "device", "home": home.id, "room": room_id, "id": st.did},
                         suffix="已离线" if not st.online else "",
                         switch=0.0 if prefs.is_hidden(st.did) else 1.0,
                     )
@@ -689,7 +712,7 @@ class SettingsDialog(QDialog):
             if scenes:
                 s_item = self.tree_hidden.add_row(
                     h_item, "快捷场景",
-                    {"kind": "scene_group", "home": home.name},
+                    {"kind": "scene_group", "home": home.id},
                     suffix=f"{shown_scene}/{len(scenes)}",
                     switch=shown_scene / len(scenes),
                 )
@@ -697,7 +720,7 @@ class SettingsDialog(QDialog):
                     sid = str(scene.get("scene_id") or "")
                     self.tree_hidden.add_row(
                         s_item, str(scene.get("name") or ""),
-                        {"kind": "scene", "home": home.name, "id": sid},
+                        {"kind": "scene", "home": home.id, "id": sid},
                         suffix="" if scene.get("enable", True) else "已停用",
                         switch=0.0 if prefs.is_scene_hidden(sid) else 1.0,
                     )
@@ -1016,16 +1039,16 @@ class SettingsDialog(QDialog):
         设备层已经不在排序页上了，但"恢复默认"仍要能清掉设备顺序——否则用户把
         某个房间排乱之后没有回到默认的入口。按房间逐个清，与改版前同一口径。
         """
-        for home in self.store.home_names():
-            self.store.prefs.reset_rooms(home)
-            for room in self.store.room_names(home):
-                self.store.prefs.reset_devices(home, room)
+        for home_id in self.store.home_ids():
+            self.store.prefs.reset_rooms(home_id)
+            for room_id in self.store.room_ids(home_id):
+                self.store.prefs.reset_devices(home_id, room_id)
         self.store.set_home_order([])
         self._fill_order_trees_silently()
 
     def _reset_scenes(self) -> None:
-        for home in self.store.home_names():
-            self.store.prefs.scene_order.pop(home, None)
+        for home_id in self.store.home_ids():
+            self.store.prefs.scene_order.pop(home_id, None)
         self.store.prefs.save()
         self.store.refresh_layout()
         self._fill_order_trees_silently()

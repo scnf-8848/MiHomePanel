@@ -48,7 +48,12 @@ from .health import (
     PollHealth,
     classify_error,
 )
-from .tree import DeviceNode, group_devices, parse_virtual_did
+from .tree import (
+    UNASSIGNED_ROOM_ID,
+    DeviceNode,
+    group_devices,
+    parse_virtual_did,
+)
 
 # 米家错误码格式：-70 + xxx(HTTP 状态码) + y(出错位置) + zzz(错误码)。
 # 后三位才是语义，所以按 abs(code) % 1000 判断，比硬编码整个码值稳。
@@ -353,22 +358,32 @@ class Topology:
     def get(self, did: str) -> DeviceNode | None:
         return self._by_did.get(did)
 
-    def by_room(self, home: str, room: str) -> list[DeviceNode]:
-        return [d for d in self.devices if d.home == home and d.room == room]
+    def by_room(self, home_id: str, room_id: str) -> list[DeviceNode]:
+        return [
+            d for d in self.devices
+            if d.home_id == home_id and d.room_id == room_id
+        ]
 
     def real_devices(self) -> list[DeviceNode]:
         return [d for d in self.devices if d.spec_type]
 
 
-def _locate(homes_raw: Sequence[Mapping[str, Any]]) -> dict[str, tuple[str, str]]:
-    """did → (家庭名, 房间名)。设备列表本身不带房间，只能从 roomlist 反查。"""
-    out: dict[str, tuple[str, str]] = {}
+def _locate(
+    homes_raw: Sequence[Mapping[str, Any]],
+) -> dict[str, tuple[str, str, str, str]]:
+    """did → (家庭 id, 家庭名, 房间 id, 房间名)。
+
+    设备列表本身不带房间，只能从 roomlist 反查；排序键用 id，显示仍用名字。
+    """
+    out: dict[str, tuple[str, str, str, str]] = {}
     for h in homes_raw:
+        home_id = str(h.get("id") or "")
         home_name = str(h.get("name") or "")
         for r in h.get("roomlist") or []:
+            room_id = str(r.get("id") or "")
             room_name = str(r.get("name") or "")
             for did in r.get("dids") or []:
-                out[str(did)] = (home_name, room_name)
+                out[str(did)] = (home_id, home_name, room_id, room_name)
     return out
 
 
@@ -492,14 +507,21 @@ class Client:
             did = str(d.get("did", ""))
             if not did:
                 continue
-            home, room = loc.get(did, ("", ""))
-            if not home:
+            home_id, home, room_id, room = loc.get(did, ("", "", "", ""))
+            if not home_id:
                 # 共享家庭的设备：roomlist 里没有，用 home_id 反查
                 hid = str(d.get("home_id") or "")
-                home = next(
-                    (str(h.get("name") or "") for h in homes_raw if str(h.get("id")) == hid),
-                    home,
+                found = next(
+                    (h for h in homes_raw if str(h.get("id") or "") == hid),
+                    None,
                 )
+                if found is not None:
+                    home_id = hid
+                    home = str(found.get("name") or "")
+            if not room_id:
+                # 未分配到任何房间：用稳定占位值，不能用 0 冒充云端 id
+                room_id = UNASSIGNED_ROOM_ID
+                room = ""
             rows.append(
                 {
                     "did": did,
@@ -509,6 +531,8 @@ class Client:
                     "online": bool(d.get("isOnline")),
                     "home": home,
                     "room": room,
+                    "home_id": home_id,
+                    "room_id": room_id,
                     # 摄像头取流用：go2rtc 的 xiaomi 源按局域网地址直连
                     "localip": str(d.get("localip") or ""),
                     "token": str(d.get("token") or ""),

@@ -63,6 +63,7 @@ def _list_qss(p: theme.Palette) -> str:
     return dialog_qss(p) + f"""
     QLabel#RuleName {{ color: {p.text}; font-size: 16px; font-weight: 700; }}
     QLabel#RuleKeys {{ color: {p.text_soft}; font-size: 12px; }}
+    QLabel#RuleBadge {{ color: {theme.DANGER}; font-size: 12px; }}
     QLabel#ListHint {{ color: {p.text_soft}; font-size: 12px; }}
     QLabel#EmptyHint {{ color: {p.text_soft}; font-size: 13px; line-height: 180%; }}
     QPushButton#RuleEdit {{
@@ -98,6 +99,26 @@ def _list_qss(p: theme.Palette) -> str:
     """ + common_qss(p)
 
 
+def _home_label(service, home_id: str) -> str:
+    """家庭 id → 显示名（只用于文案；规则归属匹配仍用 id）。"""
+    label = getattr(service, "home_label", None)
+    return str(label(home_id) or "") if callable(label) else home_id
+
+
+def trigger_text(rule: Rule, limit: int = 3) -> str:
+    """卡片上那行触发摘要。多触发用「 / 」连起来；超过 ``limit`` 个只留前缀。
+
+    规则可以挂多条触发（OR），卡片行宽有限：全塞进去会和右边的编辑 / 删除挤在
+    一起。超过上限时退成「A / B / …（共 N 个）」，完整键位放 tooltip。
+    """
+    keys = [t.keys for t in rule.triggers if t.type == "keyboard" and t.keys]
+    if not keys:
+        return "未设置快捷键"
+    if len(keys) <= limit:
+        return " / ".join(keys)
+    return " / ".join(keys[:limit]) + f" / …（共 {len(keys)} 个）"
+
+
 class RuleCard(QFrame):
     """一条规则 = 名称 + 触发键 + 编辑 / 删除 + 启停开关。
 
@@ -131,9 +152,23 @@ class RuleCard(QFrame):
         name.setObjectName("RuleName")
         grid.addWidget(name, 0, 0, 1, 2, Qt.AlignLeft | Qt.AlignVCenter)
 
-        keys = QLabel(rule.keys or "未设置快捷键", self)
+        keys = QLabel(trigger_text(rule), self)
         keys.setObjectName("RuleKeys")
-        grid.addWidget(keys, 1, 0, 1, 1, Qt.AlignLeft | Qt.AlignVCenter)
+        keys.setToolTip("、".join(t.keys for t in rule.triggers
+                                 if t.type == "keyboard" and t.keys) or "未设置快捷键")
+        second = QWidget(self)
+        srow = QHBoxLayout(second)
+        srow.setContentsMargins(0, 0, 0, 0)
+        srow.setSpacing(8)
+        srow.addWidget(keys)
+        if not rule.home:
+            # 旧文件的空归属是开发中间态：卡片上标出来，打开保存一次就归到当前家庭
+            # （在那之前它不注册热键、不会运行）
+            badge = QLabel("未指定家庭 · 保存后归入当前家庭", second)
+            badge.setObjectName("RuleBadge")
+            srow.addWidget(badge)
+        srow.addStretch(1)
+        grid.addWidget(second, 1, 0, 1, 1, Qt.AlignLeft | Qt.AlignVCenter)
 
         actions = QWidget(self)
         arow = QHBoxLayout(actions)
@@ -208,10 +243,7 @@ class AutomationListDialog(QDialog):
         hint.setObjectName("ListHint")
         hint.setWordWrap(True)
         col.addWidget(hint)
-        # 规则按家庭隔离：这一层只列出**当前家庭**的规则，标题栏顺带写清楚，
-        # 免得在别的家庭里看到"0 条规则"却以为规则丢了
-        if home := str(getattr(self.service, "current_home", "") or ""):
-            hint.setText(f"{hint.text()}\n只显示「{home}」这个家庭的规则。")
+        self.hint = hint
 
         self.scroll = QScrollArea(body)
         self.scroll.setWidgetResizable(True)
@@ -269,15 +301,24 @@ class AutomationListDialog(QDialog):
             if widget is not None:
                 widget.setParent(None)
                 widget.deleteLater()
-        # 规则按家庭隔离：这一层只列出**当前家庭**的规则
+        # 规则按家庭隔离：这一层只列出**当前家庭**的规则；home 是家庭 id，
+        # 文案里换成 display_name（用户 11-13 第三轮：内部匹配一律用 id）
         home = str(getattr(self.service, "current_home", "") or "")
         rules = self.service.rules.active(home)
         trashed = self.service.rules.trashed(home)
+        label = _home_label(self.service, home)
+        unassigned = sum(1 for r in rules if not r.home)
+        text = "每条规则 = 一个全局热键 → 电脑条件 → 米家虚拟事件。停用后热键立即释放。"
+        if label:
+            text += f"\n只显示「{label}」这个家庭的规则。"
+        if unassigned:
+            text += f"\n有 {unassigned} 条旧规则还没有家庭归属，打开并保存后会归到当前家庭。"
+        self.hint.setText(text)
         self.title_bar.set_subtitle(f"{len(rules)} 条规则")
         self.trash_btn.setToolTip(
             f"回收站：{len(trashed)} 条已删除规则" if trashed else "这是本家庭的回收站，目前是空的")
         if not rules:
-            extra = (f"\n列表只显示「{home}」这个家庭的规则" if home else "")
+            extra = (f"\n列表只显示「{label}」这个家庭的规则" if label else "")
             empty = QLabel("还没有自动化规则\n点下面的「＋ 新建规则」开始配置" + extra,
                            self.list_body)
             empty.setObjectName("EmptyHint")

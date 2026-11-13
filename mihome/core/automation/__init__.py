@@ -69,10 +69,12 @@ from .rules import (
     MAX_SPEAK_CHARS,
     OPS,
     SCHEMA_VERSION,
+    TRIGGER_TYPES,
     Action,
     Condition,
     Rule,
     RuleSet,
+    Trigger,
     validate_rule,
 )
 
@@ -101,6 +103,7 @@ __all__ = [
     "SCHEMA_VERSION",
     "SENT",
     "TIME_RANGES",
+    "TRIGGER_TYPES",
     "WARN_OUTCOMES",
     "Action",
     "AutomationEngine",
@@ -110,6 +113,7 @@ __all__ = [
     "Rule",
     "RuleSet",
     "Snapshot",
+    "Trigger",
     "availability",
     "date_text",
     "evaluate_conditions",
