@@ -38,7 +38,7 @@ SENT = "sent"
 FAILED = "failed"
 DONE = "done"
 
-Emit = Callable[[str, Callable[[str], None]], None]
+Emit = Callable[[Action, Callable[[str], None]], None]
 Say = Callable[[Action, Callable[[str], None]], None]
 Later = Callable[[int, Callable[[], None]], Any]
 
@@ -62,7 +62,7 @@ def _immediate(_ms: int, fn: Callable[[], None]) -> None:
     fn()
 
 
-def _no_channel(name: str, done: Callable[[str], None]) -> None:
+def _no_channel(_act: Action, done: Callable[[str], None]) -> None:
     done("没有配置发送通道")
 
 
@@ -203,15 +203,17 @@ class AutomationEngine:
         def done(error: str) -> None:
             if self._closed or rule.id not in self._running:
                 return
+            hub = f"（中枢：{act.hub_name or act.hub}）" if act.hub else ""
             if error:
                 self._running.discard(rule.id)
-                self._add_log(rule, FAILED, f"发送「{act.name}」失败：{error}，队列已停止")
+                self._add_log(rule, FAILED,
+                              f"发送「{act.name}」{hub}失败：{error}，队列已停止")
                 return
-            self._add_log(rule, SENT, f"已发送虚拟事件「{act.name}」")
+            self._add_log(rule, SENT, f"已发送虚拟事件「{act.name}」{hub}")
             self._step(rule, actions, index + 1)
 
         try:
-            self.emit(act.name, done)
+            self.emit(act, done)
         except Exception as exc:  # noqa: BLE001  发送通道抛异常也要收尾，别让 _running 卡死
             self._running.discard(rule.id)
             self._add_log(rule, FAILED, f"发送「{act.name}」异常：{exc}")

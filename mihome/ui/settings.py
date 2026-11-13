@@ -13,11 +13,12 @@
 （比主界面亮/暗一档），搬过来浅色只差 3、深色只差 2 个明度档，栏和内容区又糊成
 一片。``rail_bg`` 只相对 ``surface_bg`` 推一档，方向仍随主题。
 
-排序和隐藏都用**树**（``ui/tree.py``）：隐藏页仍是"家庭 → 房间 → 设备"三层，
-平铺时必须先选家庭、再选房间，才看得到一小截设备。树把三层摊开，一次看全，
-每层都能折起来；拖动只在同一层内生效——把设备拖进别的房间属于"改设备归属"，
-那是米家 App 的事，我们只负责顺序。排序页则缩窄成"家庭 → 房间"加场景两棵树：
-设备顺序由首页拖动负责，这里不再渲染第三层。
+排序和隐藏都用**树**（``ui/tree.py``）。两页同一套骨架：顶部两个互斥的分段标签，
+下面一张卡里只放当前那一棵树，各自吃满卡片高度。排序页是"家庭 → 房间"和
+"家庭 → 快捷场景"两棵（设备顺序由首页拖动负责，这里不渲染第三层）；隐藏页是
+"家庭 → 房间 → 设备"和"家庭 → 快捷场景"两棵，开关打开 = 显示、关闭 = 收起。
+树把层级摊开，一次看全，每层都能折起来；拖动只在排序页的同层内生效——把设备
+拖进别的房间属于"改设备归属"，那是米家 App 的事，我们只负责顺序。
 
 窗口本身也是无边框的，标题栏和主窗口同一套实现（只是少了最大化按钮）。
 """
@@ -272,7 +273,7 @@ class SettingsDialog(QDialog):
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
 
-        self.titlebar = TitleBar("设置", palette, subtitle="外观 · 排序 · 隐藏设备 · 账号",
+        self.titlebar = TitleBar("设置", palette, subtitle="外观 · 排序 · 隐藏 · 账号",
                                  buttons=("close",), variant="dialog",
                                  frame=self._frame)
         outer.addWidget(self.titlebar)
@@ -286,7 +287,7 @@ class SettingsDialog(QDialog):
         self.nav.setObjectName("SettingsNav")
         self.nav.setFrameShape(QFrame.NoFrame)
         self.nav.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        for text in ("外观", "排序", "隐藏设备", "账号", "常规"):
+        for text in ("外观", "排序", "隐藏", "账号", "常规"):
             self.nav.addItem(QListWidgetItem(text))
 
         # 分类栏单独一块圆角底（``theme.rail_bg``）。不直接给 QListWidget 上底色：
@@ -343,7 +344,8 @@ class SettingsDialog(QDialog):
         for cls in (RadioDot, ToggleSwitch):
             for widget in self.findChildren(cls):
                 widget.set_palette(palette)
-        for tree in (self.tree_rooms, self.tree_scenes, self.tree_hidden):
+        for tree in (self.tree_rooms, self.tree_scenes,
+                     self.tree_hidden_devices, self.tree_hidden_scenes):
             tree.set_palette(palette)
         preview = getattr(self, "preview", None)
         if preview is not None:
@@ -586,23 +588,6 @@ class SettingsDialog(QDialog):
         self.btn_reset_rooms.setVisible(not scenes)
         self.btn_reset_scenes.setVisible(scenes)
 
-    def _tree_section(self, title: str, tree: ReorderTree, action: str,
-                      reset) -> tuple[QWidget, QPushButton]:
-        """分区标题（外面）+ 只装树的一张卡（里面）。
-
-        标题放在卡片外面是 QQ 那套的重点：卡片是"一组控件的容器"，标题是"这组叫
-        什么"。放进卡里会让标题读成卡内第一行，两个以上的分区就分不清主次了。
-        """
-        box = QWidget()
-        lay = QVBoxLayout(box)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(6)
-        btn = self._section(lay, title, (action, reset))
-        card = SettingsCard(pad=(10, 8, 10, 8))
-        card.add_unit(tree, stretch=1)
-        lay.addWidget(card, 1)
-        return box, btn
-
     def _fill_order_trees(self) -> None:
         # 第一次填（树还是空的）才全部展开；之后一律照用户折成的样子还原，
         # 包括"全折起来"——否则在隐藏页点一下开关，这里会自己撑开
@@ -658,88 +643,137 @@ class SettingsDialog(QDialog):
                         "开关打开 = 显示；关闭 = 收起来。房间 / 家庭那一层的开关是整组操作，"
                         "只藏了一部分时会停在中间。隐藏只影响首页怎么排，不影响轮询和控制。")
 
-        self.tree_hidden = ReorderTree(self._p, mode="hidden")
-        self.tree_hidden.toggle_requested.connect(self._on_toggle)
-        box, self.btn_show_all = self._tree_section(
-            "家庭 → 房间 → 设备 · 快捷场景", self.tree_hidden, "全部恢复显示", self._show_all
+        # 和排序页同一套骨架：顶部两个互斥 tab，下面一张卡里只放当前那棵树，
+        # 各自吃满卡片高度。两棵树常驻，切 tab 只换索引，展开状态和滚动位置都不会丢。
+        self.tree_hidden_devices = ReorderTree(self._p, mode="hidden")
+        self.tree_hidden_devices.toggle_requested.connect(self._on_toggle)
+        self.tree_hidden_scenes = ReorderTree(self._p, mode="hidden")
+        self.tree_hidden_scenes.toggle_requested.connect(self._on_toggle)
+
+        self.hidden_tabs = HomeTabs(self._p)
+        self.hidden_tabs.configure(PLACEMENT_FIXED, STYLE_PILL)
+        self.hidden_tabs.set_homes(
+            [("devices", "家庭 → 房间 → 设备"), ("scenes", "家庭 → 快捷场景")], "devices",
         )
-        col.addWidget(box, 1)
+        self.hidden_tabs.home_selected.connect(self._switch_hidden_tab)
+
+        # 「全部恢复显示」按 tab 分开：在设备页顺手清掉场景的隐藏状态会很意外
+        self.btn_show_devices = link_button("全部恢复显示")
+        self.btn_show_devices.clicked.connect(self._show_all_devices)
+        self.btn_show_scenes = link_button("全部恢复显示")
+        self.btn_show_scenes.clicked.connect(self._show_all_scenes)
+
+        bar = QHBoxLayout()
+        bar.setContentsMargins(0, 0, 0, 0)
+        bar.setSpacing(8)
+        bar.addWidget(self.hidden_tabs)
+        bar.addStretch(1)
+        bar.addWidget(self.btn_show_devices)
+        bar.addWidget(self.btn_show_scenes)
+        col.addLayout(bar)
+
+        self.hidden_stack = QStackedWidget()
+        self.hidden_stack.addWidget(self.tree_hidden_devices)
+        self.hidden_stack.addWidget(self.tree_hidden_scenes)
+        card = SettingsCard(pad=(10, 8, 10, 8))
+        card.add_unit(self.hidden_stack, stretch=1)
+        col.addWidget(card, 1)
+        self._switch_hidden_tab("devices")
         return page
 
-    def _fill_hidden_tree(self) -> None:
-        first = self.tree_hidden.topLevelItemCount() == 0
-        keep = self.tree_hidden.expanded_keys()
-        self.tree_hidden.clear()
+    def _switch_hidden_tab(self, key: str) -> None:
+        scenes = key == "scenes"
+        self.hidden_stack.setCurrentIndex(1 if scenes else 0)
+        self.btn_show_devices.setVisible(not scenes)
+        self.btn_show_scenes.setVisible(scenes)
+
+    def _fill_hidden_devices(self) -> None:
+        """家庭 → 房间 → 设备。开关 1.0 = 显示，0.0 = 隐藏。"""
+        tree = self.tree_hidden_devices
+        first = tree.topLevelItemCount() == 0
+        keep = tree.expanded_keys()
+        scroll = tree.verticalScrollBar().value()
+        tree.clear()
         prefs = self.store.prefs
         for home in self.store.homes():
-            states = [d for d in self.store.home_devices(home.id)]
-            scenes = [
-                s for s in self.store.scenes_for(home.id, include_hidden=True)
-                if str(s.get("scene_id") or "") and str(s.get("name") or "")
-            ]
-            shown_dev = sum(1 for st in states if not prefs.is_hidden(st.did))
-            shown_scene = sum(
-                1 for s in scenes if not prefs.is_scene_hidden(str(s.get("scene_id") or ""))
-            )
-            total = len(states) + len(scenes)
-            shown = shown_dev + shown_scene
-            h_item = self.tree_hidden.add_row(
+            states = list(self.store.home_devices(home.id))
+            shown = sum(1 for st in states if not prefs.is_hidden(st.did))
+            h_item = tree.add_row(
                 None, home.display_name,
                 {"kind": "home", "home": home.id},
-                suffix=f"{shown}/{total}",
-                switch=shown / total if total else 0.0,
+                suffix=f"{shown}/{len(states)}",
+                switch=shown / len(states) if states else 0.0,
             )
-
             for room_id, room_name in self.store.room_entries(home.id):
                 room_states = self.store.device_states(home.id, room_id)
                 if not room_states:
                     continue
                 visible = sum(1 for st in room_states if not prefs.is_hidden(st.did))
-                r_item = self.tree_hidden.add_row(
+                r_item = tree.add_row(
                     h_item, room_name,
                     {"kind": "room", "home": home.id, "room": room_id},
                     suffix=f"{visible}/{len(room_states)}",
                     switch=visible / len(room_states),
                 )
                 for st in room_states:
-                    self.tree_hidden.add_row(
+                    tree.add_row(
                         r_item, st.name,
                         {"kind": "device", "home": home.id, "room": room_id, "id": st.did},
                         suffix="已离线" if not st.online else "",
                         switch=0.0 if prefs.is_hidden(st.did) else 1.0,
                     )
+        tree.restore_expanded(None if first else keep)
+        tree.verticalScrollBar().setValue(scroll)
 
-            if scenes:
-                s_item = self.tree_hidden.add_row(
-                    h_item, "快捷场景",
-                    {"kind": "scene_group", "home": home.id},
-                    suffix=f"{shown_scene}/{len(scenes)}",
-                    switch=shown_scene / len(scenes),
+    def _fill_hidden_scenes(self) -> None:
+        """家庭 → 快捷场景。场景是叶子，不再有「快捷场景」中间分组行。"""
+        tree = self.tree_hidden_scenes
+        first = tree.topLevelItemCount() == 0
+        keep = tree.expanded_keys()
+        scroll = tree.verticalScrollBar().value()
+        tree.clear()
+        prefs = self.store.prefs
+        for home in self.store.homes():
+            scenes = [
+                s for s in self.store.scenes_for(home.id, include_hidden=True)
+                if str(s.get("scene_id") or "") and str(s.get("name") or "")
+            ]
+            shown = sum(
+                1 for s in scenes if not prefs.is_scene_hidden(str(s.get("scene_id") or ""))
+            )
+            h_item = tree.add_row(
+                None, home.display_name,
+                {"kind": "scene_home", "home": home.id},
+                suffix=f"{shown}/{len(scenes)}",
+                switch=shown / len(scenes) if scenes else 0.0,
+            )
+            for scene in scenes:
+                sid = str(scene.get("scene_id") or "")
+                tree.add_row(
+                    h_item, str(scene.get("name") or ""),
+                    {"kind": "scene", "home": home.id, "id": sid},
+                    suffix="" if scene.get("enable", True) else "已停用",
+                    switch=0.0 if prefs.is_scene_hidden(sid) else 1.0,
                 )
-                for scene in scenes:
-                    sid = str(scene.get("scene_id") or "")
-                    self.tree_hidden.add_row(
-                        s_item, str(scene.get("name") or ""),
-                        {"kind": "scene", "home": home.id, "id": sid},
-                        suffix="" if scene.get("enable", True) else "已停用",
-                        switch=0.0 if prefs.is_scene_hidden(sid) else 1.0,
-                    )
-
-        self.tree_hidden.restore_expanded(None if first else keep)
+        tree.restore_expanded(None if first else keep)
+        tree.verticalScrollBar().setValue(scroll)
 
     def _on_toggle(self, data: dict) -> None:
-        """行尾开关：按层级决定改哪些，改完重建（保留展开状态）。"""
+        """行尾开关：按层级决定改哪些，改完只重建对应的那棵树（保留展开状态）。"""
         kind = str(data.get("kind") or "")
         home = str(data.get("home") or "")
         prefs = self.store.prefs
 
         if kind == "device":
             did = str(data.get("id") or "")
-            self._apply_hidden(hide=[did] if not prefs.is_hidden(did) else [],
-                               show=[did] if prefs.is_hidden(did) else [])
+            hidden = prefs.is_hidden(did)
+            self._apply_hidden(hide=[did] if not hidden else [],
+                               show=[did] if hidden else [])
+            self._fill_hidden_devices()
         elif kind == "scene":
             sid = str(data.get("id") or "")
             self.store.set_scene_hidden(sid, not prefs.is_scene_hidden(sid))
+            self._fill_hidden_scenes()
         elif kind in ("room", "home"):
             room = str(data.get("room") or "")
             if room:
@@ -751,18 +785,21 @@ class SettingsDialog(QDialog):
             want_hidden = bool(shown) and len(shown) == len(group)
             ids = [st.did for st in group]
             self._apply_hidden(hide=ids if want_hidden else [], show=[] if want_hidden else ids)
-        elif kind == "scene_group":
+            self._fill_hidden_devices()
+        elif kind == "scene_home":
             scenes = [
                 str(s["scene_id"]) for s in self.store.scenes_for(home, include_hidden=True)
                 if str(s.get("scene_id") or "")
             ]
             shown = [sid for sid in scenes if not prefs.is_scene_hidden(sid)]
             want_hidden = bool(shown) and len(shown) == len(scenes)
+            changed = False
             for sid in scenes:
-                prefs.set_scene_hidden(sid, want_hidden)
-            self.store.refresh_layout()
+                changed |= prefs.set_scene_hidden(sid, want_hidden)
+            if changed:
+                self.store.refresh_layout()
+            self._fill_hidden_scenes()
 
-        self._fill_hidden_tree()
         self._fill_order_trees_silently()
 
     def _apply_hidden(self, *, show: list[str], hide: list[str]) -> None:
@@ -979,7 +1016,8 @@ class SettingsDialog(QDialog):
         self._loading = True
         try:
             self._fill_order_trees()
-            self._fill_hidden_tree()
+            self._fill_hidden_devices()
+            self._fill_hidden_scenes()
         finally:
             self._loading = False
         self._sync_layout_controls()
@@ -1053,12 +1091,16 @@ class SettingsDialog(QDialog):
         self.store.refresh_layout()
         self._fill_order_trees_silently()
 
-    def _show_all(self) -> None:
+    def _show_all_devices(self) -> None:
         # 设备：清隐藏 + 逐台追加到所在房间末尾 + 重建（走 Store 保证两端口径一致）
         self.store.clear_hidden()
+        self._fill_hidden_devices()
+        self._fill_order_trees_silently()
+
+    def _show_all_scenes(self) -> None:
         if self.store.prefs.clear_hidden_scenes():
             self.store.refresh_layout()
-        self._fill_hidden_tree()
+        self._fill_hidden_scenes()
         self._fill_order_trees_silently()
 
 

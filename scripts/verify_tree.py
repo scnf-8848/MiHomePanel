@@ -4,12 +4,14 @@
 八件事：
 
 1. **结构**：排序页缩窄成"家庭 → 房间"两层（设备层已移除），场景是家庭 → 场景
-   两层；隐藏页仍是"家庭 → 房间 → 设备"三层，"快捷场景"是隐藏页里场景所在的那一层；
+   两层；隐藏页和排序页同一套骨架，两个互斥 tab：设备树"家庭 → 房间 → 设备"
+   三层，场景树"家庭 → 快捷场景"两层（不再有「快捷场景」分组行）；
 2. **展开状态**：折起来之后再重建，还保持折起来；
 3. **排序**：同层拖动后 ``apply_order_snapshot`` 真的落进了 prefs（并且只落一次盘），
    重填过程中（``_loading``）不写；「恢复默认」仍会清掉各房间的设备顺序；
 4. **跨层拖动被拒**：把房间拖进别的家庭 = 改归属，不在这个程序的职责里；
-5. **隐藏页聚合开关**：全显 → 全隐 → 部分态停在中间，家庭那一层把场景也算进去；
+5. **隐藏页聚合开关**：全显 → 全隐 → 部分态停在中间；设备树和场景树各管各的，
+   家庭那一层只聚合本 tab 的条目；「全部恢复显示」也按 tab 分开；
 6. **几何与绘制**：行高 32 / 缩进 16，折角只画在有子项的行上，开关按状态上色；
 7. **分类栏分层**：分类栏和内容区曾经同色（内容区是 ``surface_bg``，直接套主界面
    那套 ``NAV_BG`` 只差两三个明度档），这一节在真实窗口上抓图量"栏底 / 内容区 /
@@ -172,7 +174,8 @@ def center(tree, item) -> QPoint:
 def section_structure() -> None:
     print("1) 两层结构（家庭 → 房间）+ 场景")
     store, dlg = fresh()
-    rooms, scene, hidden = dlg.tree_rooms, dlg.tree_scenes, dlg.tree_hidden
+    rooms, scene = dlg.tree_rooms, dlg.tree_scenes
+    hidden_dev, hidden_sc = dlg.tree_hidden_devices, dlg.tree_hidden_scenes
 
     check("排序树 = 两个家庭", rooms.topLevelItemCount() == 2, f"{rooms.topLevelItemCount()} 行")
     home = find(rooms, kind="home", key="h1")
@@ -191,16 +194,23 @@ def section_structure() -> None:
           str([s_home.child(i).text(0) for i in range(2)]))
     check("没场景的家庭是空行", find(scene, kind="home", key="h2").childCount() == 0)
 
-    check("隐藏树 = 两个家庭", hidden.topLevelItemCount() == 2)
-    h_home = find(hidden, kind="home", home="h1")
-    check("隐藏树家庭下 = 两个房间 + 快捷场景", h_home.childCount() == 3,
-          str([h_home.child(i).text(0) for i in range(3)]))
-    group = find(hidden, kind="scene_group", home="h1")
-    check("「快捷场景」是个分组行", group is not None and group.childCount() == 2)
-    check("分组行的数据是 scene_group", (group.data(0, ROLE_DATA) or {}).get("kind") == "scene_group")
-    check("隐藏树家庭行有 5/5（3 设备 + 2 场景）", suffix(h_home) == "5/5", suffix(h_home))
-    check("离线设备标了已离线", suffix(find(hidden, kind="device", id="d3")) == "已离线",
-          suffix(find(hidden, kind="device", id="d3")))
+    check("隐藏页设备树 = 两个家庭", hidden_dev.topLevelItemCount() == 2)
+    h_home = find(hidden_dev, kind="home", home="h1")
+    check("设备树家庭下只有两个房间（场景不在这一 tab）", h_home.childCount() == 2,
+          str([h_home.child(i).text(0) for i in range(2)]))
+    check("设备树里没有场景行", find(hidden_dev, kind="scene") is None)
+    check("设备树家庭行有 3/3", suffix(h_home) == "3/3", suffix(h_home))
+    check("离线设备标了已离线", suffix(find(hidden_dev, kind="device", id="d3")) == "已离线",
+          suffix(find(hidden_dev, kind="device", id="d3")))
+
+    check("隐藏页场景树 = 两个家庭", hidden_sc.topLevelItemCount() == 2)
+    s_h = find(hidden_sc, kind="scene_home", home="h1")
+    check("场景树家庭下是两个场景叶子", s_h.childCount() == 2,
+          str([s_h.child(i).text(0) for i in range(2)]))
+    check("场景树没有「快捷场景」分组行", find(hidden_sc, kind="scene_group") is None)
+    check("场景树家庭行有 2/2", suffix(s_h) == "2/2", suffix(s_h))
+    check("没场景的家庭是 0/0", suffix(find(hidden_sc, kind="scene_home", home="h2")) == "0/0",
+          suffix(find(hidden_sc, kind="scene_home", home="h2")))
     dlg.close()
 
 
@@ -408,81 +418,144 @@ def section_cross_layer() -> None:
 
 
 def section_hidden() -> None:
-    print("\n5) 隐藏页的聚合开关")
+    print("\n5) 隐藏页：设备 / 场景两个 tab 的开关")
     store, dlg = fresh()
-    tree = dlg.tree_hidden
+    dlg.nav.setCurrentRow(2)
+    QApplication.processEvents()
+    dev, sc = dlg.tree_hidden_devices, dlg.tree_hidden_scenes
 
-    home = find(tree, kind="home", home="h1")
-    living = find(tree, kind="room", room="r1")
+    home = find(dev, kind="home", home="h1")
+    living = find(dev, kind="room", room="r1")
     check("初始全显示", switch(home) == 1.0 and switch(living) == 1.0,
           f"{switch(home)}/{switch(living)}")
+    check("默认停在设备 tab", dlg.hidden_stack.currentWidget() is dev)
+    check("设备 tab 只露出设备那枚恢复按钮",
+          not dlg.btn_show_devices.isHidden() and dlg.btn_show_scenes.isHidden())
 
     # 点房间开关 → 房间里两台全隐藏
-    QTest.mouseClick(tree.viewport(), Qt.LeftButton, Qt.NoModifier,
-                     _switch_rect(tree.visualItemRect(living)).center())
+    QTest.mouseClick(dev.viewport(), Qt.LeftButton, Qt.NoModifier,
+                     _switch_rect(dev.visualItemRect(living)).center())
     QApplication.processEvents()
-    living = find(tree, kind="room", room="r1")
-    home = find(tree, kind="home", home="h1")
+    living = find(dev, kind="room", room="r1")
+    home = find(dev, kind="home", home="h1")
     check("房间开关 → 0", switch(living) == 0.0, str(switch(living)))
     check("房间行变成 0/2", suffix(living) == "0/2", suffix(living))
     check("两台设备都关上了",
-          switch(find(tree, kind="device", id="d1")) == 0.0
-          and switch(find(tree, kind="device", id="d2")) == 0.0)
-    check("家庭行按比例 3/5", suffix(home) == "3/5" and abs(float(switch(home)) - 0.6) < 1e-6,
+          switch(find(dev, kind="device", id="d1")) == 0.0
+          and switch(find(dev, kind="device", id="d2")) == 0.0)
+    check("家庭行按比例 1/3", suffix(home) == "1/3" and abs(float(switch(home)) - 1 / 3) < 1e-6,
           f"{suffix(home)} / {switch(home)}")
     check("prefs 里真的藏了", store.prefs.is_hidden("d1") and store.prefs.is_hidden("d2"))
 
     # 再点一次 → 全显示
-    QTest.mouseClick(tree.viewport(), Qt.LeftButton, Qt.NoModifier,
-                     _switch_rect(tree.visualItemRect(find(tree, kind="room", room="r1"))).center())
+    QTest.mouseClick(dev.viewport(), Qt.LeftButton, Qt.NoModifier,
+                     _switch_rect(dev.visualItemRect(find(dev, kind="room", room="r1"))).center())
     QApplication.processEvents()
-    living = find(tree, kind="room", room="r1")
+    living = find(dev, kind="room", room="r1")
     check("再点一次回到全显", switch(living) == 1.0 and suffix(living) == "2/2",
           f"{switch(living)} / {suffix(living)}")
 
     # 单台 → 房间停在中间
-    QTest.mouseClick(tree.viewport(), Qt.LeftButton, Qt.NoModifier,
-                     _switch_rect(tree.visualItemRect(find(tree, kind="device", id="d1"))).center())
+    QTest.mouseClick(dev.viewport(), Qt.LeftButton, Qt.NoModifier,
+                     _switch_rect(dev.visualItemRect(find(dev, kind="device", id="d1"))).center())
     QApplication.processEvents()
-    living = find(tree, kind="room", room="r1")
+    living = find(dev, kind="room", room="r1")
     check("只藏一台时房间是半开", abs(float(switch(living)) - 0.5) < 1e-6, str(switch(living)))
     check("半开时的计数是 1/2", suffix(living) == "1/2", suffix(living))
     check("半开状态不是 0 也不是 1", 0.02 < float(switch(living)) < 0.98)
 
     # 家庭开关：还有没显示的 → 全部显示
-    QTest.mouseClick(tree.viewport(), Qt.LeftButton, Qt.NoModifier,
-                     _switch_rect(tree.visualItemRect(find(tree, kind="home", home="h1"))).center())
+    QTest.mouseClick(dev.viewport(), Qt.LeftButton, Qt.NoModifier,
+                     _switch_rect(dev.visualItemRect(find(dev, kind="home", home="h1"))).center())
     QApplication.processEvents()
-    home = find(tree, kind="home", home="h1")
-    check("部分隐藏时点家庭 = 全部显示", switch(home) == 1.0 and suffix(home) == "5/5",
+    home = find(dev, kind="home", home="h1")
+    check("部分隐藏时点家庭 = 全部显示", switch(home) == 1.0 and suffix(home) == "3/3",
           f"{switch(home)} / {suffix(home)}")
 
-    # 家庭开关：全显示时 → 全部隐藏（设备；场景不动）
-    QTest.mouseClick(tree.viewport(), Qt.LeftButton, Qt.NoModifier,
-                     _switch_rect(tree.visualItemRect(home)).center())
+    # 家庭开关：全显示时 → 只隐藏这一 tab 的设备，场景不动
+    QTest.mouseClick(dev.viewport(), Qt.LeftButton, Qt.NoModifier,
+                     _switch_rect(dev.visualItemRect(home)).center())
     QApplication.processEvents()
-    home = find(tree, kind="home", home="h1")
-    check("全显时点家庭 = 设备全隐藏", suffix(home) == "2/5", suffix(home))
-    check("场景没受影响", suffix(find(tree, kind="scene", id="s1")) == "",
-          f"'{suffix(find(tree, kind='scene', id='s1'))}'")
+    home = find(dev, kind="home", home="h1")
+    check("全显时点家庭 = 设备全隐藏", suffix(home) == "0/3", suffix(home))
+    check("设备 tab 不影响场景",
+          store.prefs.hidden_scenes == [] and suffix(find(sc, kind="scene_home", home="h1")) == "2/2",
+          f"{store.prefs.hidden_scenes} / {suffix(find(sc, kind='scene_home', home='h1'))}")
 
-    # 场景组开关
-    QTest.mouseClick(tree.viewport(), Qt.LeftButton, Qt.NoModifier,
-                     _switch_rect(tree.visualItemRect(find(tree, kind="scene_group"))).center())
+    # -- 切到场景 tab ------------------------------------------------
+    dlg._switch_hidden_tab("scenes")
     QApplication.processEvents()
-    home = find(tree, kind="home", home="h1")
-    check("场景组一点全藏", switch(find(tree, kind="scene_group")) == 0.0)
-    check("家庭行跟着变 0/5", suffix(home) == "0/5", suffix(home))
-    check("场景隐藏进了 prefs",
-          store.prefs.is_scene_hidden("s1") and store.prefs.is_scene_hidden("s2"))
+    check("切到场景 tab 只显示场景树", dlg.hidden_stack.currentWidget() is sc)
+    check("场景 tab 只露出场景那枚恢复按钮",
+          dlg.btn_show_devices.isHidden() and not dlg.btn_show_scenes.isHidden())
 
-    # 全部恢复显示
-    dlg.btn_show_all.click()
+    s_home = find(sc, kind="scene_home", home="h1")
+    check("场景初始全显示", switch(s_home) == 1.0 and suffix(s_home) == "2/2",
+          f"{switch(s_home)} / {suffix(s_home)}")
+
+    # 单条场景开关
+    QTest.mouseClick(sc.viewport(), Qt.LeftButton, Qt.NoModifier,
+                     _switch_rect(sc.visualItemRect(find(sc, kind="scene", id="s1"))).center())
     QApplication.processEvents()
-    home = find(tree, kind="home", home="h1")
-    check("「全部恢复显示」拉回 5/5", suffix(home) == "5/5", suffix(home))
-    check("prefs 两侧都清空了", store.prefs.hidden == [] and store.prefs.hidden_scenes == [],
+    s_home = find(sc, kind="scene_home", home="h1")
+    check("单条场景关掉", switch(find(sc, kind="scene", id="s1")) == 0.0)
+    check("场景家庭行停在半开", suffix(s_home) == "1/2" and abs(float(switch(s_home)) - 0.5) < 1e-6,
+          f"{suffix(s_home)} / {switch(s_home)}")
+    check("场景隐藏进了 prefs", store.prefs.is_scene_hidden("s1"))
+
+    # 家庭开关：部分隐藏 → 全部显示
+    QTest.mouseClick(sc.viewport(), Qt.LeftButton, Qt.NoModifier,
+                     _switch_rect(sc.visualItemRect(s_home)).center())
+    QApplication.processEvents()
+    s_home = find(sc, kind="scene_home", home="h1")
+    check("部分隐藏时点家庭 = 场景全显示", switch(s_home) == 1.0 and suffix(s_home) == "2/2",
+          f"{switch(s_home)} / {suffix(s_home)}")
+
+    # 家庭开关：全显示 → 全部隐藏
+    QTest.mouseClick(sc.viewport(), Qt.LeftButton, Qt.NoModifier,
+                     _switch_rect(sc.visualItemRect(s_home)).center())
+    QApplication.processEvents()
+    s_home = find(sc, kind="scene_home", home="h1")
+    check("全显时点家庭 = 场景全隐藏", suffix(s_home) == "0/2", suffix(s_home))
+    check("场景隐藏不影响设备", len(store.prefs.hidden) == 3, str(store.prefs.hidden))
+
+    # 再点一次（全隐藏）→ 全部显示
+    QTest.mouseClick(sc.viewport(), Qt.LeftButton, Qt.NoModifier,
+                     _switch_rect(sc.visualItemRect(s_home)).center())
+    QApplication.processEvents()
+    check("全隐时再点家庭 = 场景全显示",
+          suffix(find(sc, kind="scene_home", home="h1")) == "2/2",
+          suffix(find(sc, kind="scene_home", home="h1")))
+
+    # -- 「全部恢复显示」按 tab 分开 --------------------------------
+    # 两边各藏一条，先清设备：场景那条必须还在
+    store.set_hidden("d1", True)
+    store.set_scene_hidden("s1", True)
+    dlg._reload_all()
+    dlg._switch_hidden_tab("devices")
+    dlg.btn_show_devices.click()
+    QApplication.processEvents()
+    check("设备 tab 的恢复只清设备",
+          store.prefs.hidden == [] and store.prefs.is_scene_hidden("s1"),
           f"{store.prefs.hidden} / {store.prefs.hidden_scenes}")
+    check("设备树拉回全显", suffix(find(dev, kind="home", home="h1")) == "3/3",
+          suffix(find(dev, kind="home", home="h1")))
+
+    dlg._switch_hidden_tab("scenes")
+    dlg.btn_show_scenes.click()
+    QApplication.processEvents()
+    check("场景 tab 的恢复只清场景",
+          store.prefs.hidden_scenes == [] and store.prefs.hidden == [],
+          f"{store.prefs.hidden} / {store.prefs.hidden_scenes}")
+    check("场景树拉回全显", suffix(find(sc, kind="scene_home", home="h1")) == "2/2",
+          suffix(find(sc, kind="scene_home", home="h1")))
+
+    # -- 切 tab 不重建、不丢展开状态 --------------------------------
+    dlg._switch_hidden_tab("devices")
+    find(dev, kind="home", home="h1").setExpanded(False)
+    dlg._switch_hidden_tab("scenes")
+    dlg._switch_hidden_tab("devices")
+    check("切 tab 不丢折叠状态", find(dev, kind="home", home="h1").isExpanded() is False)
     dlg.close()
 
 
@@ -497,7 +570,7 @@ def _diff(a: QColor, b: QColor) -> int:
 def section_geometry() -> None:
     print("\n6) 几何与绘制")
     store, dlg = fresh()
-    tree = dlg.tree_hidden
+    tree = dlg.tree_hidden_devices
     dlg.nav.setCurrentRow(2)  # 切到隐藏页，让它真的拿到宽度
     QApplication.processEvents()
 
@@ -551,7 +624,7 @@ def section_geometry() -> None:
     on = track(home)
     check("全开的开关是绿的", _diff(on, QColor(theme.TOGGLE_ON)) < 12, on.name())
     store.prefs.set_hidden("d1", True)
-    dlg._fill_hidden_tree()
+    dlg._fill_hidden_devices()
     QApplication.processEvents()
     img = tree.viewport().grab().toImage()
     half = track(find(tree, kind="room", room="r1"))
@@ -667,6 +740,23 @@ def section_panels() -> None:
         check(f"{pal.name}：房间树铺满卡片高度",
               abs(dlg.tree_rooms.height() - dlg.order_stack.height()) <= 2,
               f"树 {dlg.tree_rooms.height()} / 栈 {dlg.order_stack.height()}")
+
+        # 隐藏页同一套：两个 tab 互斥，各自吃满卡片高度
+        show_page(2)
+        check(f"{pal.name}：隐藏页默认显示设备树",
+              dlg.hidden_stack.currentWidget() is dlg.tree_hidden_devices)
+        dlg._switch_hidden_tab("scenes")
+        QApplication.processEvents()
+        check(f"{pal.name}：隐藏页切到场景 tab 只显示场景树",
+              dlg.hidden_stack.currentWidget() is dlg.tree_hidden_scenes)
+        check(f"{pal.name}：隐藏场景树铺满卡片高度",
+              abs(dlg.tree_hidden_scenes.height() - dlg.hidden_stack.height()) <= 2,
+              f"树 {dlg.tree_hidden_scenes.height()} / 栈 {dlg.hidden_stack.height()}")
+        dlg._switch_hidden_tab("devices")
+        QApplication.processEvents()
+        check(f"{pal.name}：隐藏设备树铺满卡片高度",
+              abs(dlg.tree_hidden_devices.height() - dlg.hidden_stack.height()) <= 2,
+              f"树 {dlg.tree_hidden_devices.height()} / 栈 {dlg.hidden_stack.height()}")
 
         # 外观页："家庭标签"卡里两行（排列 / 激活样式）+ 预览；三段 → 两条线
         show_page(0)

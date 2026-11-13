@@ -168,26 +168,27 @@ def main() -> int:
     check("非法值被忽略", store.prefs.set_home_placement("bogus"), False)
     check("非法值不落盘", Prefs(prefs.path).home_placement, "fixed")
 
-    # 旧版 v10：排序键是名字，读到时四份顺序直接丢弃；did 类数据保留
+    # 已删除版本分支：字段原样读，不再按 version 丢弃顺序
     legacy_path = prefs.path.with_name("legacy.json")
     legacy_path.write_text(json.dumps({
         "version": 10,
         "home_order": ["示例家庭"],
         "room_order": {"示例家庭": ["客厅"]},
-        "device_order": {"示例家庭\u001f客厅": ["d1"]},
+        "device_order": {"示例家庭\u001f客厅": ["d2"]},
         "scene_order": {"示例家庭": ["s1"]},
         "hidden": ["d1"],
         "card_styles": {"d1": "wide"},
         "speaker_command_did": "sp1",
     }, ensure_ascii=False), encoding="utf-8")
     legacy = Prefs(legacy_path)
-    check("v10 家庭顺序被丢弃", legacy.home_order, [])
-    check("v10 房间顺序被丢弃", legacy.room_order, {})
-    check("v10 设备顺序被丢弃", legacy.device_order, {})
-    check("v10 场景顺序被丢弃", legacy.scene_order, {})
-    check("v10 隐藏 did 保留", legacy.hidden, ["d1"])
-    check("v10 卡片样式保留", legacy.card_styles, {"d1": "wide"})
-    check("v10 音箱 did 保留", legacy.speaker_command_did, "sp1")
+    check("顺序字段不再按版本丢弃", legacy.home_order, ["示例家庭"])
+    check("房间 / 设备 / 场景顺序原样读入",
+          (legacy.room_order, legacy.device_order, legacy.scene_order),
+          ({"示例家庭": ["客厅"]}, {"示例家庭\u001f客厅": ["d2"]},
+           {"示例家庭": ["s1"]}))
+    check("隐藏 did 保留", legacy.hidden, ["d1"])
+    check("卡片样式保留", legacy.card_styles, {"d1": "wide"})
+    check("音箱 did 保留", legacy.speaker_command_did, "sp1")
 
     # 纯函数边界
     check("排序函数容忍未知项", apply_order(["b"], ["a", "b", "c"]), ["b", "a", "c"])

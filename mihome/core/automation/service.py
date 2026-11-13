@@ -17,6 +17,7 @@ from typing import Any, Callable
 from PySide6.QtCore import QObject, QTimer, Signal
 
 from .. import speaker
+from ..geek import supports as geek_supports
 from ..jobs import PRIORITY_CONTROL
 from .engine import AutomationEngine, LogEntry
 from .hotkeys_win import HotkeyRegistry
@@ -104,12 +105,40 @@ class AutomationService(QObject):
         check = getattr(self.store, "home_has_hub", None)
         return bool(check(want)) if callable(check) else False
 
+    def hub_choices(self, home: str = "") -> list[tuple[str, str, bool]]:
+        """这个家庭里可作「发虚拟事件」中枢的设备：``[(did, 显示名, 在线), ...]``。
+
+        判据与 :meth:`home_has_hub` 完全相同（``geek.supports`` 的探测结论），
+        所以"有没有中枢"和"下拉里列几台"永远是同一份名单。这里只给编辑页做候选；
+        真正发送时再按 did 解析 ``siid/aiid``（``sender.resolve_did``），避免在
+        规格没加载完时把坐标固化进 rules.json。
+        """
+        want = self.current_home if not home else home
+        store = self.store
+        checker = getattr(store, "home_has_hub", None)
+        if not callable(checker):
+            return []
+        out: list[tuple[str, str, bool]] = []
+        for st in getattr(store, "devices", {}).values():
+            node = getattr(st, "node", None)
+            did = str(getattr(st, "did", "") or getattr(node, "did", ""))
+            if not did:
+                continue
+            info = getattr(store, "device_room", None)
+            home_id = ""
+            if callable(info):
+                got = info(did)
+                home_id = got[0] if got else ""
+            if home_id != want:
+                continue
+            if not geek_supports(did, str(getattr(node, "model", "") or "")):
+                continue
+            name = str(getattr(st, "name", "") or getattr(node, "name", "") or did)
+            out.append((did, name, bool(getattr(st, "online", True))))
+        return sorted(out, key=lambda item: (not item[2], item[1]))
+
     def status_for(self, keys: str) -> str:
         return self.registry.status(keys)
-
-    def target_label(self) -> str:
-        target, why = self.sender.resolve()
-        return target.label if target is not None else why
 
     def speaker_targets(self, home: str | None = None) -> list[speaker.Target]:
         """某个家庭里能「执行文本指令」的音箱。默认 = 当前家庭。
@@ -159,9 +188,14 @@ class AutomationService(QObject):
         timer.timeout.connect(fire)
         timer.start(max(0, int(ms)))
 
-    def _emit(self, name: str, done: Callable[[str], None]) -> None:
-        """主线程解析中枢 → 后台线程发请求 → 主线程回调继续动作队列。"""
-        target, why = self.sender.resolve()
+    def _emit(self, act: Action, done: Callable[[str], None]) -> None:
+        """主线程解析中枢 → 后台线程发请求 → 主线程回调继续动作队列。
+
+        规则里存了 ``hub`` 就只认那台（多中枢家庭里用户选的是哪台就发哪台）；
+        ``hub`` 为空是旧规则，才回落"上次用过 / 第一台在线中枢"。
+        """
+        target, why = (self.sender.resolve_did(act.hub) if act.hub
+                       else self.sender.resolve())
         if target is None:
             done(why)
             return
@@ -171,10 +205,12 @@ class AutomationService(QObject):
                 done(f"后台任务失败：{error}")
                 return
             ok, text = result if isinstance(result, tuple) else (False, "返回结果格式不对")
+            # code 0 仅代表云端收下这条 action；极客版本地规则有没有真的执行，
+            # 云端不会回报，只能靠设备端的反馈确认（见 sender 模块 docstring）。
             done("" if ok else text)
 
         self.worker.submit(
-            self.sender.call, (target, name),
+            self.sender.call, (target, act.name),
             callback=finished, priority=PRIORITY_CONTROL, label="发虚拟事件",
         )
 

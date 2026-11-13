@@ -146,10 +146,12 @@ class Emitter:
     def __init__(self, fail_on: str = "") -> None:
         self.calls: list[str] = []
         self.fail_on = fail_on
+        self.hubs: list[str] = []
 
-    def __call__(self, name: str, done) -> None:
-        self.calls.append(name)
-        done(f"模拟失败：{name}" if name == self.fail_on else "")
+    def __call__(self, act, done) -> None:
+        self.calls.append(act.name)
+        self.hubs.append(act.hub)
+        done(f"模拟失败：{act.name}" if act.name == self.fail_on else "")
 
 
 class Speaker:
@@ -276,6 +278,19 @@ check("silent 只认 true（写「是」/1 都算不静默）",
 check("音箱动作不残留 delay 的 ms/unit",
       (lambda a: a.ms == 0 and a.unit == "ms")(
           Action.from_dict({"type": "speaker", "did": "d", "text": "x"})))
+
+# 「发虚拟事件」显式绑定中枢：did 执行用，hub_name 只做显示快照
+evt = Action("virtual_event", "事件A", hub="hub1", hub_name="客厅中枢")
+evt_dict = evt.to_dict()
+check("虚拟事件落盘带上中枢 did 与名字",
+      evt_dict == {"type": "virtual_event", "name": "事件A",
+                   "hub": "hub1", "hub_name": "客厅中枢"}, str(evt_dict))
+check("没选中枢的旧动作不写 hub 键",
+      Action("virtual_event", "事件A").to_dict()
+      == {"type": "virtual_event", "name": "事件A"})
+evt_back = Action.from_dict(evt_dict)
+check("中枢设置能原样读回",
+      (evt_back.hub, evt_back.hub_name) == ("hub1", "客厅中枢"), str(evt_back))
 check("没选音箱被抓", any("没选音箱" in e for e in validate_rule(base_rule(actions=[
     Action("speaker", name="客厅", did="", text="开灯")]))))
 check("没填指令被抓", any("没填要说的话" in e for e in validate_rule(base_rule(actions=[
@@ -331,9 +346,8 @@ check("triggers 落盘是列表", [t["keys"] for t in multi.to_dict()["triggers"
 check("v3 不再写单个 keys 键", "keys" not in multi.to_dict())
 check("多触发能原样读回",
       [t.keys for t in Rule.from_dict(multi.to_dict()).triggers] == ["Ctrl+Alt+F7", "F8"])
-check("v2 的单个 keys 自动变成一条 keyboard 触发",
-      [t.keys for t in Rule.from_dict({"id": "old", "keys": "ctrl+alt+f9"}).triggers]
-      == ["Ctrl+Alt+F9"])
+check("旧文件的单个 keys 不再转换（当前结构只认 triggers）",
+      Rule.from_dict({"id": "old", "keys": "ctrl+alt+f9"}).triggers == [])
 check("空触发列表被拦",
       any("至少要有一个触发方式" in e
           for e in validate_rule(base_rule(triggers=[]))))
@@ -380,8 +394,9 @@ check("update 生效", rs3.update(base_rule(id="a", name="改名后")) and rs3.g
 
 # 坏数据字段级修复
 path.write_text('{"version": 1, "rules": ['
-                '{"id":"ok","keys":"alt+ctrl+f9","cooldown_ms":"坏","actions":[{"type":"delay"}]},'
-                '{"keys":"没有 id"}, 42]}', encoding="utf-8")
+                '{"id":"ok","triggers":[{"type":"keyboard","keys":"alt+ctrl+f9"}],'
+                '"cooldown_ms":"坏","actions":[{"type":"delay"}]},'
+                '{"triggers":[],"name":"没有 id"}, 42]}', encoding="utf-8")
 fixed = RuleSet(path)
 check("坏数据不整体丢掉", len(fixed.rules) == 1 and fixed.rules[0].id == "ok")
 check("坏 cooldown 退回默认", fixed.rules[0].cooldown_ms == 1000)
@@ -475,6 +490,14 @@ eng_m, _, _, em_m = make_engine(base_rule(
 check("第二个触发也能执行", eng_m.trigger("F8") == 1 and em_m.calls == ["事件A"])
 check("日志记下实际按下的键", eng_m.log[0].keys == "F8", eng_m.log[0].keys)
 check("冷静期按规则算：换另一个触发也被同一条规则挡住", eng_m.trigger("F7") == 0)
+
+# 虚拟事件按动作里选中的中枢发，日志写明是哪台
+eng_h, _, _, em_h = make_engine(base_rule(actions=[
+    Action("virtual_event", "事件A", hub="hub1", hub_name="客厅中枢")]))
+check("动作把选中的中枢带进发送通道",
+      eng_h.trigger("Ctrl+Alt+F7") == 1 and em_h.hubs == ["hub1"], str(em_h.hubs))
+check("发送日志写明中枢", any("客厅中枢" in e.detail for e in eng_h.log),
+      str([e.detail for e in eng_h.log]))
 
 # 动作顺序 + 延迟
 seq_rule = base_rule(actions=[
@@ -689,7 +712,7 @@ check("未指定家庭的规则在哪个家的回收站都能看到（方便找�
 hs.restore("h1")
 hs.restore("h3")
 
-# v1 按家庭名存：加载时把归属置空，规则其余字段一个不少
+# 旧结构不再转换：本机 rules.json 已规范成 v3，加载只按当前字段读
 legacy = _TMP / "legacy-rules.json"
 legacy.write_text(json.dumps({"version": 1, "rules": [{
     "id": "old1", "name": "老规则", "enabled": False, "keys": "F11",
@@ -699,27 +722,25 @@ legacy.write_text(json.dumps({"version": 1, "rules": [{
     "cooldown_ms": 2000, "home": "共享家庭",
 }]}, ensure_ascii=False), encoding="utf-8")
 old = RuleSet(legacy).get("old1", include_deleted=True)
-check("v1 的家庭名归属被置空", old is not None and old.home == "", repr(old.home if old else None))
-check("v1 规则本身全部保留（名称 / 键位 / 条件 / 动作 / 启停 / 冷静期）",
-      old is not None and (old.name, old.keys, old.enabled, old.condition_mode,
-                           old.cooldown_ms) == ("老规则", "F11", False, "any", 2000)
+check("旧文件的 keys 不再变成触发（数据已规范化，不兼容旧字段）",
+      old is not None and old.triggers == [])
+check("旧文件其余字段照常读入",
+      old is not None and (old.name, old.enabled, old.condition_mode,
+                           old.cooldown_ms) == ("老规则", False, "any", 2000)
       and [c.type for c in old.conditions] == ["idle_minutes"]
       and [a.type for a in old.actions] == ["delay"])
-check("v1 老规则不注册热键",
-      RuleSet(legacy).enabled_keys() == [])
+check("没有触发的旧规则不注册热键", RuleSet(legacy).enabled_keys() == [])
 
-# v2（单个 keys + 家庭 id）：升级到 v3 只把 keys 摊成触发行，归属不能被清空
+# v2 的 home 已经是 id：加载时不再按版本清空
 v2 = _TMP / "v2-rules.json"
 v2.write_text(json.dumps({"version": 2, "rules": [{
     "id": "v2r", "name": "v2 规则", "keys": "Ctrl+Alt+F6", "home": "1002",
     "actions": [{"type": "virtual_event", "name": "A"}],
 }]}, ensure_ascii=False), encoding="utf-8")
 v2r = RuleSet(v2).get("v2r", include_deleted=True)
-check("v2 → v3 保留家庭 id", v2r is not None and v2r.home == "1002",
+check("v2 的家庭 id 原样保留", v2r is not None and v2r.home == "1002",
       repr(v2r.home if v2r else None))
-check("v2 的 keys 升成一条触发",
-      v2r is not None and [t.keys for t in v2r.triggers] == ["Ctrl+Alt+F6"])
-check("v2 规则的热键继续注册", RuleSet(v2).enabled_keys() == ["Ctrl+Alt+F6"])
+check("v2 的 keys 不再自动升成触发", v2r is not None and v2r.triggers == [])
 
 # 空归属规则直接进引擎也不会被触发（不能静默按某个家庭执行）
 eng_empty, _, _, em_empty = make_engine(base_rule(id="e1", keys="F12", home=""))

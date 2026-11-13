@@ -631,7 +631,7 @@ class Store:
         home, room = slot if slot is not None else ("", "")
         if not self.prefs.set_hidden(did, hidden, home=home, room=room):
             return
-        self._status("设备已隐藏，可在「设置 → 隐藏设备」里恢复" if hidden else "设备已恢复显示")
+        self._status("设备已隐藏，可在「设置 → 隐藏」里恢复" if hidden else "设备已恢复显示")
         self._layout_changed()
 
     def clear_hidden(self) -> None:
@@ -652,7 +652,7 @@ class Store:
     def set_scene_hidden(self, scene_id: str, hidden: bool) -> None:
         if not self.prefs.set_scene_hidden(scene_id, hidden):
             return
-        self._status("场景已隐藏，可在「设置 → 隐藏设备」里恢复" if hidden else "场景已恢复显示")
+        self._status("场景已隐藏，可在「设置 → 隐藏」里恢复" if hidden else "场景已恢复显示")
         self._layout_changed()
 
     def apply_order_snapshot(

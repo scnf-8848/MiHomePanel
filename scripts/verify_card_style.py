@@ -463,19 +463,17 @@ def main() -> int:
     bad = tmp / "bad.json"
     bad.write_text(json.dumps({
         "card_styles": {
-            "new": "light_bright",                           # v4
-            "v3_dual": {"span": 1, "template": "light_dual"},  # v3 → 沿用 id
-            "v3_wide": {"span": 2, "template": "standard"},    # v3 伪组合 → 回默认
-            "v3_span": {"span": 2},                            # 只改过大小 → 回默认
+            "new": "light_bright",                           # 当前结构
+            "old_dict": {"span": 1, "template": "light_dual"},  # 旧结构 → 丢弃
+            "span_only": {"span": 2},                          # 旧结构 → 丢弃
             "junk": {"span": 9, "template": "BAD ID"},
             "plain": 42,
             "empty": "",
         }}), encoding="utf-8")
     loaded = Prefs(bad)
-    check("坏数据 / v3 迁移只留合法项", loaded.card_styles,
-          {"new": LIGHT_BRIGHT, "v3_dual": LIGHT_DUAL})
-    check("v3 的 2×1 标准退回默认（记录被清掉）", loaded.card_style("v3_wide"), None)
-    check("落盘版本已升到 11（v11 排序键改用云端 id）",
+    check("坏数据 / 旧结构字典只留字符串样式 id", loaded.card_styles,
+          {"new": LIGHT_BRIGHT})
+    check("落盘版本仍是 11（当前结构）",
           json.loads((tmp / "p.json").read_text(encoding="utf-8"))["version"], 11)
 
     print("\n2) 样式解析：能力过滤 / 宽度由样式自带")

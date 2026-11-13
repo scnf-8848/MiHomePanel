@@ -134,6 +134,10 @@ _HINT_TIPS = {
     "要填延迟时间": "延迟必须有值；不想等待就删掉这一行动作",
     "要先选动作类型": "这一行还没选类型：点左边的下拉挑「发虚拟事件 / 延迟 / 发音箱指令」；"
                     "不想加这条就点右边的 × 删掉",
+    "要先选中枢": "「发虚拟事件」由中枢网关发出：先在左边选一台中枢。家庭里有多台时"
+               "可随时切换，执行时按这一行选中的那台发送",
+    "没有可选中枢": "当前家庭里没有探测到能发虚拟事件的中枢网关；换一个有中枢的家庭"
+                 "再建这条规则",
     "不能小于 0": "延迟不能是负数",
     "该家庭缺少中枢网关": "「发虚拟事件」由中枢网关执行；这个家庭里没有探测到中枢网关，"
                     "所以输入框是禁用的。换一个有中枢的家庭再建这条规则",
@@ -240,6 +244,7 @@ def _page_qss(p: theme.Palette) -> str:
         p, "QLineEdit#Field", radius=8, padding="5px 9px", font_size=12
     ) + f"""
     QLabel#Hint {{ color: {p.text_soft}; font-size: 11px; }}
+    QLabel#RegOff {{ color: {p.text}; font-size: 11px; }}
     QLabel#Warn {{ color: {_error_color(p)}; font-size: 11px; }}
     QLabel#Ok {{ color: {theme.ACCENT_GREEN}; font-size: 11px; }}
     /* 浅色主题下 text_soft 压在浅灰底上几乎看不见，小按钮统一用主文字色。
@@ -484,7 +489,10 @@ class TriggerRow(QWidget):
         state = service.status_for(keys)
         reason = reserved_reason(keys)
         text = f"注册状态：{state}" + (f"（{reason}）" if reason else "")
-        tone = "Warn" if ("占用" in state or "不支持" in state or reason) else "Ok"
+        # 用户 11-13 第十一条：注册成功才变绿；未注册 / 被占用用主文字色（白），
+        # 不再默认绿色——绿色应当只表示"已经在系统里注册好了"。
+        registered = not reason and ("已注册" in state or "注册成功" in state)
+        tone = "Ok" if registered else "RegOff"
         if conflict:
             text += f"　·　{conflict}"
             tone = "Warn"
@@ -729,6 +737,21 @@ def _speaker_targets(service: AutomationService) -> list[speaker.Target]:
         return []
 
 
+def _hub_targets(service: AutomationService) -> list[tuple[str, str, bool]]:
+    """当前家庭里能发虚拟事件的中枢：``[(did, 名字, 在线)]``；取不到就当没有。
+
+    和 :func:`_speaker_targets` 一样只决定"下拉里有几项"，假 service 没有这个方法
+    时返回空列表，别把编辑窗带崩。
+    """
+    getter = getattr(service, "hub_choices", None)
+    if not callable(getter):
+        return []
+    try:
+        return list(getter())
+    except Exception:  # noqa: BLE001
+        return []
+
+
 class ActionRow(QWidget):
     """一行 = 类型 + 该类型自己那几个下拉 + 值 + 上移 / 下移 / 删除。
 
@@ -754,11 +777,14 @@ class ActionRow(QWidget):
                  on_move: Callable[[QWidget, int], None],
                  targets: list[speaker.Target] | None = None,
                  hub_ready: bool = True,
+                 hubs: list[tuple[str, str, bool]] | None = None,
                  parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._on_change = on_change
         self._loading = True
         self._targets = list(targets or [])
+        #: 当前家庭可作虚拟事件中枢的设备：``[(did, 名字, 在线)]``
+        self._hubs = list(hubs or [])
         #: 当前家庭有没有中枢网关（「发虚拟事件」的前提，判据同极客版入口）
         self._hub_ready = hub_ready
         self._kind = action.type  # 上一次的类型：判"换的是不是同一种动作"
@@ -780,6 +806,12 @@ class ActionRow(QWidget):
             self.kind.addItem(label, key)
         # 「发音箱指令」5 个全角字 + 左右内边距 12/38：118 刚好不省略
         self.kind.setFixedWidth(118)
+
+        # 中枢设备：只有「发虚拟事件」用得到。多中枢的家庭把几台都列出来，
+        # 发的时候按这一行选中的发（关系显式化，不再隐式取第一台）。
+        self.hub = Combo(palette, self)
+        self.hub.setFixedWidth(176)
+        self._fill_hubs(action)
 
         # 延迟的单位：同一份毫秒值的两把尺子
         self.unit = Combo(palette, self)
@@ -817,6 +849,7 @@ class ActionRow(QWidget):
 
         lay.addWidget(self.index_label)
         lay.addWidget(self.kind)
+        lay.addWidget(self.hub)
         lay.addWidget(self.unit)
         lay.addWidget(self.speaker)
         lay.addWidget(self.silent)
@@ -828,15 +861,20 @@ class ActionRow(QWidget):
         # 控件都建好再连：下面回填值时不能让 _kind_changed 抢先清空输入框
         self.kind.currentIndexChanged.connect(self._kind_changed)
         self.unit.currentIndexChanged.connect(self._unit_changed)
+        self.hub.currentIndexChanged.connect(self._selection_changed)
         self.speaker.currentIndexChanged.connect(self._selection_changed)
         self.silent.currentIndexChanged.connect(self._selection_changed)
 
         # 认不出的类型（空串 / 旧版本残留）一律落在空档上，别偷偷替用户选成虚拟事件
         kind = action.type if action.type in dict(_ACTION_LABELS) else ""
         with QSignalBlocker(self.kind), QSignalBlocker(self.unit), \
-                QSignalBlocker(self.speaker), QSignalBlocker(self.silent):
+                QSignalBlocker(self.hub), QSignalBlocker(self.speaker), \
+                QSignalBlocker(self.silent):
             self.kind.setCurrentIndex(max(0, self.kind.findData(kind)))
             self.unit.setCurrentIndex(max(0, self.unit.findData(self._prev_unit)))
+            # 没存中枢的旧动作：落在第一台上（有就显式选中），改了才落盘
+            self.hub.setCurrentIndex(max(
+                0, self.hub.findData(action.hub if kind == "virtual_event" else "")))
             self.speaker.setCurrentIndex(
                 max(0, self.speaker.findData(action.did if kind == "speaker" else "")))
             self.silent.setCurrentIndex(
@@ -854,6 +892,33 @@ class ActionRow(QWidget):
         self.sync_hint()
 
     # -- 候选 ------------------------------------------------------------
+    def _fill_hubs(self, action: Action) -> None:
+        """中枢候选 = 当前家庭里被探测为中枢的那几台（由调用方筛好传进来）。
+
+        规则里存的是 did。那台设备如果已经不在这个家庭的候选里（被移除 / 换家庭），
+        仍然补成一条特殊项，让这一行有东西可显示；执行时服务层按 did 解析，真
+        找不到才在日志里报错。
+        """
+        dids = {h[0] for h in self._hubs}
+        for did, name, online in self._hubs:
+            label = name or did
+            if not online:
+                label += "（离线）"
+            self.hub.addItem(label, did)
+            self.hub.setItemData(self.hub.count() - 1, label, Qt.ToolTipRole)
+        if action.type == "virtual_event" and action.hub and action.hub not in dids:
+            self.hub.insertItem(0, f"{action.hub_name or action.hub}（不在当前家庭）",
+                                action.hub)
+            self.hub.setItemData(
+                0, "这台中枢已不在当前家庭的候选里（可能被移除或换了家庭）",
+                Qt.ToolTipRole)
+        if not self._hubs and not (action.type == "virtual_event" and action.hub):
+            self.hub.addItem("没有可选中枢", "")
+            self.hub.setEnabled(False)
+            return
+        if not self._hubs:
+            self.hub.setEnabled(False)
+
     def _fill_speakers(self, action: Action) -> None:
         """音箱候选 = 当前家庭里能执行文本指令的那几台（由调用方筛好传进来）。
 
@@ -880,6 +945,19 @@ class ActionRow(QWidget):
 
     def _current_did(self) -> str:
         return str(self.speaker.currentData() or "")
+
+    def _current_hub(self) -> str:
+        return str(self.hub.currentData() or "")
+
+    def _pick_default_hub(self) -> None:
+        """从别的类型切到「发虚拟事件」：没选就挑第一台在线的中枢。"""
+        if self._current_hub():
+            return
+        best = next((h for h in self._hubs if h[2]), None) or (
+            self._hubs[0] if self._hubs else None)
+        if best is not None:
+            with QSignalBlocker(self.hub):
+                self.hub.setCurrentIndex(max(0, self.hub.findData(best[0])))
 
     def _pick_default_speaker(self) -> None:
         """从别的类型切到音箱指令：没选就挑第一台在线的，别让用户先空跑一次校验。"""
@@ -920,6 +998,8 @@ class ActionRow(QWidget):
             self.value_edit.setText("")
             if kind == "speaker":
                 self._pick_default_speaker()
+            elif kind == "virtual_event":
+                self._pick_default_hub()
         self._kind = kind
         # 选了类型就不再是"还没选"，之前那条红字跟着撤掉
         self._show_missing = False
@@ -950,6 +1030,9 @@ class ActionRow(QWidget):
         """
         kind = self._kind_key()
         self.unit.setVisible(kind == "delay")
+        self.hub.setVisible(kind == "virtual_event")
+        self.hub.setEnabled(kind == "virtual_event" and (
+            bool(self._hubs) or bool(self._current_hub())))
         self.speaker.setVisible(kind == "speaker")
         self.silent.setVisible(kind == "speaker")
         # 发虚拟事件需要家庭里有中枢网关：没有就禁用输入框，红字由 sync_hint 给
@@ -968,6 +1051,8 @@ class ActionRow(QWidget):
 
     def focus_widget(self) -> QWidget:
         """出错时焦点该给谁：空档行的输入框是禁用的，交给类型下拉。"""
+        if self._kind_key() == "virtual_event" and not self._current_hub():
+            return self.hub
         return self.value_edit if self.value_edit.isEnabled() else self.kind
 
     def reveal_missing(self) -> None:
@@ -1070,6 +1155,10 @@ class ActionRow(QWidget):
             if not self.value_edit.text().strip():
                 return "要填指令"
             return ""
+        if kind == "virtual_event":
+            if not self._current_hub():
+                return "没有可选中枢" if not self._hubs else "要先选中枢"
+            return ""
         if not self._is_delay():
             return ""
         raw = self.value_edit.text().strip()
@@ -1109,11 +1198,13 @@ class ActionRow(QWidget):
         self.index_label.setText(f"{number}.")
 
     def set_move_enabled(self, up: bool, down: bool) -> None:
-        """到边界的箭头直接禁用 + tooltip 说明，别让点了没反应。"""
-        self.up_btn.setEnabled(up)
-        self.down_btn.setEnabled(down)
-        self.up_btn.setToolTip("上移这条动作" if up else "已经是第一条")
-        self.down_btn.setToolTip("下移这条动作" if down else "已经是最后一条")
+        """上移 / 下移**从不置灰**（用户 11-13 第十二条）：第一行按 ↑、最后一行按 ↓
+        顺序不变即可，灰按钮反而像"这一行坏了"。``up`` / ``down`` 只为接口
+        兼容（调用方仍按位置传），按钮一律可点。"""
+        self.up_btn.setEnabled(True)
+        self.down_btn.setEnabled(True)
+        self.up_btn.setToolTip("上移这条动作" if up else "已经是第一条，按了也不会动")
+        self.down_btn.setToolTip("下移这条动作" if down else "已经是最后一条，按了也不会动")
 
     def value(self) -> Action:
         """读回一条动作。延迟**永远是毫秒**，秒档在这里折算，界面之外没人认"秒"。"""
@@ -1133,7 +1224,12 @@ class ActionRow(QWidget):
             # 也认这个（见 rules.validate_rule）。别默认成 virtual_event，
             # 那等于替用户选了一个他从没选过的类型。
             return Action("")
-        return Action("virtual_event", self.value_edit.text().strip(), 0)
+        did = self._current_hub()
+        target = next((h for h in self._hubs if h[0] == did), None)
+        # hub_name 只是显示名快照；执行按 did 解析（见 sender.resolve_did）
+        name = target[1] if target is not None else ""
+        return Action("virtual_event", self.value_edit.text().strip(), 0,
+                      hub=did, hub_name=name)
 
 
 # ---------------------------------------------------------------------------
@@ -1184,6 +1280,8 @@ class AutomationDialog(QDialog):
         # 「发音箱指令」的候选：**当前家庭**里能执行文本指令的那几台。
         # 取一次就够——本窗是模态的，开着的时候切不了家庭。
         self._speaker_targets = _speaker_targets(service)
+        # 「发虚拟事件」的中枢候选：同样取当前家庭、一次取完（窗开着时切不了家庭）
+        self._hub_targets = _hub_targets(service)
 
         title = "新建规则" if self._is_new else "编辑规则"
         self.setWindowTitle(title)
@@ -1281,8 +1379,7 @@ class AutomationDialog(QDialog):
         self.home_value = QLabel(home_text or "未指定家庭", content)
         self.home_value.setObjectName("Hint")
         self.home_value.setToolTip("规则归属于创建时所在的家庭，不能修改")
-        head.add_row("归属家庭", self.home_value,
-                     sub="创建后固定，不能修改；旧规则打开后按当前家庭保存")
+        head.add_row("归属家庭", self.home_value)
         col.addWidget(head)
 
         self.cooldown = QLineEdit(content)
@@ -1337,7 +1434,7 @@ class AutomationDialog(QDialog):
         # 「条件关系」常显在章节标题右侧（用户 11-13 第五次调整）：0 / 1 / 多条都
         # 显示，不再按条数隐藏。它原本占卡片里一整行、右边一长条空白，现在只占
         # 标题行，卡片里只剩条件行和按钮；也不再配「条件关系」文字标签。
-        head2 = self._step_header(content, "2", "状态条件（可以为空）")
+        head2 = self._step_header(content, "2", "状态条件")
         self.mode = Combo(self._p, content)
         for key, label in _MODE_LABELS:
             self.mode.addItem(label, key)
@@ -1354,7 +1451,7 @@ class AutomationDialog(QDialog):
         self.cond_layout.setContentsMargins(0, 0, 0, 0)
         self.cond_layout.setSpacing(2)
         card2.add_unit(self.cond_box)
-        self.cond_empty = QLabel("没有条件限制，快捷键按下就会执行动作", content)
+        self.cond_empty = QLabel("可以为空：不设条件时，快捷键按下就会执行动作", content)
         self.cond_empty.setObjectName("Hint")
         self.cond_empty.setContentsMargins(0, 8, 0, 8)
         # 空态提示和它**上下两条分隔线**一起缩进到 44px（用户 11-13 第八次调整），
@@ -1420,10 +1517,10 @@ class AutomationDialog(QDialog):
         card3.add_unit(action_btns)
         col.addWidget(card3)
 
-        # 中枢说明是静态文字，放滚动区末尾即可；别占固定底栏的高度。
-        self.target_label = QLabel("", content)
-        self.target_label.setObjectName("Hint")
-        col.addWidget(self.target_label)
+        # 中枢 / 云端说明**不再上界面**（用户 11-13 第十二条）：
+        # ``Sender.call`` 返回 code 0 只代表云端收下了这条 action，极客版本地规则
+        # 有没有真的执行、设备有没有动，云端不会回报——只能看设备端反馈。
+        # 这句话留在代码里给维护者看，底栏只保留错误条 + 按钮。
 
         col.addStretch(1)
         area.setWidget(content)
@@ -1534,7 +1631,10 @@ class AutomationDialog(QDialog):
     def _add_action(self, action: Action, *, quiet: bool = False) -> None:
         row = ActionRow(action, self._p, self._mark_dirty,
                         self._remove_action, self._move_action,
-                        self._speaker_targets, self._hub_ready, self.action_box)
+                        targets=self._speaker_targets,
+                        hub_ready=self._hub_ready,
+                        hubs=self._hub_targets,
+                        parent=self.action_box)
         self.action_layout.addWidget(row)
         self._action_rows.append(row)
         self._renumber()
@@ -1732,8 +1832,6 @@ class AutomationDialog(QDialog):
     def _refresh_status(self) -> None:
         for row in self._trigger_rows:
             row.refresh_status(self.service, self._conflict_note(row))
-        self.target_label.setText(f"中枢：{self.service.target_label()}　·　"
-                                  "云端返回 code 0 只代表收下，末端动作请听设备反馈")
 
     def _conflict_note(self, row: TriggerRow) -> str:
         """这个键还被哪条**启用**的规则用着（非阻塞提示）。

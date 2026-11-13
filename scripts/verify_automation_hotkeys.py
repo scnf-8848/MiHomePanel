@@ -30,6 +30,7 @@ os.environ["MIHOME_DATA_DIR"] = str(_TMP / "data")
 from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import QApplication, QWidget  # noqa: E402
 
+from mihome.core.automation import Action  # noqa: E402
 from mihome.core.automation import hotkeys_win as HK  # noqa: E402
 from mihome.core.automation.sender import VirtualEventSender, target_for  # noqa: E402
 from mihome.core.automation.service import AutomationService  # noqa: E402
@@ -187,6 +188,14 @@ empty = VirtualEventSender(lambda: api, lambda: [])
 picked2, why3 = empty.resolve()
 check("没中枢给中文原因", picked2 is None and "没找到" in why3, why3)
 
+# 显式中枢（多中枢家庭）：按 did 解析，不糊到"第一台"
+picked3, why4 = sender.resolve_did("107")
+check("按 did 解析到选中的中枢", picked3 is not None and picked3.did == "107", why4)
+picked4, why5 = sender.resolve_did("nope")
+check("did 不存在给中文原因", picked4 is None and "找不到" in why5, why5)
+off_sel, why6 = offline.resolve_did("107")
+check("选中的中枢离线也不换一台", off_sel is None and "离线" in why6, why6)
+
 print("\n--- 常驻服务：后台投递 / 成员定时器 ---", flush=True)
 
 
@@ -211,7 +220,7 @@ worker = FakeWorker()
 service = AutomationService(store=store, client=FakeClient(api), worker=worker,
                             window=None, path=_TMP / "svc-rules.json")
 done: list[str] = []
-service._emit("测试事件", done.append)
+service._emit(Action("virtual_event", "测试事件", hub="107"), done.append)
 check("云端请求丢进后台队列", len(worker.jobs) == 1)
 fn, args, callback, priority, label = worker.jobs[0]
 check("用 CONTROL 优先级插队", priority == 0 and label == "发虚拟事件")
@@ -220,7 +229,7 @@ check("结果回主线程继续动作队列", done == [""], str(done))
 
 worker.jobs.clear()
 done.clear()
-service._emit("测试事件", done.append)
+service._emit(Action("virtual_event", "测试事件", hub="107"), done.append)
 fn, args, callback, _p, _l = worker.jobs[0]
 callback(None, RuntimeError("模拟后台异常"))
 check("后台异常不会卡住队列", done and "失败" in done[0], str(done))

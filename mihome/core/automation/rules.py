@@ -10,7 +10,7 @@
     {id, name, enabled, triggers[], condition_mode, conditions[], actions[], cooldown_ms[, home]}
     triggers[]   = {type:"keyboard", keys}   至少一条；**任一触发命中即执行**
     conditions[] = {type, op, arg}        空数组 = 无条件
-    actions[]    = {type:"virtual_event", name}
+    actions[]    = {type:"virtual_event", name[, hub, hub_name]}
                  | {type:"delay", ms[, unit:"s"]}
                  | {type:"speaker", did, name, text[, silent:true]}
 
@@ -19,20 +19,18 @@
 ``keyboard`` 一种触发类型，``triggers[]`` 的 ``type`` 先占住位置，以后加别的
 触发源（进程启动、网络变化）不用再改 schema。
 
-v2 及更早的文件里是单个 ``keys`` 字符串：加载时自动变成 ``triggers`` 里的一条
-``keyboard``，键位不丢；v3 起只写 ``triggers``，不再写 ``keys``。旧版本程序读
-v3 文件会看到 ``version: 3`` 的兼容警告，规则本身仍然可读（只是没有键位）。
+**只认当前结构**：本机 ``rules.json`` 已由一次性脚本规范成 v3（``triggers[]`` +
+家庭 id），旧文件里的单个 ``keys`` / 家庭名归属 / ``mode`` 字段的兼容分支已删除；
+再读到那些键会按默认值处理（等价于"没有触发"、“没有归属”），不会再做转换。
 
 **规则按家庭隔离**（用户 11-13）：``home`` 记规则归属的云端**家庭 id**，列表窗 /
 回收站 / 日志的规则筛选只显示**当前家庭**的那几条，免得在 1103 家庭里看到共享家庭
 建的规则。三条约定：
 
-* ``home`` 为**空串 = 未指定家庭**（v2 之前按家庭名存的老数据、或者没选家庭就
-  保存的规则）。这种规则在**任何**家庭都可见，方便用户找到并重新选一次；但它
-  **不注册热键、不参与触发**——不能静默按某个家庭执行。
-* 旧版（``rules.json`` v1）按家庭名存的归属在加载时**直接置空**，规则本身
-  （条件、动作、启用状态、名称、id）全部保留；不做名字→id 的迁移。
-  ``RuleSet`` 不再自动"认领"空归属的规则，用户必须在编辑窗里自己选。
+* ``home`` 为**空串 = 未指定家庭**（规则文件从别处拷来、或早先没选家庭就保存的）。
+  这种规则在**任何**家庭都可见，方便用户找到并重新选一次；但它**不注册热键、
+  不参与触发**——不能静默按某个家庭执行。空归属只在编辑窗里由用户显式落定，
+  加载时**不再按文件版本清空**（本机数据已全是家庭 id）。
 * **热键与引擎不做家庭过滤**：热键是这台电脑的系统资源，被自动化的也是这台电脑，
   切到别的家庭去看设备不该让自己的快捷键失灵。家庭只决定"在哪个页面能看到和改"，
   以及执行时这条规则到底算不算数（空归属不算）。
@@ -184,7 +182,11 @@ class Condition:
 class Action:
     """一个动作。三种类型各用各的字段：
 
-    * ``virtual_event`` —— 用 ``name``（事件名，要和米家自动化里监听的完全一致）；
+    * ``virtual_event`` —— 用 ``name``（事件名，要和米家自动化里监听的完全一致）
+      + ``hub``（中枢设备 did）/ ``hub_name``（显示名快照）。**中枢是显式选中的**：
+      同一个家庭有多台中枢时按这一行选的发，不再隐式取"上次那台"。``hub`` 为空
+      表示早先没存中枢的规则，执行时回落 ``VirtualEventSender.resolve()``
+      （见 ``service._emit``；本机旧数据无法离线补出中枢 did，所以这一段保留）。
     * ``delay`` —— 用 ``ms``；
     * ``speaker`` —— 用 ``did``（音箱设备 id）+ ``text``（要说的话）+ ``silent``
       （静默执行）。**``name`` 在这里存的是音箱显示名快照**，只给日志和界面回显用；
@@ -193,7 +195,6 @@ class Action:
     ``unit`` 只是 ``delay`` 的**输入刻度**，语义永远由 ``ms`` 决定：校验、存盘、引擎
     执行全按毫秒算。留着它是为了重开编辑页时「秒」那一档仍显示 ``30`` 而不是
     ``30000``——用户 11-13 要的是两种录入规格，不是两套数据。
-    旧文件没有这个键，读进来就是 ``"ms"``；非 ``"s"`` 的值一律退回 ``"ms"``。
     """
 
     type: str = "virtual_event"
@@ -203,21 +204,29 @@ class Action:
     did: str = ""
     text: str = ""
     silent: bool = False
+    hub: str = ""
+    hub_name: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         if self.type == "delay":
             out: dict[str, Any] = {"type": "delay", "ms": self.ms}
-            # 毫秒是默认刻度，不写这个键，rules.json 对旧版本仍然是原样
+            # 毫秒是默认刻度，不写这个键
             if self.unit == "s":
                 out["unit"] = "s"
             return out
         if self.type == "speaker":
             out = {"type": "speaker", "did": self.did, "name": self.name, "text": self.text}
-            # 不静默是默认值：不写键，读旧文件的代码也不受影响
+            # 不静默是默认值，不写键
             if self.silent:
                 out["silent"] = True
             return out
-        return {"type": "virtual_event", "name": self.name}
+        out = {"type": "virtual_event", "name": self.name}
+        # 没选中枢（旧规则）不写键，保留"未指定"的语义
+        if self.hub:
+            out["hub"] = self.hub
+        if self.hub_name:
+            out["hub_name"] = self.hub_name
+        return out
 
     @classmethod
     def from_dict(cls, raw: Any) -> Action | None:
@@ -235,7 +244,12 @@ class Action:
                 raw.get("silent") is True,
             )
         if kind == "virtual_event":
-            return cls(kind, _text(raw.get("name"), 120), 0)
+            return cls(
+                type=kind,
+                name=_text(raw.get("name"), 120),
+                hub=_text(raw.get("hub"), 64),
+                hub_name=_text(raw.get("hub_name"), 120),
+            )
         return None
 
 
@@ -303,19 +317,12 @@ class Rule:
         rid = _text(raw.get("id"), 64)
         if not rid:
             return None
-        mode = _text(raw.get("mode") or raw.get("condition_mode"), 10)
+        mode = _text(raw.get("condition_mode"), 10)
         conds = raw.get("conditions")
         acts = raw.get("actions")
         raws = raw.get("triggers")
-        triggers: list[Trigger] = []
-        if isinstance(raws, list):
-            triggers = [t for item in raws if (t := Trigger.from_dict(item))]
-        if not triggers:
-            # v2 及更早：单个 keys 字符串。升上来就是一条 keyboard，
-            # 键位 / 注册状态 / 冷静期全按原样继续用，不丢。
-            legacy = normalize(raw.get("keys") or "")
-            if legacy:
-                triggers = [Trigger("keyboard", legacy)]
+        triggers = ([t for item in raws if (t := Trigger.from_dict(item))]
+                    if isinstance(raws, list) else [])
         try:
             deleted_at = float(raw.get("deleted_at") or 0.0)
         except (TypeError, ValueError):
@@ -453,23 +460,20 @@ class RuleSet:
         items = data.get("rules")
         if not isinstance(items, list):
             return
-        # v1 的 home 是家庭名；v2 起改成家庭 id。旧归属直接置空（不做名字→id
-        # 映射），规则其余字段原样保留，用户下一次打开编辑窗自己重选。
-        # v2 → v3 只是 keys 变 triggers，归属已经是 id，不能再当老数据清空。
+        # 本机 rules.json 已规范成 v3；版本不符只提示，不做字段转换（旧 keys /
+        # 家庭名归属 / mode 的分支已删除）。
         version = data.get("version")
-        legacy_home = version in (None, 1)
         seen: set[str] = set()
         for raw in items:
             rule = Rule.from_dict(raw)
             if rule is None or rule.id in seen:
                 self.warnings.append("跳过一条结构损坏或重复 id 的规则")
                 continue
-            if legacy_home:
-                rule.home = ""
             seen.add(rule.id)
             self.rules.append(rule)
-        if version not in (None, 1, 2, SCHEMA_VERSION):
-            self.warnings.append(f"规则文件版本 {version} 不是 {SCHEMA_VERSION}，已按兼容方式读入")
+        if version != SCHEMA_VERSION:
+            self.warnings.append(
+                f"规则文件版本 {version} 不是 {SCHEMA_VERSION}，已按当前结构读入")
 
     def save(self) -> bool:
         payload = {

@@ -80,9 +80,6 @@ class FakeService(QObject):
     def status_for(self, keys: str) -> str:
         return "已注册" if keys else "未设置"
 
-    def target_label(self) -> str:
-        return "家庭中枢"
-
     def sync(self) -> None:
         pass
 

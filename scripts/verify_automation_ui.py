@@ -89,6 +89,10 @@ class FakeService(QObject):
         self.current_home = home
         # 「发虚拟事件」要求家庭有中枢网关；默认有，专门用例里再关掉
         self.hub_ready = True
+        # 家庭内的中枢候选（多台时编辑窗要把它们都列出来）
+        self.hubs = [("hub-a", "客厅中枢", True), ("hub-b", "书房中枢", False)]
+        # 注册状态：默认"已注册"，专门用例里改成"未注册"检查颜色
+        self.registered = True
         # 编辑窗的「归属家庭」只读展示要换成显示名
         self.store = SimpleNamespace(
             homes=lambda: [SimpleNamespace(id=hid, display_name=label)
@@ -107,10 +111,12 @@ class FakeService(QObject):
         self.rules_changed.emit()
 
     def status_for(self, keys: str) -> str:
-        return "已注册" if keys else "未设置"
+        if not keys:
+            return "未设置"
+        return "已注册" if self.registered else "未注册"
 
-    def target_label(self) -> str:
-        return "测试中枢（假）"
+    def hub_choices(self, home_id: str = "") -> list[tuple[str, str, bool]]:
+        return list(self.hubs) if self.hub_ready else []
 
     def sync(self) -> None:
         self.syncs += 1
@@ -662,7 +668,17 @@ check("0 条条件时空态块的按钮上方分隔线让位（不叠线）",
 check("条件关系下拉在 ② 卡片外（标题行里），不占卡片行",
       not dlg.cond_card.isAncestorOf(dlg.mode))
 check("只有 0 条条件时条件关系也常显", not dlg.mode.isHidden())
-check("状态条写明 code 0 的边界", "code 0" in dlg.target_label.text())
+check("编辑页不再显示「中枢 / 云端返回」说明条", not hasattr(dlg, "target_label"))
+_titles = [w.text() for w in dlg.findChildren(QLabel) if w.objectName() == "SectionTitle"]
+check("条件标题就是「状态条件」，不再带「可以为空」",
+      "状态条件" in _titles and not any("可以为空" in t for t in _titles), str(_titles))
+check("「可以为空」落在卡片内的空态行上",
+      dlg.cond_empty.text().startswith("可以为空：") and "执行动作" in dlg.cond_empty.text(),
+      dlg.cond_empty.text())
+check("归属家庭下面不再有说明小字",
+      "创建后固定" not in dlg.home_value.toolTip()
+      and not any(w.objectName() == "RowSub" and "创建后固定" in w.text()
+                  for w in dlg.findChildren(QLabel)))
 check("编辑窗不画规则列表", not dlg.findChildren(AL.RuleCard))
 check("编辑窗没有新建规则按钮", button_with(dlg, "Primary") is None
       or button_with(dlg, "Primary").text() != "＋ 新建规则")
@@ -676,9 +692,10 @@ check("IconTool 把 padding 归零", "QPushButton#IconTool" in dlg.styleSheet()
       and "padding: 0;" in dlg.styleSheet())
 check("图标按钮都有 tooltip 与无障碍名",
       all(b.toolTip() and b.accessibleName() for b in icons))
-check("单行时上下移都禁用", not row0.up_btn.isEnabled()
-      and not row0.down_btn.isEnabled())
-check("禁用态 tooltip 说明原因", "已经是第一条" in row0.up_btn.toolTip())
+check("单行时上下移也可点（用户 11-13 第十二条：不再置灰）",
+      row0.up_btn.isEnabled() and row0.down_btn.isEnabled())
+check("边界箭头 tooltip 说明按了也不会动", "已经是第一条" in row0.up_btn.toolTip()
+      and "已经是最后一条" in row0.down_btn.toolTip())
 dlg.name_edit.setText("改名测试")
 check("标题副标题随名称同步", dlg.title_bar._sub == "改名测试")
 
@@ -756,6 +773,14 @@ tr0._mod_boxes["Alt"].setChecked(True)
 tr0.key_combo.setCurrentIndex(tr0.key_combo.findData("F7"))
 check("手动选键生成规范串", tr0.value().keys == "Ctrl+Alt+F7", tr0.value().keys)
 check("键位显示在按钮上", tr0.keycap.text() == "Ctrl+Alt+F7")
+check("注册成功才用绿色", tr0.status.objectName() == "Ok" and "已注册" in tr0.status.text(),
+      f"{tr0.status.objectName()} / {tr0.status.text()}")
+dlg.service.registered = False
+dlg._refresh_status()
+check("未注册用主文字色（不是绿色）",
+      tr0.status.objectName() == "RegOff", tr0.status.objectName())
+dlg.service.registered = True
+dlg._refresh_status()
 
 # 多触发：第二条行有自己的键位，保存时两条一起进 draft（OR 语义）
 dlg._add_trigger()
@@ -893,21 +918,25 @@ dlg._action_rows[0].value_edit.setText("极客版按键自动化执行")
 dlg._add_action(Action("delay", "", 2000))
 check("添加延迟后两行", len(dlg._action_rows) == 2)
 check("序号连续", [r.index_label.text() for r in dlg._action_rows] == ["1.", "2."])
-check("两行时首行禁上移 / 末行禁下移",
-      not dlg._action_rows[0].up_btn.isEnabled()
-      and not dlg._action_rows[1].down_btn.isEnabled())
-check("两行时中间方向可用", dlg._action_rows[0].down_btn.isEnabled()
-      and dlg._action_rows[1].up_btn.isEnabled())
+check("两行时四枚箭头全部可点（首行 ↑ / 末行 ↓ 只是按了不动）",
+      all(r.up_btn.isEnabled() and r.down_btn.isEnabled()
+          for r in dlg._action_rows))
+dlg._move_action(dlg._action_rows[0], -1)
+check("首行按 ↑ 顺序不变", [r.value().type for r in dlg._action_rows]
+      == ["virtual_event", "delay"])
+dlg._move_action(dlg._action_rows[-1], 1)
+check("末行按 ↓ 顺序不变", [r.value().type for r in dlg._action_rows]
+      == ["virtual_event", "delay"])
 dlg._move_action(dlg._action_rows[1], -1)
 check("上移生效", dlg._action_rows[0].value().type == "delay")
 check("延迟值读回", dlg._action_rows[0].value().ms == 2000)
-check("移动后边界重新计算", not dlg._action_rows[0].up_btn.isEnabled()
-      and not dlg._action_rows[1].down_btn.isEnabled())
+check("移动后边界箭头仍可点", all(r.up_btn.isEnabled() and r.down_btn.isEnabled()
+      for r in dlg._action_rows))
 dlg._move_action(dlg._action_rows[0], 1)
 check("下移生效", dlg._action_rows[0].value().type == "virtual_event")
 dlg._remove_action(dlg._action_rows[1])
 check("删除动作回到一行", len(dlg._action_rows) == 1)
-check("回到单行后箭头重新禁用", not dlg._action_rows[0].down_btn.isEnabled())
+check("回到单行后箭头仍可点", dlg._action_rows[0].down_btn.isEnabled())
 
 # 换类型残留旧值会让 int() 失败，用户看到"填了东西却报校验错"
 dlg._action_rows[0].kind.setCurrentIndex(
@@ -1001,6 +1030,7 @@ ed_hub = A.AutomationDialog(service2, theme.LIGHT)
 row = ed_hub._action_rows[0]
 row.kind.setCurrentIndex(row.kind.findData("virtual_event"))
 check("无中枢网关：虚拟事件输入框禁用", not row.value_edit.isEnabled())
+check("无中枢网关：中枢下拉也禁用", not row.hub.isEnabled())
 check("无中枢网关：红字提示", row.hint.text() == "该家庭缺少中枢网关",
       row.hint.text())
 check("无中枢网关：保存被拦", ed_hub._save(quiet=True) is False)
@@ -1016,7 +1046,29 @@ row2 = ed_hub2._action_rows[0]
 row2.kind.setCurrentIndex(row2.kind.findData("virtual_event"))
 check("有中枢网关：虚拟事件输入框可用", row2.value_edit.isEnabled())
 check("有中枢网关：没有红字", row2.hint.text() == "", row2.hint.text())
+check("家庭内多台中枢全部列进下拉", row2.hub.count() == 2
+      and row2.hub.itemText(0) == "客厅中枢"
+      and "书房中枢（离线）" == row2.hub.itemText(1),
+      f"{row2.hub.count()} / {row2.hub.itemText(0)} / {row2.hub.itemText(1)}")
+check("默认落在第一台在线的中枢", row2._current_hub() == "hub-a", row2._current_hub())
+row2.hub.setCurrentIndex(row2.hub.findData("hub-b"))
+act_hub = row2.value()
+check("可切换到另一台中枢并写进 Action",
+      (act_hub.hub, act_hub.hub_name) == ("hub-b", "书房中枢"),
+      f"{act_hub.hub} / {act_hub.hub_name}")
+row2.hub.setCurrentIndex(row2.hub.findData("hub-a"))
+check("切回第一台也按选中的写", row2.value().hub == "hub-a")
 ed_hub2.close()
+
+# 旧动作存的中枢已经不在当前家庭：仍显示一条带标记的项，执行时由服务层报原因
+stale_row = A.ActionRow(Action("virtual_event", "A", hub="gone", hub_name="旧中枢"),
+                        theme.LIGHT, lambda: None, lambda *_: None, lambda *_: None,
+                        hubs=[("hub-a", "客厅中枢", True)])
+check("不在当前家庭的中枢仍能回显",
+      stale_row._current_hub() == "gone"
+      and "旧中枢（不在当前家庭）" in stale_row.hub.itemText(0),
+      stale_row.hub.itemText(0))
+stale_row.deleteLater()
 
 ed2 = A.AutomationDialog(service2, theme.LIGHT, saved.id)
 check("编辑既有规则回填名称", ed2.name_edit.text() == "测试播报")

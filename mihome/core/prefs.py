@@ -43,8 +43,8 @@ HIDDEN_ROOM = "已隐藏设备"
 #: 隐藏项的真正顺序走 ``self.hidden``，不落进 ``device_order``。
 HIDDEN_ROOM_ID = "__hidden__"
 
-#: 偏好文件版本。v11 起排序键从「家庭名 / 房间名」换成云端 ``home_id`` /
-#: ``room_id``；旧版顺序直接丢弃，用户重新排一次，不做名字到 id 的迁移。
+#: 偏好文件版本。当前结构：排序键一律是云端 ``home_id`` / ``room_id``。v11 改完这
+#: 一代后不再按版本分支读：本机文件已经规范成 v11，旧文件名 / 旧结构的分支全部删除。
 PREFS_VERSION = 11
 
 # 家庭切换栏的两种排列方式：
@@ -69,8 +69,6 @@ CAMERA_NETWORK_DEFAULT = "lan_first"
 # 摄像头声音**不进偏好文件**（2026-11-10 用户实测后定）：每次开一路新的播放都从
 # 静音开始，只在这一次观看里由用户决定要不要出声。理由与实现见
 # ``core/camera_view.py`` 顶部"静音不跨会话保留"。
-#: 旧版只有 "lan_first"/"remote" 两档，读到 "remote" 按「仅远程」处理
-CAMERA_NETWORK_ALIASES = {"remote": "remote_only"}
 
 #: 点关闭按钮时收进托盘（而不是退出）。默认开：不这样的话"看一眼设备"每次都要
 #: 重新启动、重新读凭据、重新拉设备列表。托盘不可用的环境会自动退回退出。
@@ -116,27 +114,14 @@ def _card_style_map(value: Any) -> dict[str, str]:
 
     存的是**稀疏**字典：只有显式改过样式的设备才留一条，选回 ``standard``
     就删记录。这样以后调默认外观，没手动设过的卡片会自动跟上。
-
-    v3 里一条记录是 ``{"span": 1|2, "template": "..."}``。大小与模板合并后
-    ``span`` 作废（宽度由样式自带），``template`` 直接当样式 id 沿用；原来的
-    「2×1 + 标准」在新版没有对应样式，退回默认 1×1 小卡——那种组合本来就
-    只是一张更宽的空卡。
     """
     if not isinstance(value, dict):
         return {}
     sid = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
     out: dict[str, str] = {}
-    for did, raw in value.items():
+    for did, candidate in value.items():
         key = str(did)
         if not key:
-            continue
-        # v4：直接就是样式 id
-        if isinstance(raw, str):
-            candidate = raw
-        # v3：{"span": ..., "template": ...}，只认 template
-        elif isinstance(raw, dict):
-            candidate = raw.get("template")
-        else:
             continue
         if isinstance(candidate, str) and sid.match(candidate) \
                 and candidate != CARD_STYLE_DEFAULT:
@@ -195,19 +180,12 @@ class Prefs:
             return
         if not isinstance(data, dict):
             return
-        # 排序键在 v11 从名字换成了云端 id。旧版的四份顺序直接丢弃：不做
-        # 名字→id 映射，也不留兼容分支；用户接受重新排一次。按 did 存的数据
-        # （hidden / card_styles / speaker_command_did）照常保留。
-        self.home_order = []
-        self.room_order = {}
-        self.device_order = {}
-        self.scene_order = {}
-        version = data.get("version")
-        if isinstance(version, int) and version >= PREFS_VERSION:
-            self.home_order = _str_list(data.get("home_order"))
-            self.room_order = _order_map(data.get("room_order"))
-            self.device_order = _order_map(data.get("device_order"))
-            self.scene_order = _order_map(data.get("scene_order"))
+        # 排序键一律是云端 id（本机文件已规范到当前结构，不再按版本分支读）。
+        # 按 did 存的数据（hidden / card_styles / speaker_command_did）照常保留。
+        self.home_order = _str_list(data.get("home_order"))
+        self.room_order = _order_map(data.get("room_order"))
+        self.device_order = _order_map(data.get("device_order"))
+        self.scene_order = _order_map(data.get("scene_order"))
         self.hidden = _str_list(data.get("hidden"))
         # 隐藏设备的 did 可能还留在顺序表里。读入时顺手清掉，
         # 让「顺序表 = 可见设备」从启动那一刻起就成立。
@@ -223,7 +201,6 @@ class Prefs:
         # 一开就收起——那是用户看不到自己的设备，比"没记住"糟得多。
         self.hidden_collapsed = data.get("hidden_collapsed") is True
         network = str(data.get("camera_network") or "")
-        network = CAMERA_NETWORK_ALIASES.get(network, network)
         if network in CAMERA_NETWORKS:
             self.camera_network = network
         self.speaker_command_did = str(data.get("speaker_command_did") or "")

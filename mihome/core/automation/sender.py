@@ -86,8 +86,9 @@ class VirtualEventSender:
     def resolve(self) -> tuple[Target | None, str]:
         """在主线程调用：挑一台能发虚拟事件的**在线**中枢。
 
-        找不到时给中文原因，让界面显示而不是抛异常。绝不退回「写死 siid 4 / aiid 1」：
-        那样固件一变就会静默发到错误的服务上。
+        只给 ``Action.hub`` 为空的旧规则兜底：新规则都按界面选中的中枢走
+        :meth:`resolve_did`。绝不退回「写死 siid 4 / aiid 1」：那样固件一变就会
+        静默发到错误的服务上。
         """
         found: list[Target] = []
         for st in self._states_getter():
@@ -102,6 +103,23 @@ class VirtualEventSender:
         if not chosen.online:
             return None, f"中枢网关「{chosen.label}」当前离线"
         return chosen, ""
+
+    def resolve_did(self, did: str) -> tuple[Target | None, str]:
+        """按规则里存的中枢 did 解析坐标——**多中枢时只认用户选的那台**。
+
+        找不到 / 离线都给一句中文原因。spec 还没加载完时也走"找不到"这一支，
+        让日志写明原因，而不是偷换去另一台中枢。
+        """
+        if not did:
+            return None, "这条动作还没有选中枢网关"
+        for st in self._states_getter():
+            target = target_for(st)
+            if target is None or target.did != did:
+                continue
+            if not target.online:
+                return None, f"中枢网关「{target.label}」当前离线"
+            return target, ""
+        return None, f"找不到中枢网关「{did}」（可能已从家庭移除，或设备规格还没加载完）"
 
     def call(self, target: Target, name: str) -> tuple[bool, str]:
         """**同步**调用云端，跑在 SerialWorker 线程里。返回 ``(成功?, 中文说明)``。"""
