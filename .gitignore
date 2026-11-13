@@ -25,3 +25,5 @@ MiHome-Windows-0.5.0/
 # 打包产物（PyInstaller / Nuitka）
 build/
 dist/
+# 自建 go2rtc 的发布产物（exe / BUILD.txt / LICENSE / Release 附件）
+dist-go2rtc/

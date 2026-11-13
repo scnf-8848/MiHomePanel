@@ -147,11 +147,36 @@ def _flatten_go(cache: Path) -> Path:
     return go
 
 
+def find_git() -> str | None:
+    """找 git：PATH → GitHub Desktop 自带的那个。
+
+    GitHub Desktop 的 git 不写系统 PATH，但装过它的机器通常没另装 Git for Windows；
+    按版本目录倒序取最新的 app-*，路径和 GitHub Desktop 自己的用法一致。
+    """
+    found = shutil.which("git")
+    if found:
+        return found
+    desktop = Path(os.environ.get("LOCALAPPDATA", "")) / "GitHubDesktop"
+    if desktop.is_dir():
+        candidates = sorted(
+            desktop.glob("app-*/resources/app/git/cmd/git.exe"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        for candidate in candidates:
+            if candidate.is_file():
+                return str(candidate)
+    return None
+
+
 def apply_patch(src: Path) -> None:
     """依次用 git apply 打补丁，再逐个核对补丁点确实生效。"""
-    git = shutil.which("git")
+    git = find_git()
     if git is None:
-        raise SystemExit("没找到 git：打补丁需要它（或按 patch 文件手工改）")
+        raise SystemExit(
+            "没找到 git：打补丁需要它。装 Git for Windows（或 GitHub Desktop），"
+            "或按 patch 文件手工改"
+        )
     for patch in PATCHES:
         log(f"打补丁 {patch.name}…")
         proc = subprocess.run(
@@ -178,7 +203,8 @@ def apply_patch(src: Path) -> None:
 def build(src: Path, go: Path, out: Path) -> None:
     log("编译中（首次要下模块依赖，约 1 分钟）…")
     env = dict(os.environ)
-    env.update({"GOPROXY": GOPROXY, "GOSUMDB": "off", "GOFLAGS": "-mod=mod"})
+    env.update({"CGO_ENABLED": "0", "GOPROXY": GOPROXY, "GOSUMDB": "off",
+                "GOFLAGS": "-mod=mod"})
     proc = subprocess.run(
         [str(go), "build", "-trimpath", "-ldflags=-s -w", "-o", str(out), "."],
         cwd=src,
