@@ -1973,6 +1973,38 @@ padding / tooltip / 边界箭头仍可点、切类型重置、三段徽章与竖
 11-13 早先 `probe_automations.py emit "极客版按键自动化执行"` 打通并听到音箱播报，
 验的是云端能力；新页面这条链路要走真机需单独授权，建议用随机事件名避免命中真实自动化。
 
+## 开发环境与依赖
+
+开发和发布都用 Python 3.13，依赖只有 `requirements.txt` 里的四个包：
+
+| 包 | 版本 | 用途 |
+|---|---|---|
+| mijiaAPI | >=5.0,<6 | 云端签名、加解密、token 刷新（GPL-3.0，决定本项目也是 GPL-3.0） |
+| PySide6 | >=6.7 | 整个界面 |
+| qrcode / pillow | >=7.4 / >=10 | 扫码登录的二维码渲染与图片处理 |
+
+## 本地数据与凭据路径
+
+程序数据默认在 `%LOCALAPPDATA%\MiHomePanel\`（macOS 是
+`~/Library/Application Support/MiHomePanel/`，Linux 是 `$XDG_DATA_HOME/MiHomePanel/`
+或 `~/.local/share/MiHomePanel/`），可用 `MIHOME_DATA_DIR` 整体改掉。
+
+| 路径 | 内容 |
+|---|---|
+| `prefs.json` | 排序、隐藏、卡片样式、主题、摄像头通道等偏好 |
+| `cache/spec/` | MIoT-Spec 原始规格缓存，离线时也能画出控件 |
+| `cache/icons/` | 产品图缓存 |
+| `cache/devices.json` | 设备列表快照，首屏秒开用 |
+| `cache/capabilities.json` | 能力学习账本：确认不支持的属性记下来，之后跳过不再重试 |
+| `logs/` | 自检、崩溃、轮询健康日志；摄像头计时默认不写 |
+| `go2rtc/` | 可选取流组件、`BUILD.txt`、许可证与运行日志 |
+
+登录凭据**不在**数据目录的常规路径里：`Client.auth_path` 优先使用上游
+`mijiaAPI.auth_data_path`，默认是 `Path.home() / ".config" / "mijia-api" / "auth.json"`；
+Windows 上即 `C:\Users\<用户名>\.config\mijia-api\auth.json`。这是 mijiaAPI 的约定，
+和程序安装目录无关，也不随安装包分发。`paths.auth_file()`（`<data>/auth.json`）只是
+拿不到上游路径时的兜底，正常扫码登录不会写那里。
+
 ## 单实例：再点一次图标只把窗口叫到前台
 
 同一份数据目录只允许一个进程。第二个进程**不启动界面、不连云端**，只广播一句
