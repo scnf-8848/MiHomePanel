@@ -271,8 +271,9 @@ def _ui_checks() -> None:
     check("建设置窗口时不闪多余的顶层小窗", spy.hits == [], "、".join(spy.hits[:8]))
     try:
         titles = [dlg.nav.item(i).text() for i in range(dlg.nav.count())]
-        check("设置页有五个分类", dlg.nav.count() == 5, str(titles))
-        check("最后一个分类是「常规」", titles[-1] == "常规", str(titles))
+        check("设置页有六个分类", dlg.nav.count() == 6, str(titles))
+        check("第五个分类是「常规」", titles[4] == "常规", str(titles))
+        check("最后一个分类是「关于」", titles[-1] == "关于", str(titles))
 
         dlg.nav.setCurrentRow(4)
         check("导航切到常规页", dlg.pages.currentIndex() == 4, str(dlg.pages.currentIndex()))

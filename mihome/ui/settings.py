@@ -40,6 +40,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+from .. import __version__
 from ..core import autostart
 from ..core.prefs import CAMERA_NETWORKS
 from ..core.store import Store
@@ -287,7 +288,7 @@ class SettingsDialog(QDialog):
         self.nav.setObjectName("SettingsNav")
         self.nav.setFrameShape(QFrame.NoFrame)
         self.nav.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        for text in ("外观", "排序", "隐藏", "账号", "常规"):
+        for text in ("外观", "排序", "隐藏", "账号", "常规", "关于"):
             self.nav.addItem(QListWidgetItem(text))
 
         # 分类栏单独一块圆角底（``theme.rail_bg``）。不直接给 QListWidget 上底色：
@@ -312,6 +313,7 @@ class SettingsDialog(QDialog):
         self.pages.addWidget(self._build_hidden())
         self.pages.addWidget(self._build_account())
         self.pages.addWidget(self._build_general())
+        self.pages.addWidget(self._build_about())
 
         self.nav.currentRowChanged.connect(self.pages.setCurrentIndex)
         self.nav.setCurrentRow(0)
@@ -901,6 +903,57 @@ class SettingsDialog(QDialog):
         self.row_tray = close.add_row("最小化到托盘，不退出程序", self.rb_tray)
         col.addWidget(close)
 
+        col.addStretch(1)
+        return page
+
+    # -- 关于 ------------------------------------------------------------
+    @staticmethod
+    def _about_text(text: str, *, soft: bool = True) -> QLabel:
+        """关于页的只读值：可选中复制，长 URL 自动换行。"""
+        lab = QLabel(text)
+        lab.setObjectName("RowValueSoft" if soft else "RowValue")
+        lab.setWordWrap(True)
+        lab.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        return lab
+
+    def _build_about(self) -> QWidget:
+        page, col = self._page()
+        self._page_head(col, "关于", "版本、许可与第三方组件；遇到问题欢迎到 GitHub 反馈。")
+
+        self._section(col, "程序")
+        card = SettingsCard()
+        card.add_row("版本", self._about_text(
+            f"米家控制台（MiHomePanel） v{__version__}", soft=False))
+        card.add_row("许可", self._about_text("GPL-3.0-or-later"),
+                     sub="完整条款见程序目录的 LICENSE")
+        card.add_row("源码与反馈", self._about_text(
+            "源码：https://github.com/scnf-8848/MiHomePanel\n"
+            "反馈：https://github.com/scnf-8848/MiHomePanel/issues"))
+        col.addWidget(card)
+
+        col.addSpacing(8)
+        self._section(col, "第三方组件")
+        third = SettingsCard()
+        third.add_row(
+            "go2rtc", self._about_text("MIT · 本地补丁版"),
+            sub="首帧优化与云台补丁；组件发布："
+                "https://github.com/scnf-8848/MiHomePanel/releases/tag/go2rtc-990f4de",
+        )
+        third.add_row("mijiaAPI", self._about_text("GPL-3.0-or-later"),
+                      sub="云端登录、签名与设备接口")
+        col.addWidget(third)
+
+        col.addSpacing(8)
+        self._section(col, "致谢")
+        note = QLabel(
+            "感谢 AlexxIT/go2rtc、Do1e/mijia-api、Google Material Icons"
+            "（Apache-2.0），以及 Reign9201/mihome-mac、Songmanual/MijiaDeck"
+            " 等项目的公开资料。"
+        )
+        note.setObjectName("PageHint")
+        note.setWordWrap(True)
+        note.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        col.addWidget(note)
         col.addStretch(1)
         return page
 

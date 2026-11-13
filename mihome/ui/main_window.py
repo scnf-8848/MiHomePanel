@@ -40,6 +40,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .. import __version__
 from ..core import speaker
 from ..core.alerts import Alert, AlertPolicy
 from ..core.api import Client, explain
@@ -215,7 +216,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.palette_ref = palette or theme.LIGHT
         self.prefs = Prefs()
-        self.setWindowTitle("米家控制台")
+        self.setWindowTitle(f"米家控制台 v{__version__}")
         self.resize(1200, 800)
         self.setMinimumSize(920, 600)
 

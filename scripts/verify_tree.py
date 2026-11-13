@@ -704,8 +704,9 @@ def section_panels() -> None:
         store, dlg = fresh(pal)
 
         heads = [lab.text() for lab in dlg.findChildren(QLabel, "PageTitle")]
-        check(f"{pal.name}：五页都有大标题",
-              sorted(heads) == sorted(["外观", "排序", "隐藏", "账号", "常规"]), "、".join(heads))
+        check(f"{pal.name}：六页都有大标题",
+              sorted(heads) == sorted(["外观", "排序", "隐藏", "账号", "常规", "关于"]),
+              "、".join(heads))
 
         # -- 结构：每页的卡片 --------------------------------
         def cards_of(index: int) -> list:
@@ -791,9 +792,9 @@ def section_panels() -> None:
         check(f"{pal.name}：值铺满到行尾", dlg.lbl_path.width() >= 200,
               f"{dlg.lbl_path.width()} px")
 
-        # 窗口拉到最小时，五页内容都不能被裁（外观页最高，最小高度就是按它定的）
+        # 窗口拉到最小时，六页内容都不能被裁（外观页最高，最小高度就是按它定的）
         dlg.resize(dlg.minimumSize())
-        for index, name in enumerate(("外观", "排序", "隐藏", "账号", "常规")):
+        for index, name in enumerate(("外观", "排序", "隐藏", "账号", "常规", "关于")):
             show_page(index)
             page = dlg.pages.widget(index)
             need = page.layout().minimumSize().height()
