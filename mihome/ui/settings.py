@@ -4,19 +4,20 @@
 排版照 QQ 设置那套骨架（``ui/settings_rows.py``）：**一行分区标题 + 下面一张圆角卡**，
 卡里一行行控件用 1px 线分开。四个页面共用同一个骨架，换页面时视线不用重新找位置。
 
-排序没有做"在首页直接拖动"——首页卡片还兼着开关和进详情的点击，拖拽手势和点击
-会互相打架；房间、场景、隐藏设备又是三类不同的东西，全塞进首页会把它变成编辑
-模式。所以集中到这个窗口：左边四个分类，右边一页一类。
+设备顺序在首页直接拖动卡片调整（拖拽手势与点击已经分开）；设置页不再重复提供
+设备层。家庭、房间、快捷场景的顺序和"恢复默认"只有这里能改，所以保留一页专门做
+这件事：左边四个分类，右边一页一类。
 
 分类栏单独铺一块圆角底（``theme.rail_bg``）。主界面侧栏那一套 ``NAV_BG`` 不能
 直接搬过来：那两档是照 ``pal.bg`` 定的，而设置窗口的内容区是 ``surface_bg``
 （比主界面亮/暗一档），搬过来浅色只差 3、深色只差 2 个明度档，栏和内容区又糊成
 一片。``rail_bg`` 只相对 ``surface_bg`` 推一档，方向仍随主题。
 
-排序和隐藏都用**树**（``ui/tree.py``）：设备天然是"家庭 → 房间 → 设备"三层，
+排序和隐藏都用**树**（``ui/tree.py``）：隐藏页仍是"家庭 → 房间 → 设备"三层，
 平铺时必须先选家庭、再选房间，才看得到一小截设备。树把三层摊开，一次看全，
-每层都能折起来；拖动只在同一层内生效——把一台设备拖进别的房间属于"改设备归属"，
-那是米家 App 的事，我们只负责顺序。
+每层都能折起来；拖动只在同一层内生效——把设备拖进别的房间属于"改设备归属"，
+那是米家 App 的事，我们只负责顺序。排序页则缩窄成"家庭 → 房间"加场景两棵树：
+设备顺序由首页拖动负责，这里不再渲染第三层。
 
 窗口本身也是无边框的，标题栏和主窗口同一套实现（只是少了最大化按钮）。
 """
@@ -343,7 +344,7 @@ class SettingsDialog(QDialog):
         for cls in (RadioDot, ToggleSwitch):
             for widget in self.findChildren(cls):
                 widget.set_palette(palette)
-        for tree in (self.tree_devices, self.tree_scenes, self.tree_hidden):
+        for tree in (self.tree_rooms, self.tree_scenes, self.tree_hidden):
             tree.set_palette(palette)
         preview = getattr(self, "preview", None)
         if preview is not None:
@@ -535,22 +536,26 @@ class SettingsDialog(QDialog):
     # -- 排序 ------------------------------------------------------------
     def _build_order(self) -> QWidget:
         page, col = self._page()
-        self._page_head(col, "排序",
-                        "点左侧折角展开 / 收起。拖动只在这一层内生效（设备不会因为拖动换房间）。"
-                        "松手立即生效，没排过的新设备 / 新房间会自动排在末尾。")
+        self._page_head(
+            col, "排序",
+            "点左侧折角展开 / 收起。这里排家庭、房间和快捷场景；设备顺序在首页"
+            "直接拖动卡片调整。拖动只在同一层内生效，松手立即生效，没排过的"
+            "新家庭 / 新房间 / 新场景自动排在末尾。「恢复默认」连同各房间的设备"
+            "顺序一起清空。",
+        )
 
-        self.tree_devices = ReorderTree(self._p, mode="order")
-        self.tree_devices.moved.connect(self._commit_device_tree)
+        self.tree_rooms = ReorderTree(self._p, mode="order")
+        self.tree_rooms.moved.connect(self._commit_room_tree)
         self.tree_scenes = ReorderTree(self._p, mode="order")
         self.tree_scenes.moved.connect(self._commit_scene_tree)
 
-        # 两棵树的高度让用户自己调：设备多的人把上面拉大，场景多的人反过来。
+        # 两棵树的高度让用户自己调：家庭 / 房间多的人把上面拉大，场景多的人反过来。
         # 分隔条留 14：两块各自是圆角卡，紧贴在一起会读成"一块被切开"
         split = QSplitter(Qt.Vertical)
         split.setChildrenCollapsible(False)
         split.setHandleWidth(14)
-        split.addWidget(self._tree_section("家庭 → 房间 → 设备", self.tree_devices,
-                                           "恢复默认", self._reset_devices)[0])
+        split.addWidget(self._tree_section("家庭 → 房间", self.tree_rooms,
+                                           "恢复默认", self._reset_layout)[0])
         split.addWidget(self._tree_section("家庭 → 快捷场景", self.tree_scenes,
                                            "恢复默认", self._reset_scenes)[0])
         split.setSizes([420, 200])
@@ -578,35 +583,29 @@ class SettingsDialog(QDialog):
     def _fill_order_trees(self) -> None:
         # 第一次填（树还是空的）才全部展开；之后一律照用户折成的样子还原，
         # 包括"全折起来"——否则在隐藏页点一下开关，这里会自己撑开
-        first_dev = self.tree_devices.topLevelItemCount() == 0
+        first_rooms = self.tree_rooms.topLevelItemCount() == 0
         first_scene = self.tree_scenes.topLevelItemCount() == 0
-        keep_dev = self.tree_devices.expanded_keys()
+        keep_rooms = self.tree_rooms.expanded_keys()
         keep_scene = self.tree_scenes.expanded_keys()
-        self.tree_devices.clear()
+        self.tree_rooms.clear()
         self.tree_scenes.clear()
 
         for home in self.store.homes():
-            h_item = self.tree_devices.add_row(
+            h_item = self.tree_rooms.add_row(
                 None, home.display_name, {"kind": "home", "key": home.name}
             )
-            rooms = self.store.room_names(home.name)
-            for room in rooms:
-                # 已隐藏设备不参与排序：这里**彻底不渲染**。顺序表的含义是
-                # 「可见设备的顺序」，隐藏项不在表里，所以也没有"排在末尾"。
+            for room in self.store.room_names(home.name):
+                # 台数只数可见设备：顺序表的含义是「可见设备的顺序」，
+                # 隐藏项不在表里，也不该算进这个数字里。
                 states = [
                     st for st in self.store.device_states(home.name, room)
                     if not self.store.prefs.is_hidden(st.did)
                 ]
-                r_item = self.tree_devices.add_row(
+                self.tree_rooms.add_row(
                     h_item, room,
                     {"kind": "room", "home": home.name, "room": room},
                     suffix=f"{len(states)} 台",
                 )
-                for st in states:
-                    self.tree_devices.add_row(
-                        r_item, st.name,
-                        {"kind": "device", "home": home.name, "room": room, "id": st.did},
-                    )
 
             s_item = self.tree_scenes.add_row(
                 None, home.display_name, {"kind": "home", "key": home.name}
@@ -626,7 +625,7 @@ class SettingsDialog(QDialog):
                     s_item, name, {"kind": "scene", "home": home.name, "id": sid}, suffix=suffix
                 )
 
-        self.tree_devices.restore_expanded(None if first_dev else keep_dev)
+        self.tree_rooms.restore_expanded(None if first_rooms else keep_rooms)
         self.tree_scenes.restore_expanded(None if first_scene else keep_scene)
 
     # -- 隐藏 ------------------------------------------------------------
@@ -978,29 +977,22 @@ class SettingsDialog(QDialog):
 
         return dict(item.data(0, ROLE_DATA) or {})
 
-    def _commit_device_tree(self) -> None:
+    def _commit_room_tree(self) -> None:
         if self._loading:
             return
-        tree = self.tree_devices
+        tree = self.tree_rooms
         homes: list[str] = []
         rooms: dict[str, list[str]] = {}
-        devices: dict[tuple[str, str], list[str]] = {}
         for i in range(tree.topLevelItemCount()):
             h = tree.topLevelItem(i)
             home = str(self._row_data(h).get("key") or "")
             if not home:
                 continue
             homes.append(home)
-            rooms[home] = []
-            for j in range(h.childCount()):
-                r = h.child(j)
-                room = str(self._row_data(r).get("room") or "")
-                rooms[home].append(room)
-                devices[(home, room)] = [
-                    str(self._row_data(r.child(k)).get("id") or "")
-                    for k in range(r.childCount())
-                ]
-        self.store.apply_order_snapshot(homes=homes, rooms=rooms, devices=devices)
+            rooms[home] = [
+                str(self._row_data(h.child(j)).get("room") or "") for j in range(h.childCount())
+            ]
+        self.store.apply_order_snapshot(homes=homes, rooms=rooms)
 
     def _commit_scene_tree(self) -> None:
         if self._loading:
@@ -1018,7 +1010,12 @@ class SettingsDialog(QDialog):
         self.store.apply_order_snapshot(scenes=scenes)
 
     # -- 重置 ------------------------------------------------------------
-    def _reset_devices(self) -> None:
+    def _reset_layout(self) -> None:
+        """恢复家庭 / 房间顺序，并清空各房间的设备顺序。
+
+        设备层已经不在排序页上了，但"恢复默认"仍要能清掉设备顺序——否则用户把
+        某个房间排乱之后没有回到默认的入口。按房间逐个清，与改版前同一口径。
+        """
         for home in self.store.home_names():
             self.store.prefs.reset_rooms(home)
             for room in self.store.room_names(home):

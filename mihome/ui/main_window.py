@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import time
+from typing import Any
 
 from PySide6.QtCore import (
     QByteArray,
@@ -65,19 +66,30 @@ POLL_MS = 3000
 #: 15 秒是比较出来的折中——再降（30/60 秒）每小时只少几十次请求，但"从托盘点开"
 #: 的第一眼更容易看到旧值（点开会立刻补一轮，可那一轮也得几百毫秒才回来）。
 POLL_HIDDEN_MS = 15_000
-#: 刚发过指令的那几秒，把轮询加到多快、维持多久。
+#: 写入确认：写请求**回包成功**之后，等 mute 到期再多等一会儿，然后对这台设备
+#: 定向读卡片属性，直到读到的值和写进去的一致。
 #:
-#: 为什么需要这一档：写入是乐观的——按下开关的瞬间屏幕上就是新值，可那是**我们
-#: 自己写的**，不是设备回读的。设备到底照做了没有，只有下一轮回读才知道。3 秒
-#: 一轮意味着"按了没反应"要等 3 秒才看得见，托盘里甚至要等 15 秒。
-#:
-#: 代价是可控的：0.5 秒 × 5 秒 = 最多 10 轮，而一轮就是一个批量包（≤300 个属性，
-#: 见 ``api.DEFAULT_CHUNK``）。连续点几下不叠加——窗口是"最后一次操作之后 5 秒"。
-#: 对比一下：OpenMexia 是每台设备每 5 秒一条，48 台就是 576 条/分钟，我们这 10 条
-#: 连它的零头都不算（见 ``docs/reference/openmexia-notes.md`` 第 8 节）。
-BURST_MS = 500
-BURST_HOLD_MS = 5000
+#: 为什么不能更早：写入是乐观的（按下开关的瞬间屏幕上就是新值），而云端快照在
+#: 回包后还会滞后一段（«强» 与 «客厅» 实测：Mesh 灯 0.26 秒、Wi-Fi 灯中位 0.65 秒、
+#: P90 2.5 秒、最慢 4.05 秒），并且 ``Client`` 自己还有 ``DEFAULT_MUTE`` 的静默期，
+#: 静默期内该属性根本不会出现在读请求里。所以在 mute 到期前读是纯浪费。
+CONFIRM_DELAY_MS = 200  # mute 到期后再等这么久，避开边界
+CONFIRM_INTERVAL_MS = 500  # 之后每 0.5 秒读一次
+CONFIRM_MAX_TRIES = 5  # 最多 5 次（mute 3s + 0.2s 起，覆盖到约 5.2 秒）
+CONFIRM_MAX_DEVICES = 4  # 同时跟踪的设备数；超出丢弃最早的那台
+#: 设备动作没有目标值、也没有 mute 条目：实测"回包→云端新值"P50 0.65 秒、
+#: P90 2.5 秒，所以从 1.0 秒起读，5 次跑到 3.0 秒，能覆盖大部分动作。
+CONFIRM_ACTION_DELAY_MS = 1000
+#: 没有目标设备的写（场景、音箱指令）改动的设备说不准，只能按几个时点做**全量读**：
+#: 回包后约 1 / 2.5 / 4 秒各一次（相对回包计时，不随读取耗时漂移）。
+#: 判据：**不做早停**，三个时点固定跑满——签名覆盖全部设备，烤箱腔体温度、温湿度、
+#: PM2.5、人体存在都在持续上报，"有变化"必然为真，早停会退化成 1 秒后就结束。
+CONFIRM_FULL_AT_MS = (1000, 2500, 4000)
 TOPOLOGY_MS = 5 * 60 * 1000  # 设备列表低频刷新：新增设备不用手动点刷新
+#: 在线状态的刷新节奏。它挂在既有的轮询 tick 上（不另起定时器），但**不跟 3 秒**：
+#: 设备清单是唯一能拿到上下线的接口，按家庭逐个请求，比一轮属性读贵得多。
+#: 这里沿用现有的降频档（与托盘同一个 15 秒），掉线 / 回线最多晚 15 秒可见。
+ONLINE_MS = POLL_HIDDEN_MS
 
 #: 顶部那条横带的边距（左 / 上 / 右）。指令条按这三个值摆，警告条浮层也按它
 #: 定位——两者叠在一起时轮廓必须重合。左右取 28 而不是 24：``WallView`` 的内容
@@ -365,17 +377,27 @@ class MainWindow(QMainWindow):
         self.poll_demand.set("window", POLL_MS, "窗口可见")
         self._poll_timer.start(POLL_MS)
 
-        # 指令后的高频窗口。写请求一发出去就登记一条最严的需求，``BURST_HOLD_MS``
-        # 之后撤掉——窗口靠"最后一次操作"顺延（``start`` 会重置），连续点几下不会
-        # 叠加成十几秒。撤掉之后 ``poll_demand`` 自动回到窗口/托盘的常态间隔。
-        self._burst_timer = QTimer(self)
-        self._burst_timer.setSingleShot(True)
-        self._burst_timer.timeout.connect(self._end_burst)
-        self.store.on_write_sent = self._start_burst
+        # 写入确认：每台正在跟踪的设备一个单次定时器（最多 CONFIRM_MAX_DEVICES 台）。
+        # 不用一条高频全局轮询去盯所有设备——那样代价是"每次点击都多打 6 个批量包"，
+        # 而真正需要确认的只有刚写的那台。
+        self._confirm_timers: dict[str, QTimer] = {}
+        self._confirm_plans: dict[str, dict[str, Any]] = {}
+        self.store.on_write_done = self._start_confirm
+        # 场景 / 音箱指令：只留一条短序列（新指令重置它，不叠加）
+        self._cmd_timer = QTimer(self)
+        self._cmd_timer.setSingleShot(True)
+        self._cmd_timer.timeout.connect(self._command_confirm_tick)
+        self._cmd_start = 0.0
+        self._cmd_step = 0
+        self.store.on_command_done = self._start_command_confirm
 
         self._topo_timer = QTimer(self)
         self._topo_timer.timeout.connect(self._refresh_topology)
         self._topo_timer.start(TOPOLOGY_MS)
+
+        #: 上一次发在线状态刷新请求的时刻（``time.monotonic``）。在线状态跟着
+        #: 轮询 tick 走，但节流到 ``ONLINE_MS``；不单独起 QTimer。
+        self._online_at = 0.0
 
         self._shortcuts = []
         for seq, slot in (
@@ -699,6 +721,12 @@ class MainWindow(QMainWindow):
     def _poll(self) -> None:
         if not self.store.loading and self.store.devices:
             self.store.poll()
+            # 在线状态只有设备清单能给（属性轮询对离线设备照样回 code=0），
+            # 挂在这个 tick 上、按 ONLINE_MS 节流，不另起定时器。
+            now = time.monotonic()
+            if now - self._online_at >= ONLINE_MS / 1000:
+                self._online_at = now
+                self.store.refresh_online()
 
     def _apply_poll_mode(self) -> None:
         """按"看不看得见"登记属性轮询的需求，回到前台时立刻补一轮。
@@ -721,28 +749,137 @@ class MainWindow(QMainWindow):
         if active:
             self._poll()
 
-    def _start_burst(self) -> None:
-        """刚发出一条写指令：接下来 ``BURST_HOLD_MS`` 按 ``BURST_MS`` 轮询。
+    def _start_confirm(
+        self,
+        did: str,
+        expected: dict[tuple[int, int], Any],
+        mute: float | None,
+    ) -> None:
+        """写请求回包成功：安排这台设备的定向回读。
 
-        只在**需求表**里多挂一条 ``burst``，不动 ``window`` 那条：窗口该是 3 秒
-        还是 15 秒由"看不看得见"决定，突发只是临时压在它上面的一档。撤掉之后
-        自然回到原来的档，不用在这里记住"刚才是什么间隔"。
-
-        失败也一样要快：写回包失败时 ``Store._on_written`` 会把乐观值还原并写
-        ``st.error``，界面立刻能看到"已还原"；随后这几轮高频回读是为了拿到设备
-        的**真实**状态——比如批量里成功了一半的情况，只看回包码是说不清的。
+        同一台设备连续写只保留一个确认序列、重新计时，期望值按 key 合并（后写的
+        覆盖先写的）；跟踪的设备超过 ``CONFIRM_MAX_DEVICES`` 时丢弃最早的那台。
+        ``mute is None`` 表示这是设备动作（没有静默期，也没有目标值）。
         """
-        timer = getattr(self, "_burst_timer", None)
-        if timer is None:  # 构造期间就有写请求（例如自动登录后立刻补一轮）
-            return
-        self.poll_demand.set("burst", BURST_MS, "刚发过指令")
-        timer.start(BURST_HOLD_MS)
+        plan = self._confirm_plans.get(did)
+        if plan is None:
+            while len(self._confirm_plans) >= CONFIRM_MAX_DEVICES:
+                self._drop_confirm(next(iter(self._confirm_plans)))
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.timeout.connect(lambda d=did: self._confirm_tick(d))
+            self._confirm_timers[did] = timer
+            plan = {"expected": {}}
+            self._confirm_plans[did] = plan
+        plan["expected"].update(expected)
+        plan["left"] = CONFIRM_MAX_TRIES
+        delay = (
+            CONFIRM_ACTION_DELAY_MS
+            if mute is None
+            else int(mute * 1000) + CONFIRM_DELAY_MS
+        )
+        self._confirm_timers[did].start(delay)
 
-    def _end_burst(self) -> None:
-        """窗口结束：撤掉那条需求，``poll_demand`` 会自己回到常态间隔。"""
-        board = getattr(self, "poll_demand", None)
-        if board is not None:
-            board.clear("burst")
+    def _confirm_tick(self, did: str) -> None:
+        """到点：读一次这台设备的卡片属性；**最后一次改成全量读**。"""
+        plan = self._confirm_plans.get(did)
+        if plan is None:
+            return
+        if plan["left"] <= 1:
+            # 最后一轮顺手覆盖联动改到的其它设备（开关 → 场景 / 自动化）
+            self.store.confirm_full(
+                lambda res, err: self._on_confirm_tail(did, res, err)
+            )
+            return
+        refs = self.store.card_refs(did)
+        if not refs:  # 离线 / 卡片没属性：没什么可确认的，直接收工
+            self._drop_confirm(did)
+            return
+        self.store.confirm_read(
+            did, refs, lambda res, err: self._on_confirm_read(did, res, err)
+        )
+
+    def _on_confirm_tail(
+        self,
+        did: str,
+        res: dict[Any, Any] | None,
+        err: BaseException | None,
+    ) -> None:
+        """最后一轮（全量读）的结果：无论是否命中，这个序列都到此为止。"""
+        plan = self._confirm_plans.get(did)
+        if plan is None:
+            return
+        if err is not None:
+            print(f"[confirm] {did} 全量确认失败：{err}")
+        self._drop_confirm(did)
+
+    def _on_confirm_read(
+        self,
+        did: str,
+        res: dict[Any, Any] | None,
+        err: BaseException | None,
+    ) -> None:
+        plan = self._confirm_plans.get(did)
+        if plan is None:
+            return
+        if res is None:
+            # 确认读失败不进退避账本，只留一行日志，下一次照常重试
+            print(f"[confirm] {did} 回读失败：{err}")
+        else:
+            expected = plan["expected"]
+            got = {
+                (ref.siid, ref.piid): rv.value
+                for ref, rv in res.items()
+                if getattr(rv, "ok", False)
+            }
+            if expected and all(
+                key in got and got[key] == value for key, value in expected.items()
+            ):
+                self._drop_confirm(did)
+                return
+        plan["left"] -= 1
+        if plan["left"] <= 0:
+            self._drop_confirm(did)
+            return
+        self._confirm_timers[did].start(CONFIRM_INTERVAL_MS)
+
+    def _drop_confirm(self, did: str) -> None:
+        self._confirm_plans.pop(did, None)
+        timer = self._confirm_timers.pop(did, None)
+        if timer is not None:
+            timer.stop()
+            timer.deleteLater()
+
+    def _start_command_confirm(self) -> None:
+        """场景 / 音箱指令回包：起一条 1 / 2.5 / 4 秒的全量读序列。
+
+        新指令直接重置这一条（不叠加）。它只是一串一次性 job：**不碰
+        ``_poll_timer``**——不改间隔、不重置相位、也不取消它，所以 3 秒轮询照旧。
+        """
+        self._cmd_start = time.monotonic()
+        self._cmd_step = 0
+        self._cmd_timer.start(CONFIRM_FULL_AT_MS[0])
+
+    def _command_confirm_tick(self) -> None:
+        self._cmd_timer.stop()  # 单次定时器：到点先停，后面按需要重新起
+        self.store.confirm_full(self._on_command_confirm_read)
+
+    def _on_command_confirm_read(
+        self,
+        res: dict[Any, Any] | None,
+        err: BaseException | None,
+    ) -> None:
+        if err is not None:
+            print(f"[confirm] 全量确认失败：{err}")
+        # **不做早停**：签名覆盖全部设备，烤箱腔体温度、温湿度、PM2.5、人体存在
+        # 都在持续上报，用它判"有变化"必然为真，相当于 1 秒后就结束。1 / 2.5 / 4 秒
+        # 三点固定跑满。
+        self._cmd_step += 1
+        if self._cmd_step >= len(CONFIRM_FULL_AT_MS):
+            return
+        elapsed = (time.monotonic() - self._cmd_start) * 1000
+        delay = max(150, int(CONFIRM_FULL_AT_MS[self._cmd_step] - elapsed))
+        self._cmd_timer.start(delay)
 
     def _on_poll_interval(self, ms: int | None) -> None:
         """需求表算出新间隔时调这里。``None`` = 没人要，停表。"""
@@ -896,6 +1033,7 @@ class MainWindow(QMainWindow):
             on_done=lambda code, reason: self._on_speaker_done(
                 target, text, code, reason, silent
             ),
+            untargeted=True,
         )
 
     def _on_speaker_done(

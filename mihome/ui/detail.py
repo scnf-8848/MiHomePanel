@@ -58,10 +58,12 @@ from .ptz_pad import PtzPad
 from .widgets import ElidedLabel, IconProvider, ToggleSwitch, draw_text
 
 PAD = 22
-#: 枚举行用轨道时允许的最大自然宽度。窗口 480、两侧各 22 的边距，左侧属性名
-#: 还要留出四五个字（约 110），再减去行内间距 12 —— 剩下 260 上下。
-#: 超过就退回下拉：轨道放不下只能截字，而下拉能把二十项列清楚。
-SEG_MAX_W = 260
+#: 枚举行用轨道时允许的最大自然宽度。按**最小窗口**（内容宽 400）算一次：
+#: 400 − 两侧 PAD 22×2 − 组内边距 18×2 − 竖滚动条 14 − 行内间距 12 = 294，
+#: 再给左侧属性名留四个汉字（56）——剩下 238。
+#: 判据是**静态**的：建行时算一次，不随窗口 resize 重新选控件（重建 editor
+#: 会丢焦点、抖滚动条）。超过就退回下拉：轨道放不下只能截字，下拉能列全。
+SEG_MAX_W = 238
 
 # 【取流计时】画面状态的中文名，只用于 core/timing.py 的日志
 _CAM_STATE_NAMES = {
@@ -184,6 +186,12 @@ class ControlRow(QWidget):
             return None
         seg = CardSeg(prop, palette, accent, label="", parent=self)
         if seg.sizeHint().width() > SEG_MAX_W:
+            # 这枚轨道不进布局、马上丢弃。**必须先 hide 再 deleteLater**：延迟删除
+            # 绑在调用它的事件循环层级上——详情页是在主循环的点击回调里建、再
+            # exec() 进嵌套循环，DeferredDelete 要等 exec 返回才处理，期间这枚
+            # 100×26 的孤儿控件会画在行左上角，和右边的下拉叠成"一行两种样式"
+            # （2026-11-13 用户报挂灯「模式」行）。
+            seg.hide()
             seg.deleteLater()
             return None
         # 按量出来的宽度钉死：``CardControl`` 的 size policy 是 Expanding，

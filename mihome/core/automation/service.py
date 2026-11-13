@@ -206,6 +206,7 @@ class AutomationService(QObject):
             target.did, target.siid, target.aiid,
             speaker.directive(target, got.text, act.silent),
             on_done=finished,
+            untargeted=True,
         )
 
 

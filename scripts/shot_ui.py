@@ -150,7 +150,7 @@ def main() -> int:
             def shoot() -> None:
                 # 选中一行再截：选中块的形状只有选中态才看得出来——曾经缩进区会
                 # 多出一块系统高亮蓝，和这边自绘的圆角块并排。
-                tree = dlg.tree_devices
+                tree = dlg.tree_rooms
                 home = tree.topLevelItem(0)
                 if home is not None and home.childCount():
                     tree.setCurrentItem(home.child(0))
@@ -252,7 +252,7 @@ def main() -> int:
             dlg.nav.setCurrentRow(1)
 
             def shoot() -> None:
-                tree = dlg.tree_devices
+                tree = dlg.tree_rooms
                 home = tree.topLevelItem(0)
                 if home is not None and home.childCount():
                     tree.setCurrentItem(home.child(0))

@@ -47,6 +47,18 @@ from .tree import DeviceNode
 # 事实来源，改频率时容易只改一处。删掉（2026-11-10）。
 POLL_BACKOFF = 6.0  # 连续失败后的退避基数
 
+#: 两轮全量读之间至少隔这么久。写入确认的"全量读"会和 3 秒 tick 撞车：如果刚有
+#: 一轮 tick 读过（或上一轮确认读过），再来一次只是把同一批属性读两遍，既浪费
+#: 也可能拿到同一份缓存。跳过这一轮就够了，不需要调整 tick 的相位。
+FULL_READ_MIN_GAP = 1.0
+
+
+def _default_mute() -> float:
+    """``Client.write`` 在 ``mute=None`` 时实际用的静默期，用于给界面算确认延迟。"""
+    from .api import DEFAULT_MUTE
+
+    return DEFAULT_MUTE
+
 
 @dataclass
 class DeviceState:
@@ -185,14 +197,24 @@ class Store:
         # 某台设备的「有没有极客版」探出来了（参数是 did）。界面拿它刷菜单提示，
         # Store 自己不改界面。
         self.on_geek_ability: Callable[[str], None] | None = None
-        #: 刚**发出**一条写请求（主线程，乐观值已经落到 ``st.values`` 里）。
+        #: 一条写请求**回包并确认成功**之后回调（主线程）：``(did, 期望值, mute 秒数)``。
         #:
-        #: 界面拿它开"指令后高频轮询"窗口：写入是乐观的，屏幕上显示的就是目标值，
-        #: 真正要确认的是设备有没有照做——那必须靠回读。这个回调只说明"有事发生了"，
-        #: 具体多快、持续多久由界面决定（Store 不该知道轮询频率）。
-        #: 放在这里而不是各个 UI 入口：写入口有卡片、详情页、场景、批量、音箱指令
-        #: 好几处，逐处接线一定会漏。
-        self.on_write_sent: Callable[[], None] | None = None
+        #: 界面拿它安排"写入确认"：写入是乐观的，屏幕上显示的就是目标值，真正要确认
+        #: 的是设备有没有照做。mute 从回包时刻起算，所以这里传的是同一个窗口值；
+        #: 动作没有 mute 条目，传 ``None``，由界面自己取一个延迟。
+        #: 期望值是 ``{(siid, piid): 值}``；动作没有目标值，传空字典。
+        #: 放在这里而不是各个 UI 入口：写入口有卡片、详情页、场景、批量好几处，
+        #: 逐处接线一定会漏。
+        self.on_write_done: (
+            Callable[[str, dict[tuple[int, int], Any], float | None], None] | None
+        ) = None
+        #: 没有单一目标设备的写（场景、音箱文本指令）成功之后的回调。
+        #:
+        #: 它们改到的设备是"哪几台说不好"，所以不按设备定向确认，而是让界面在
+        #: 回包后按几个固定时点做全量读（见 ``MainWindow._start_command_confirm``）。
+        self.on_command_done: Callable[[], None] | None = None
+        #: 上一轮**全量读**（tick 或确认读）的提交时刻，用来给确认读做 1 秒去重。
+        self._last_full_at = 0.0
         self._poll_generation = 0
         self._last_topology_change: set[str] = set()
         # (URN, 型号) → (源规格, 套了型号级文案的规格)。规格对象换了就重算；
@@ -201,6 +223,8 @@ class Store:
         self._text_specs: dict[tuple[str, str], tuple[DeviceSpec, DeviceSpec]] = {}
         self._fail_streak = 0
         self._next_poll_at = 0.0
+        #: 有一轮在线状态刷新已经派出去、还没回来（别堆叠）
+        self._online_pending = False
         #: 本轮已经派出去、还没回来的能力探测（同一台别重复提交）
         self._geek_pending: set[str] = set()
 
@@ -287,6 +311,11 @@ class Store:
     def apply_topology(self, topo: Topology, specs: Mapping[str, DeviceSpec]) -> None:
         """用新拓扑重建设备表，尽量保留旧读数避免界面闪白。"""
         old = self.devices
+        # 复用原来的 DeviceState 时，``prev.node`` 会被换成新节点；变更检测必须
+        # 拿**换之前**的值来比，否则就是在和刚写进去的自己比，永远相等。
+        before = {
+            did: (st.node.online, st.node.name, st.node.room) for did, st in old.items()
+        }
         self.topology = topo
         devices: dict[str, DeviceState] = {}
         for node in topo.devices:
@@ -324,11 +353,11 @@ class Store:
         # 结构变化（增删设备）+ 状态变化（在线/改名）都要让界面知道
         changed = set(old) ^ set(devices)
         for did, st in devices.items():
-            prev = old.get(did)
+            prev = before.get(did)
             if prev is not None and (
-                prev.node.online != st.node.online
-                or prev.node.name != st.node.name
-                or prev.node.room != st.node.room
+                prev[0] != st.node.online
+                or prev[1] != st.node.name
+                or prev[2] != st.node.room
             ):
                 changed.add(did)
         self.devices = devices
@@ -625,6 +654,7 @@ class Store:
         if not refs:
             return
         self.polling = True
+        self._last_full_at = time.monotonic()
         gen = self._poll_generation
         self.worker.submit(
             self.client.read,
@@ -673,6 +703,14 @@ class Store:
             self._next_poll_at = 0.0
             self.client.health.backoff(streak=0, seconds=0.0)
             self._status("已重新连接")
+        self._apply_values(result)
+
+    def _apply_values(self, result: Mapping[Any, Any]) -> None:
+        """把一批读回的值写进 ``DeviceState``（不做健康账本）。
+
+        轮询和"写入确认"共用这一段：后者只关心值到没到，不该因为一台设备读慢了
+        就影响全局的失败计数与退避。
+        """
         changed: set[str] = set()
         now = time.monotonic()
         for ref, rv in result.items():  # type: ignore[union-attr]
@@ -699,21 +737,121 @@ class Store:
         if changed:
             self._changed(changed)
 
-    def reraise(self, did: str) -> None:
-        """用户手动操作后立刻追加一轮，体感快一些。"""
+    # -- 在线状态 --------------------------------------------------------
+    def refresh_online(self) -> None:
+        """把云端设备清单里的 ``isOnline`` 同步到 ``DeviceState.online``。
+
+        **为什么不在 ``poll`` 里顺手做**：属性轮询拿到的是云缓存，离线设备照样
+        回 ``code=0``（见 ``Client.device_online``），判不出在线；唯一来源是设备
+        清单，而它要逐家庭请求，比一轮属性读贵。所以这里只提供"刷新一次"的能力，
+        **什么时候刷由界面决定**——它挂在既有的轮询 tick 上，不另起定时器。
+        """
+        if self._online_pending or self.loading or not self.devices:
+            return
+        self._online_pending = True
+        self.worker.submit(
+            self.client.device_online,
+            priority=PRIORITY_DATA,
+            label="online",
+            callback=self._on_online,
+        )
+
+    def _on_online(self, result: Any, error: BaseException | None) -> None:
+        self._online_pending = False
+        if error is not None or not isinstance(result, Mapping):
+            return
+        changed: set[str] = set()
+        for did, online in result.items():
+            st = self.devices.get(did)
+            if st is None:
+                continue
+            online = bool(online)
+            if st.node.online == online:
+                continue
+            st.node.online = online
+            changed.add(did)
+        if changed:
+            # 只通知真的变了的设备：卡片、顶栏离线数、音箱候选都跟着这张表走；
+            # 变回在线的设备下一轮 ``poll_refs`` 会自动重新纳入
+            self._changed(changed)
+
+    def card_refs(self, did: str) -> list[Any]:
+        """这台设备卡片上展示的属性引用（写入确认只读这些）。"""
         st = self.devices.get(did)
         if st is None or not st.online:
-            return
-        refs = [st.keys[k] for k in _card_keys(st.card) if k in st.keys]
-        if not refs:
-            return
+            return []
+        return [st.keys[k] for k in _card_keys(st.card) if k in st.keys]
+
+    def confirm_read(
+        self,
+        did: str,
+        refs: Sequence[Any],
+        done: Callable[[dict[Any, Any] | None, BaseException | None], None],
+    ) -> None:
+        """写入确认用的定向读：回填界面，但**不进轮询健康账本**。
+
+        失败不加 ``_fail_streak``、也不清它——否则一次确认失败会把全局轮询推进
+        退避，或者把正在退避的状态误判成"已恢复"。
+        """
         self.worker.submit(
             self.client.read,
             (refs,),
             priority=PRIORITY_DATA,
-            label="refresh",
-            callback=lambda res, err: self._on_polled(self._poll_generation, res, err),
+            label="confirm",
+            callback=lambda res, err: self._on_confirm_read(res, err, done),
         )
+
+    def _on_confirm_read(
+        self,
+        result: Any,
+        error: BaseException | None,
+        done: Callable[[dict[Any, Any] | None, BaseException | None], None],
+    ) -> None:
+        if error is None and isinstance(result, Mapping):
+            self._apply_values(result)
+        done(result if isinstance(result, Mapping) else None, error)
+
+    def confirm_full(
+        self,
+        done: Callable[[Mapping[Any, Any] | None, BaseException | None], None],
+    ) -> None:
+        """确认用的**全量**读（在线设备的卡片属性）。
+
+        和 tick 完全解耦：不碰 ``_poll_timer``、不改它的相位、也不取消它，只是往
+        同一条串行队列里塞一个一次性 job。距离上一轮全量读不足 ``FULL_READ_MIN_GAP``
+        时直接跳过（``done(None, None)``），避免和刚跑过的 tick 读同一批。
+
+        不做"值有没有变化"的判断：签名覆盖全部设备，温湿度/PM2.5/人体存在这类
+        常变属性会让它必然为真，拿它做早停等于没有早停。需要比对期望值的只有
+        目标写确认的最后一轮，它自己看 ``result``。
+        """
+        if time.monotonic() - self._last_full_at < FULL_READ_MIN_GAP:
+            done(None, None)
+            return
+        refs = self.poll_refs()
+        if not refs:
+            done(None, None)
+            return
+        self._last_full_at = time.monotonic()
+        self.worker.submit(
+            self.client.read,
+            (refs,),
+            priority=PRIORITY_DATA,
+            label="confirm-full",
+            callback=lambda res, err: self._on_confirm_full(res, err, done),
+        )
+
+    def _on_confirm_full(
+        self,
+        result: Any,
+        error: BaseException | None,
+        done: Callable[[Mapping[Any, Any] | None, BaseException | None], None],
+    ) -> None:
+        if error is not None or not isinstance(result, Mapping):
+            done(None, error)
+            return
+        self._apply_values(result)
+        done(result, None)
 
     def read_props(
         self,
@@ -794,7 +932,9 @@ class Store:
         self._changed({did})
 
         def done(res: Any, err: BaseException | None) -> None:
-            self._on_written(did, key, old, gen, res, err, mute)
+            if self._on_written(did, key, old, gen, res, err, mute):
+                window = mute if mute is not None else _default_mute()
+                self._notify_write_done(did, {key: value}, window)
 
         self.worker.submit(
             self.client.write,
@@ -804,12 +944,26 @@ class Store:
             label="write",
             callback=done,
         )
-        self._notify_write()
         return True
 
-    def _notify_write(self) -> None:
-        """告诉界面"刚发了一条写指令"。回调异常不许污染写入链路。"""
-        cb = self.on_write_sent
+    def _notify_write_done(
+        self,
+        did: str,
+        expected: dict[tuple[int, int], Any],
+        mute: float | None,
+    ) -> None:
+        """告诉界面"这台设备的写已经回包成功"，由界面安排写入确认。"""
+        cb = self.on_write_done
+        if cb is None:
+            return
+        try:
+            cb(did, expected, mute)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _notify_command_done(self) -> None:
+        """场景 / 音箱指令：没有目标设备，由界面按几个时点做全量读。"""
+        cb = self.on_command_done
         if cb is None:
             return
         try:
@@ -826,10 +980,10 @@ class Store:
         result: Any,
         error: BaseException | None,
         mute: float | None,
-    ) -> None:
+    ) -> bool:
         st = self.devices.get(did)
         if st is None:
-            return
+            return False
         ok = False
         if error is None and isinstance(result, Mapping):
             from .api import classify
@@ -837,15 +991,16 @@ class Store:
             ok = all(classify(int(c)) == "ok" for c in result.values()) if result else False
         if gen != st.gen:
             # 期间用户又操作了同一台设备，交给最后一次回调决定
-            return
+            return False
         st.optimistic.pop(key, None)
         if not ok:
             st.values[key] = old
             st.error = "操作失败，已还原"
             self._changed({did})
-            return
+            return False
         st.error = ""
         self._changed({did})
+        return True
 
     def set_power_for_devices(self, dids: Sequence[str], value: Any) -> int:
         """把一组设备的电源键一次性写到同一个值，返回实际下发的属性条数。
@@ -908,6 +1063,7 @@ class Store:
                 and all(classify(int(c)) == "ok" for c in result.values())
             )
             touched: set[str] = set()
+            expected: dict[str, dict[tuple[int, int], Any]] = {}
             for did, key, old, gen in plan:
                 st = self.devices.get(did)
                 if st is None or gen != st.gen:
@@ -916,6 +1072,8 @@ class Store:
                 if not ok:
                     st.values[key] = old
                     st.error = "操作失败，已还原"
+                else:
+                    expected.setdefault(did, {})[key] = value
                 touched.add(did)
             self._changed(touched)
             self._status(
@@ -923,6 +1081,10 @@ class Store:
                 if ok
                 else "批量操作失败，已还原"
             )
+            if ok:
+                window = mute if mute is not None else _default_mute()
+                for did, exp in expected.items():
+                    self._notify_write_done(did, exp, window)
 
         self.worker.submit(
             self.client.write,
@@ -932,7 +1094,6 @@ class Store:
             label="write-many",
             callback=done,
         )
-        self._notify_write()
         return len(pairs)
 
     def toggle(self, did: str, siid: int, piid: int) -> None:
@@ -950,11 +1111,15 @@ class Store:
         value: Sequence[Any] | None = None,
         *,
         on_done: Callable[[int, str], None] | None = None,
+        untargeted: bool = False,
     ) -> None:
         """执行一次设备方法。``on_done`` 收到 ``(错误码, 失败原因)``，0 表示成功。
 
         码与原因都是 ``Client.run_action`` 的既有契约（云端非 0 码会原样返回，
         异常统一 -1 并在 ``last_error`` 里留一句话），这里只做搬运。
+
+        ``untargeted=True`` 用于"影响面不在这个 did 上"的动作（目前是音箱文本指令）：
+        不按这台设备做定向确认，改走场景那条"几个时点全量读"的序列。
         """
 
         def done(res: Any, err: BaseException | None) -> None:
@@ -968,7 +1133,13 @@ class Store:
             else:
                 code = int(res) if isinstance(res, int) else 0
                 reason = "" if code == 0 else (self.client.last_error or explain(code))
-                self.reraise(did)
+                if code == 0:
+                    # 动作没有目标值，也没有 mute 条目：只让界面按 card 属性回读几次。
+                    # 音箱文本指令影响的是别的设备，走"全量读"那条序列。
+                    if untargeted:
+                        self._notify_command_done()
+                    else:
+                        self._notify_write_done(did, {}, None)
             if on_done is not None:
                 on_done(code, reason)
 
@@ -979,7 +1150,6 @@ class Store:
             label="action",
             callback=done,
         )
-        self._notify_write()
 
     # -- 极客版能力探测 ----------------------------------------------------
     #: 一次启动最多探几台。探测是"每台一次、结论落盘"的成本，但设备多的家里
@@ -1062,14 +1232,13 @@ class Store:
             label="scene",
             callback=self._on_scene_done,
         )
-        # 场景会改动一批设备，"刚发过指令"这件事对自动化的意义更大：接下来
-        # 那 5 秒要连着几轮才看得出一组设备各自变成了什么
-        self._notify_write()
 
     def _on_scene_done(self, result: Any, error: BaseException | None) -> None:
-        self._status("场景执行失败" if error or result is False else "场景已执行")
-        # 场景会改动一批设备，等它生效后再追一轮
-        self.worker.submit(lambda: time.sleep(1.2), priority=PRIORITY_DATA, callback=lambda *_: self.poll())
+        ok = error is None and result is not False
+        self._status("场景执行失败" if not ok else "场景已执行")
+        if ok:
+            # 场景改到哪几台说不准：不按设备确认，交给界面的固定时点全量读序列
+            self._notify_command_done()
 
     # -- 杂务 ------------------------------------------------------------
     @property

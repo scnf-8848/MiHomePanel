@@ -392,6 +392,10 @@ class Client:
         self.health = health or PollHealth()
         self._mute: dict[PropRef, float] = {}
         self._mute_window = DEFAULT_MUTE
+        #: 拓扑加载时记下的 ``home_id → uid``。重读在线状态要逐家庭请求设备清单，
+        #: 上游的 ``get_devices_list`` 会为拿 ``home_owner`` 再请求一次家庭列表，
+        #: 两个家庭就是 5 次请求；这里用记下的 uid 直接发，一次家庭一次。
+        self._owners: dict[str, int] = {}
         self.last_error: str = ""
         #: 最近一轮轮询到底读没读回来东西。``None`` = 上一次 ``read`` 不是轮询。
         #: ``Store`` 判退避只能看这个，别再拿"返回值是不是 Mapping"当判据——失败时
@@ -511,6 +515,12 @@ class Client:
                 }
             )
 
+        self._owners = {
+            str(h.get("id") or ""): int(h.get("uid") or 0)
+            for h in homes_raw
+            if h.get("id")
+        }
+
         homes: list[HomeNode] = []
         for h in homes_raw:
             rooms = [
@@ -527,6 +537,48 @@ class Client:
             )
 
         return Topology(homes=homes, devices=group_devices(rows))
+
+    # -- 在线状态 --------------------------------------------------------
+    def device_online(self) -> dict[str, bool]:
+        """读一次设备清单，返回 ``did → 是否在线``。
+
+        **在线状态只有这一个来源**：``/miotspec/prop/get``（``datasource=1``，也就是
+        我们轮询用的那条）对**离线设备**同样返回云缓存的旧值和 ``code=0``——实测
+        四台掉线设备各读 20 条属性，一条离线码都没有；``datasource=2``（强制找设备）
+        才会回 ``-704042011``，但 150 条批量要 1.05s（约是 ``datasource=1`` 的 9 倍），
+        而且值一模一样，不能挂在 3 秒轮询上。所以"读成功"不等于在线，在线只能
+        定期重读设备清单。
+
+        走 ``_request`` 而不是上游的 ``get_devices_list``：后者为了拿 ``home_owner``
+        会再请求一次家庭列表，两个家庭累计 5 次请求；这里用拓扑加载时记下的
+        ``home_id → uid``，一次家庭一次。设备数 64 条远小于单页 200，不翻页。
+        """
+        owners = dict(self._owners)
+        out: dict[str, bool] = {}
+        if not owners:
+            return out
+        for home_id, owner in owners.items():
+            data = {
+                "home_owner": owner,
+                "home_id": int(home_id) if home_id.isdigit() else home_id,
+                "limit": 200,
+                "start_did": "",
+                "get_split_device": True,
+                "support_smart_home": True,
+                "get_cariot_device": True,
+                "get_third_device": True,
+            }
+            with self._lock:
+                try:
+                    ret = self._api._request("/home/home_device_list", data)
+                except Exception as exc:  # noqa: BLE001  网络层什么都可能抛
+                    self.last_error = f"读取设备在线状态失败: {exc}"
+                    continue
+            for d in (ret or {}).get("device_info") or []:
+                did = str(d.get("did") or "")
+                if did:
+                    out[did] = bool(d.get("isOnline"))
+        return out
 
     # -- 读 --------------------------------------------------------------
     def read(

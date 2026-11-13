@@ -9,9 +9,9 @@
 * **不互相重置**：结果没变就不回调（否则挂件要的 1 秒会被窗口切后台那一下重置）；
 * **有下限**：谁报 100 ms 都会被收敛到 0.5 秒，这是"保守设计"的兜底；
 * **能回落**：撤掉最严的那条之后回到次严 / 默认 / 停表；
-* **连点不叠加**：同一个 owner 再登记是覆盖那一条，撤一次就全撤掉；窗口那半个
-  （`MainWindow` 的单次定时器）只顺延、不攒定时器，连点 3 次仍然只有一个窗口；
-* **不落盘**：突发只活在内存里，崩溃重启仍从常量起（prefs 里没有任何轮询键）。
+* **写入确认**：回包后 mute+0.2 秒起读、每台只保留一个序列、最多 4 台、动作 1.0 秒，
+  且确认读不进健康账本；
+* **不落盘**：需求表只活在内存里，崩溃重启仍从常量起（prefs 里没有任何轮询键）。
 """
 
 from __future__ import annotations
@@ -164,62 +164,171 @@ def _describe() -> None:
     check("describe 默认档", "默认" in b2.describe(), b2.describe())
 
 
-def _burst() -> None:
-    """指令后的高频窗口：压在上面的一档，撤掉就回原档。
+def _confirm() -> None:
+    """写入确认：回包后等 mute 到期，再对那台设备定向读，最多 5 次。
 
-    这条对应 ``main_window`` 的 ``_start_burst`` / ``_end_burst``：窗口该是 3 秒
-    还是 15 秒由"看不看得见"决定，突发只在写指令之后的几秒里临时更严。
+    对应 ``MainWindow._start_confirm``：同一台设备只保留一个序列、重新计时；
+    同时最多跟踪 4 台，第 5 台挤掉最早的那台；动作没有 mute，用固定起点。
     """
-    hits: list[int | None] = []
+    from PySide6.QtWidgets import QApplication  # noqa: PLC0415
 
-    # 前台：3 秒常态 → 发指令 → 0.5 秒 → 窗口结束回 3 秒
-    b = PollDemandBoard("属性轮询", idle_ms=3000)
-    hits = _record(b)
-    b.set("window", 3000, "窗口可见")
-    b.set("burst", 500, "刚发过指令")
-    check("发指令后压到 500", b.interval_ms == 500, str(b.interval_ms))
-    check("突发那条是最严的", b.holder().owner == "burst", str(b.holder()))
-    b.clear("burst")
-    check("窗口结束回 3000", b.interval_ms == 3000, str(b.interval_ms))
-    # 两次切换各一次回调（3000 → 500 → 3000），没有多余的重置
-    check("只为两次真实变化回调", hits == [3000, 500, 3000], str(hits))
+    from mihome.ui import main_window as mw  # noqa: PLC0415
+    from mihome.ui import theme  # noqa: PLC0415
 
-    # 托盘：15 秒常态 → 发指令 → 仍然 0.5 秒（后台也不能等 15 秒）
-    b2 = PollDemandBoard("属性轮询", idle_ms=3000)
-    b2.set("window", 15_000, "窗口在托盘")
-    b2.set("burst", 500, "刚发过指令")
-    check("托盘里发指令也压到 500", b2.interval_ms == 500, str(b2.interval_ms))
-    b2.clear("burst")
-    check("托盘里窗口结束回 15000", b2.interval_ms == 15_000, str(b2.interval_ms))
+    check("确认参数：mute 后 +200ms、间隔 500ms、5 次、最多 4 台",
+          (mw.CONFIRM_DELAY_MS, mw.CONFIRM_INTERVAL_MS, mw.CONFIRM_MAX_TRIES,
+           mw.CONFIRM_MAX_DEVICES) == (200, 500, 5, 4),
+          str((mw.CONFIRM_DELAY_MS, mw.CONFIRM_INTERVAL_MS,
+               mw.CONFIRM_MAX_TRIES, mw.CONFIRM_MAX_DEVICES)))
+    check("动作的确认起点是 1.0 秒", mw.CONFIRM_ACTION_DELAY_MS == 1000,
+          str(mw.CONFIRM_ACTION_DELAY_MS))
+    check("burst 相关常量已经删掉",
+          not any(hasattr(mw, n) for n in ("BURST_MS", "BURST_HOLD_MS")), "")
 
-    # 下限：谁报 100 都会被抬到 MIN_INTERVAL_MS，0.5 秒已经不再被抬
-    b3 = PollDemandBoard("属性轮询", idle_ms=3000)
-    b3.set("burst", 500, "刚发过指令")
-    check("500 不被下限抬高", b3.interval_ms == 500, str(b3.interval_ms))
-    check("下限就是 500", MIN_INTERVAL_MS == 500, str(MIN_INTERVAL_MS))
+    QApplication.instance() or QApplication([])
+    win = mw.MainWindow(theme.DARK, tray_available=False)
+    win._save_settings = lambda: None  # type: ignore[method-assign]  # noqa: SLF001
+    try:
+        check("确认读的入口存在", hasattr(win.store, "confirm_read"), "")
+        check("reraise 已经删除（没有死代码）",
+              not hasattr(win.store, "reraise"), "")
+        check("写入成功的回调挂在 on_write_done",
+              win.store.on_write_done == win._start_confirm, "")  # noqa: SLF001
 
-    # 连点：同一个 owner 再登记是**覆盖**那一条，不会又挂一条 ---------------------
-    b4 = PollDemandBoard("属性轮询", idle_ms=3000)
-    b4.set("window", 3000, "窗口可见")
-    for _ in range(3):
-        b4.set("burst", 500, "刚发过指令")
-    check("连点 3 次仍然只有一条 burst 需求", len(b4.demands()) == 2, str(b4.demands()))
-    check("连点 3 次间隔仍是 500", b4.interval_ms == 500, str(b4.interval_ms))
-    b4.clear("burst")
-    check("撤一次就全撤掉（不是撤三份）", b4.interval_ms == 3000, str(b4.interval_ms))
+        # mute 3.0 → 3.2 秒后开始
+        win._start_confirm("did-a", {(2, 1): True}, 3.0)  # noqa: SLF001
+        left = win._confirm_timers["did-a"].remainingTime()  # noqa: SLF001
+        check("mute 3.0 → 3.2 秒起读", 3100 <= left <= 3200, str(left))
+
+        # 同一台再写一次：重新计时、不叠加
+        win._start_confirm("did-a", {(2, 2): 25}, 2.0)  # noqa: SLF001
+        left2 = win._confirm_timers["did-a"].remainingTime()  # noqa: SLF001
+        plan = win._confirm_plans["did-a"]  # noqa: SLF001
+        check("同设备重新计时（2.0+0.2）", 2100 <= left2 <= 2200, str(left2))
+        check("同一台只有一个序列、次数重置为 5", plan["left"] == 5, str(plan))
+        check("期望值按 key 合并",
+              plan["expected"] == {(2, 1): True, (2, 2): 25}, str(plan["expected"]))
+
+        # 4 台上限：第 5 台挤掉最早的
+        for i in range(3):
+            win._start_confirm(f"did-{i}", {(2, 1): i}, 3.0)  # noqa: SLF001
+        check("现在跟踪 4 台", len(win._confirm_plans) == 4,
+              str(list(win._confirm_plans)))
+        check("最早的是 did-a", "did-a" in win._confirm_plans, str(list(win._confirm_plans)))
+        win._start_confirm("did-new", {(2, 1): 1}, 3.0)  # noqa: SLF001
+        check("第 5 台挤掉最早的那台",
+              "did-a" not in win._confirm_plans and "did-new" in win._confirm_plans,
+              str(list(win._confirm_plans)))
+        check("定时器一起清掉", "did-a" not in win._confirm_timers, "")
+
+        # 动作：没有 mute，1.0 秒起
+        win._start_confirm("did-act", {}, None)  # noqa: SLF001
+        act = win._confirm_timers["did-act"].remainingTime()  # noqa: SLF001
+        check("动作 1.0 秒起读", 900 <= act <= 1000, str(act))
+
+        # 确认读不进健康账本：失败不加 streak、不清 streak
+        st = win.store
+        st._fail_streak = 2  # noqa: SLF001
+        st._next_poll_at = 123.0  # noqa: SLF001
+        calls = {}
+
+        def fake_submit(fn, args=(), kwargs=None, priority=0, label="", callback=None):
+            calls["label"] = label
+            callback(None, RuntimeError("boom"))
+
+        st.worker.submit = fake_submit  # type: ignore[method-assign]
+        got = []
+        st.confirm_read("did-x", [], lambda res, err: got.append((res, err)))
+        check("确认读走 confirm 标签", calls.get("label") == "confirm", str(calls))
+        check("失败回调拿到了错误", bool(got) and got[0][0] is None, str(got))
+        check("确认失败不改 streak", st._fail_streak == 2, str(st._fail_streak))  # noqa: SLF001
+        check("确认失败不改退避时刻", st._next_poll_at == 123.0, str(st._next_poll_at))  # noqa: SLF001
+
+        # 最后一轮改全量读（覆盖联动改到的设备） -------------------------------
+        win._start_confirm("did-tail", {(2, 1): True}, 3.0)  # noqa: SLF001
+        win._confirm_plans["did-tail"]["left"] = 1  # noqa: SLF001
+        full_calls: list[str] = []
+        st.confirm_full = lambda done: full_calls.append("full")  # type: ignore[method-assign]
+        win._confirm_tick("did-tail")  # noqa: SLF001
+        check("第 5 次走全量读", full_calls == ["full"], str(full_calls))
+        win._drop_confirm("did-tail")  # noqa: SLF001
+
+        # 场景 / 音箱指令：1 / 2.5 / 4 秒，固定 3 次，不做早停 ------------------
+        check("全量序列时点 1 / 2.5 / 4 秒",
+              mw.CONFIRM_FULL_AT_MS == (1000, 2500, 4000), str(mw.CONFIRM_FULL_AT_MS))
+        check("on_command_done 接线到全量序列",
+              st.on_command_done == win._start_command_confirm, "")  # noqa: SLF001
+        win._start_command_confirm()  # noqa: SLF001
+        check("起点 1 秒", 900 <= win._cmd_timer.remainingTime() <= 1000,  # noqa: SLF001
+              str(win._cmd_timer.remainingTime()))  # noqa: SLF001
+
+        steps: list[int] = []
+
+        def fake_full(done):
+            steps.append(win._cmd_step)  # noqa: SLF001
+            done(None, None)
+
+        st.confirm_full = fake_full  # type: ignore[method-assign]
+        win._command_confirm_tick()  # noqa: SLF001
+        check("第 1 次读完 → 等下一个时点", steps == [0] and win._cmd_timer.isActive(),  # noqa: SLF001
+              f"{steps} active={win._cmd_timer.isActive()}")  # noqa: SLF001
+        win._command_confirm_tick()  # noqa: SLF001
+        win._command_confirm_tick()  # noqa: SLF001
+        check("固定跑满 3 次", steps == [0, 1, 2] and not win._cmd_timer.isActive(),  # noqa: SLF001
+              f"{steps} active={win._cmd_timer.isActive()}")  # noqa: SLF001
+
+        # 中途有值变化也不早停（签名覆盖全设备，常变属性会让"有变化"恒真）
+        win._start_command_confirm()  # noqa: SLF001
+        moved: list[int] = []
+
+        def full_with_changes(done):
+            moved.append(win._cmd_step)  # noqa: SLF001
+            done({"dev/1.1": object()}, None)
+
+        st.confirm_full = full_with_changes  # type: ignore[method-assign]
+        win._command_confirm_tick()  # noqa: SLF001
+        still_running = win._cmd_timer.isActive()  # noqa: SLF001
+        win._command_confirm_tick()  # noqa: SLF001
+        win._command_confirm_tick()  # noqa: SLF001
+        check("有值变化也不提前结束（仍然跑满 3 次）",
+              still_running and moved == [0, 1, 2] and not win._cmd_timer.isActive(),  # noqa: SLF001
+              f"{moved} active={win._cmd_timer.isActive()}")  # noqa: SLF001
+
+        # 1 秒去重：距上一轮全量读不足 1 秒就跳过，不发请求 ----------------------
+        import time as _t  # noqa: PLC0415
+
+        del st.confirm_full  # 恢复真实的实现（前面几段打了桩）
+        st._last_full_at = _t.monotonic()  # noqa: SLF001
+
+        def boom(*a, **k):
+            raise AssertionError("不足 1 秒时不该发全量读")
+
+        st.worker.submit = boom  # type: ignore[method-assign]
+        skipped: list[tuple] = []
+        st.confirm_full(lambda res, err: skipped.append((res, err)))
+        check("不足 1 秒 → 跳过这一次", skipped == [(None, None)], str(skipped))
+
+        # 解耦：全量确认不改 tick 的间隔
+        before_ms = win._poll_timer.interval()  # noqa: SLF001
+        win._start_command_confirm()  # noqa: SLF001
+        check("全量确认不动 _poll_timer 的间隔",
+              win._poll_timer.interval() == before_ms,  # noqa: SLF001
+              f"{before_ms} → {win._poll_timer.interval()}")  # noqa: SLF001
+    finally:
+        win.close()
 
 
 def _no_persist() -> None:
-    """突发窗口只活在内存里：**崩溃重启不会把 0.5 秒带进下一次**。
+    """确认节奏只活在内存里：**崩溃重启不会把临时档带进下一次**。
 
-    用户问过这个（2026-11-12）：发指令后 5 秒内程序崩了，下次启动会不会沿用 0.5 秒？
+    2026-11-12 用户问过：发指令后几秒内程序崩了，下次启动会不会沿用临时的高频？
     答案是不会，但"不会"必须能证明，否则哪天有人为了"记住上次的间隔"往 prefs 里
     塞一个键，就真的会了。这组从四个角度钉住：
 
     1. ``poll_demand`` 这个模块**根本不碰文件**（源码里没有任何写盘调用）；
     2. 间隔来自模块常量，新建一张表就是常量值，没有任何"上次留下的"可读；
-    3. 模拟崩溃：登记了 burst 的旧表**直接丢掉**（不清、不保存），新建一张仍是常态；
-    4. 唯一的偏好文件 ``prefs.json`` 里没有任何轮询相关键（真存一次再看 JSON）。
+    3. 模拟崩溃：登记过需求的旧表**直接丢掉**（不清、不保存），新建一张仍是常态；
+    4. 唯一的偏好文件 ``prefs.json`` 里没有任何轮询 / 确认相关键（真存一次再看 JSON）。
     """
     import inspect  # noqa: PLC0415
     import json  # noqa: PLC0415
@@ -233,20 +342,20 @@ def _no_persist() -> None:
 
     # 新建 = 从常量起。idle_ms 就是常态档，没人给它"上次的值"。
     # 注意新表的需求表是**空的**（idle 只是兜底，不算一条登记）——正因如此，
-    # 没有任何"上次留下的 burst"能被读到。
+    # 没有任何"上次留下的临时档"能被读到。
     fresh = PollDemandBoard("属性轮询", idle_ms=3000)
     check("新建的需求表就是常态 3000", fresh.interval_ms == 3000, str(fresh.interval_ms))
-    check("这次运行没有任何登记（没有残留的 burst / window）",
+    check("这次运行没有任何登记（没有残留的 window / widget）",
           fresh.demands() == (), str(fresh.demands()))
 
-    # 模拟"发过指令、窗口没结束就崩了"：旧表在这里被丢弃，不做任何清理/保存
+    # 模拟"登记过一条临时需求、还没撤就崩了"：旧表在这里被丢弃，不做任何清理/保存
     doomed = PollDemandBoard("属性轮询", idle_ms=3000)
     doomed.set("window", 3000, "窗口可见")
-    doomed.set("burst", 500, "刚发过指令")
-    check("崩之前确实是 500", doomed.interval_ms == 500, str(doomed.interval_ms))
+    doomed.set("widget", 1000, "挂件临时要 1 秒")
+    check("崩之前确实是 1000", doomed.interval_ms == 1000, str(doomed.interval_ms))
     del doomed
     after = PollDemandBoard("属性轮询", idle_ms=3000)
-    check("崩后新进程仍是 3000（突发没被继承）", after.interval_ms == 3000,
+    check("崩后新进程仍是 3000（临时档没被继承）", after.interval_ms == 3000,
           str(after.interval_ms))
 
     # 唯一的偏好文件里也不许有轮询键
@@ -254,8 +363,8 @@ def _no_persist() -> None:
     prefs = Prefs(path)
     prefs.save()
     payload = json.loads(path.read_text(encoding="utf-8"))
-    bad = [k for k in payload if any(w in k.lower() for w in ("poll", "interval", "burst"))]
-    check("prefs.json 里没有轮询 / 突发相关的键", bad == [], str(bad))
+    bad = [k for k in payload if any(w in k.lower() for w in ("poll", "interval", "confirm"))]
+    check("prefs.json 里没有轮询 / 确认相关的键", bad == [], str(bad))
     check("prefs.json 的键是白名单（新增键要过这一关）",
           sorted(payload) == sorted([
               "version", "card_styles", "home_order", "room_order", "device_order",
@@ -267,64 +376,13 @@ def _no_persist() -> None:
 
     # 常量本身就是"每次运行的起点"：改这里才会改默认，env / 配置都改不了
     from mihome.ui.main_window import (  # noqa: PLC0415
-        BURST_HOLD_MS,
-        BURST_MS,
         POLL_HIDDEN_MS,
         POLL_MS,
     )
 
-    check("常量：前 3 秒 / 托盘 15 秒 / 突发 0.5 秒×5 秒",
-          (POLL_MS, POLL_HIDDEN_MS, BURST_MS, BURST_HOLD_MS) == (3000, 15_000, 500, 5000),
-          str((POLL_MS, POLL_HIDDEN_MS, BURST_MS, BURST_HOLD_MS)))
-
-
-def _burst_window() -> None:
-    """真窗口里的那半个：连点只**顺延**窗口，不会攒出好几个定时器。
-
-    需求表那边已经证明了"同 owner 覆盖"，但窗口的时长是 ``MainWindow`` 里一个
-    单次定时器负责的：必须是**同一个** ``QTimer`` 反复 ``start()``（start 会重新
-    计时）。要是哪天改成 ``QTimer.singleShot(5000, self._end_burst)``，连点三次就
-    是三个独立的单次定时器——第一个会在"第一次点击后 5 秒"把 burst 撤掉，后面两次
-    的窗口被提前砍断，而且没人看得出来。这组断言就是防这个。
-    """
-    from PySide6.QtTest import QTest  # noqa: PLC0415
-    from PySide6.QtWidgets import QApplication  # noqa: PLC0415
-
-    from mihome.ui import theme  # noqa: PLC0415
-    from mihome.ui.main_window import BURST_HOLD_MS, MainWindow  # noqa: PLC0415
-
-    QApplication.instance() or QApplication([])
-    win = MainWindow(theme.DARK, tray_available=False)
-    # 别把测试写进用户真实的 QSettings
-    win._save_settings = lambda: None  # type: ignore[method-assign]  # noqa: SLF001
-    try:
-        # 常态是多少取决于窗口看不看得见（离屏没 show 时是按 15 秒登记的），
-        # 所以先记下基线，别拿常量比
-        base = win.poll_demand.interval_ms
-        win._start_burst()  # noqa: SLF001
-        check("发指令后窗口是 500", win.poll_demand.interval_ms == 500,
-              str(win.poll_demand.interval_ms))
-        win._start_burst()  # noqa: SLF001
-        win._start_burst()  # noqa: SLF001
-        owners = [d.owner for d in win.poll_demand.demands()]
-        check("连点 3 次只有一条 burst", owners.count("burst") == 1, str(owners))
-        check("burst 窗口用的是同一个单次定时器",
-              win._burst_timer.isSingleShot(), "")  # noqa: SLF001
-
-        # 走 300ms 再点一次：剩余时间要回到 5 秒，而不是"5 秒减去已经过的"
-        QTest.qWait(300)
-        left = win._burst_timer.remainingTime()  # noqa: SLF001
-        win._start_burst()  # noqa: SLF001
-        again = win._burst_timer.remainingTime()  # noqa: SLF001
-        check("再点一次把窗口重新算满 5 秒（顺延）",
-              again >= BURST_HOLD_MS - 50, f"{left} → {again}")
-        check("窗口不会因为连点变长", again <= BURST_HOLD_MS, str(again))
-
-        win._end_burst()  # noqa: SLF001
-        check("窗口到点自己回常态", win.poll_demand.interval_ms == base,
-              f"{win.poll_demand.interval_ms}，基线 {base}")
-    finally:
-        win.close()
+    check("常量：前台 3 秒 / 托盘 15 秒",
+          (POLL_MS, POLL_HIDDEN_MS) == (3000, 15_000),
+          str((POLL_MS, POLL_HIDDEN_MS)))
 
 
 def main() -> int:
@@ -332,9 +390,8 @@ def main() -> int:
     _floor()
     _none_and_subscribe()
     _describe()
-    _burst()
+    _confirm()
     _no_persist()
-    _burst_window()
     print()
     if FAILS:
         print(f"{len(FAILS)} 项失败：")

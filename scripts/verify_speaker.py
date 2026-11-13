@@ -632,8 +632,8 @@ def test_main_window(app: QApplication) -> None:
         calls: list[tuple] = []
         notes = _notes()
 
-        def fake_action(did, siid, aiid, value=None, *, on_done=None):
-            calls.append((did, siid, aiid, value, on_done))
+        def fake_action(did, siid, aiid, value=None, *, on_done=None, untargeted=False):
+            calls.append((did, siid, aiid, value, on_done, untargeted))
 
         win.store.run_action = fake_action  # type: ignore[method-assign]  # noqa: SLF001
         spec2 = make_spec(siid=5, act=5, wake=3)  # 按 lx06 的实号造
@@ -646,6 +646,8 @@ def test_main_window(app: QApplication) -> None:
               str(calls[0][:4] if calls else None))
         check("默认不静默（第二个实参是 False）",
               bool(calls) and calls[0][3][1] is False, str(calls and calls[0][3]))
+        check("音箱指令走无目标确认（untargeted）",
+              bool(calls) and calls[0][5] is True, str(calls[0][5] if calls else None))
 
         notes.clear()
         calls[0][4](0, "")
