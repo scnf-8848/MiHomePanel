@@ -33,9 +33,18 @@ from ..core.automation import Rule
 from ..core.automation.service import AutomationService
 from . import theme
 from .automation_style import (
-    CARD_H, chip_border, chip_fill, common_qss, fit_height, tab_focus_only,
+    CARD_H, chip_border, chip_fill, common_qss, fit_height, reserve_scrollbar,
+    tab_focus_only,
 )
-from .chrome import TitleBar, WindowFrame, surface_bg, surface_border
+from .chrome import (
+    SHADOW_PAD,
+    TitleBar,
+    WindowFrame,
+    floating_size,
+    shadow_alpha,
+    surface_bg,
+    surface_border,
+)
 from .confirm import confirm
 from .settings import dialog_qss
 
@@ -139,20 +148,24 @@ class AutomationTrashDialog(QDialog):
         self.setWindowFlags(Qt.Dialog | Qt.FramelessWindowHint)
         self._frame = WindowFrame(
             self, resizable=True,
+            radius=theme.RADIUS_CARD,
+            shadow=SHADOW_PAD,
+            shadow_alpha=shadow_alpha(self._p),
             fill=lambda: surface_bg(self._p),
             border=lambda: surface_border(self._p),
         )
-        self.resize(620, fit_height(500))
-        self.setMinimumSize(500, 360)
+        self.resize(*floating_size(620, fit_height(500, reserve=2 * SHADOW_PAD)))
+        self.setMinimumSize(*floating_size(500, 360))
         self.setStyleSheet(_trash_qss(palette))
 
-        outer = QVBoxLayout(self)
+        outer = QVBoxLayout(self._frame.body)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
-        self.title_bar = TitleBar("回收站", palette, buttons=("close",), variant="dialog")
+        self.title_bar = TitleBar("回收站", palette, buttons=("close",),
+                                  variant="dialog", frame=self._frame)
         outer.addWidget(self.title_bar)
 
-        body = QWidget(self)
+        body = QWidget(self._frame.body)  # 内容区，别挂窗口（窗口大一圈）
         col = QVBoxLayout(body)
         col.setContentsMargins(18, 12, 18, 12)
         col.setSpacing(10)
@@ -163,6 +176,8 @@ class AutomationTrashDialog(QDialog):
 
         self.scroll = QScrollArea(body)
         self.scroll.setWidgetResizable(True)
+        # 同列表窗：滚动条常驻占位，卡片宽度不随条目多少跳
+        reserve_scrollbar(self.scroll)
         self.list_body = QWidget(self.scroll)
         self.list_body.setObjectName("TrashBody")
         self.list_col = QVBoxLayout(self.list_body)
@@ -189,10 +204,14 @@ class AutomationTrashDialog(QDialog):
             if widget is not None:
                 widget.setParent(None)
                 widget.deleteLater()
-        rules = self.service.rules.trashed()
+        # 规则按家庭隔离：回收站也只放**当前家庭**删掉的规则
+        home = str(getattr(self.service, "current_home", "") or "")
+        rules = self.service.rules.trashed(home)
         self.title_bar.set_subtitle(f"{len(rules)} 条已删除规则")
         if not rules:
-            empty = QLabel("回收站是空的\n列表页点「删除」的规则会先放到这里", self.list_body)
+            extra = f"\n只收「{home}」这个家庭删掉的规则" if home else ""
+            empty = QLabel("回收站是空的\n列表页点「删除」的规则会先放到这里" + extra,
+                           self.list_body)
             empty.setObjectName("TrashEmpty")
             empty.setAlignment(Qt.AlignCenter)
             self.list_col.addWidget(empty, 1)

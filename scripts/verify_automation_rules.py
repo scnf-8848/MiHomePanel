@@ -6,10 +6,12 @@
 覆盖范围：
 
 * ``hotkeys.py`` —— 规范串、Win32 参数（含 ``MOD_NOREPEAT``）、反查、保留键；
-* ``rules.py``   —— schema 校验、坏数据字段级修复、原子落盘、启用键位去重与分发；
+* ``rules.py``   —— schema 校验、三类动作的落盘形状（含音箱的 ``did/text/silent``）、
+  坏数据字段级修复、原子落盘、启用键位去重与分发；
 * ``pc_state.py``—— 6 类电脑条件、AND / OR、空条件、条件不可用（台式机无电池）；
 * ``engine.py``  —— 冷静期（默认 1s / 0=关 / 剩余秒数）、动作队列重入、条件不成立、
-  动作按序 + 延迟、发送失败停止、测试绕过冷静期、日志、close；
+  动作按序 + 延迟、发送失败停止、音箱通道（``say``）的成功 / 静默 / 失败 / 未注入、
+  测试绕过冷静期、日志、close；
 * ``logbook.py``—— 独立日志窗的筛选 / 查找（关键字、规则、结果、时间范围）与表格列；
 * ``rules.py``   —— 软删除回收站：trash / restore / purge 与「删除后不注册热键」。
 
@@ -29,12 +31,14 @@ _TMP = Path(tempfile.mkdtemp(prefix="mihome-automation-"))
 os.environ["MIHOME_DATA_DIR"] = str(_TMP / "data")
 
 from mihome.core.automation import (  # noqa: E402
+    ACTION_TYPES,
     CONDITION,
     COOLDOWN,
     DONE,
     FAILED,
     FAIL_OUTCOMES,
     FIRED,
+    MAX_SPEAK_CHARS,
     MOD_NOREPEAT,
     NEUTRAL_OUTCOMES,
     OPS,
@@ -146,6 +150,22 @@ class Emitter:
         done(f"模拟失败：{name}" if name == self.fail_on else "")
 
 
+class Speaker:
+    """假的音箱通道（引擎的第三个出口 ``say``）：记录说给谁、说了什么、静不静默。
+
+    真实现要解析设备、清洗文本、拼 miot 入参（``core/speaker.py`` +
+    ``AutomationService._say``），这里一概不管——引擎本来就不该认设备。
+    """
+
+    def __init__(self, fail_on: str = "") -> None:
+        self.calls: list[tuple[str, str, bool]] = []
+        self.fail_on = fail_on
+
+    def __call__(self, act: Action, done) -> None:
+        self.calls.append((act.did, act.text, bool(act.silent)))
+        done(f"模拟失败：{act.text}" if act.text == self.fail_on else "")
+
+
 def base_rule(**kw) -> Rule:
     data = dict(
         id="r1", name="测试规则", enabled=True, keys="Ctrl+Alt+F7",
@@ -157,7 +177,7 @@ def base_rule(**kw) -> Rule:
 
 
 def make_engine(rule: Rule, *, state=None, emitter=None, clock=None, sched=None,
-                fail_on: str = ""):
+                say=None, fail_on: str = ""):
     clock = clock or Clock()
     sched = sched or Scheduler(clock)
     emitter = emitter or Emitter(fail_on)
@@ -165,7 +185,7 @@ def make_engine(rule: Rule, *, state=None, emitter=None, clock=None, sched=None,
     rules.rules = [rule]
     engine = AutomationEngine(
         rules, state=state or FakeState(Snapshot(available=True)),
-        emit=emitter, call_later=sched, now=clock.now, wall_now=clock.wall,
+        emit=emitter, say=say, call_later=sched, now=clock.now, wall_now=clock.wall,
     )
     return engine, clock, sched, emitter
 
@@ -226,6 +246,75 @@ check("坏 unit 退回毫秒档而不是丢动作",
 check("延迟越界提示写明两个刻度",
       any("600 秒" in e for e in validate_rule(base_rule(actions=[
           Action("virtual_event", name="A"), Action("delay", ms=10**9)]))))
+
+# 「发音箱指令」动作：did 是执行用的，name 只是显示名快照（日志 / 回显），
+# silent 默认 false 时不写键——旧版本读新文件、新版本读旧文件都不受影响。
+check("动作类型只有三档，没有 delay_s 之类的伪类型",
+      ACTION_TYPES == ("virtual_event", "delay", "speaker"), str(ACTION_TYPES))
+spk_dict = Action("speaker", name="客厅音箱", did="123456", text="打开台灯").to_dict()
+check("音箱动作落盘 = did/name/text 三字段",
+      spk_dict == {"type": "speaker", "did": "123456", "name": "客厅音箱",
+                   "text": "打开台灯"}, str(spk_dict))
+check("不静默是默认值，不写 silent 键", "silent" not in spk_dict)
+check("静默才写 silent: true",
+      Action("speaker", did="d1", text="开灯", silent=True).to_dict().get("silent") is True)
+back = Action.from_dict({"type": "speaker", "did": "123456", "name": "客厅音箱",
+                         "text": "开灯", "silent": True})
+check("音箱动作能原样读回", (back.did, back.name, back.text, back.silent)
+      == ("123456", "客厅音箱", "开灯", True), str(back))
+check("silent 只认 true（写「是」/1 都算不静默）",
+      Action.from_dict({"type": "speaker", "did": "d", "text": "x",
+                        "silent": "是"}).silent is False)
+check("音箱动作不残留 delay 的 ms/unit",
+      (lambda a: a.ms == 0 and a.unit == "ms")(
+          Action.from_dict({"type": "speaker", "did": "d", "text": "x"})))
+check("没选音箱被抓", any("没选音箱" in e for e in validate_rule(base_rule(actions=[
+    Action("speaker", name="客厅", did="", text="开灯")]))))
+check("没填指令被抓", any("没填要说的话" in e for e in validate_rule(base_rule(actions=[
+    Action("speaker", name="客厅", did="d1", text="   ")]))))
+check(f"指令超过 {MAX_SPEAK_CHARS} 字被抓",
+      any(str(MAX_SPEAK_CHARS) in e for e in validate_rule(base_rule(actions=[
+          Action("speaker", name="客厅", did="d1", text="灯" * (MAX_SPEAK_CHARS + 1))]))))
+check("只有一条音箱动作也能过校验（按键 → 说句话是完整规则）",
+      validate_rule(base_rule(actions=[
+          Action("speaker", name="客厅", did="d1", text="我回来了")])) == [])
+check("只有延迟仍然过不了（得有一条真会干事的）",
+      any("发音箱指令" in e for e in validate_rule(base_rule(actions=[
+          Action("delay", ms=1000)]))))
+check("发虚拟事件 + 延迟照旧合法",
+      validate_rule(base_rule(actions=[Action("virtual_event", name="A"),
+                                       Action("delay", ms=1000)])) == [])
+
+# 空档「-」（用户 11-13 第八条）：② 和 ③ 加出来的一行默认没选类型，type 是空串。
+# 这一层必须拦——`Action.to_dict` 会把空类型和未知类型都写成 virtual_event，
+# 而 `from_dict` 又读不回它，放过去就等于悄悄把动作换成了另一种。
+check("动作没选类型（空串）被抓，且说「还没选」而不是「未知」",
+      any("还没选动作类型" in e for e in validate_rule(base_rule(actions=[
+          Action("virtual_event", name="A"), Action("")]))),
+      str(validate_rule(base_rule(actions=[Action("virtual_event", name="A"),
+                                           Action("")]))))
+check("空类型动作不会被顺手写成 virtual_event 混过校验",
+      bool(validate_rule(base_rule(actions=[Action("")]))))
+check("条件没选类型（空串）被抓，且和「类型未知」分开说",
+      any("还没选条件类型" in e for e in validate_rule(base_rule(conditions=[
+          Condition("", "", "x")]))),
+      str(validate_rule(base_rule(conditions=[Condition("", "", "x")]))))
+check("真正写错的条件类型仍然是「类型未知」",
+      any("类型未知" in e for e in validate_rule(base_rule(conditions=[
+          Condition("no_such_type", "is", "x")]))))
+check("选了类型的规则不受影响（空档只在没选时算错）",
+      validate_rule(base_rule(conditions=[Condition("idle_minutes", "ge", "10")],
+                              actions=[Action("virtual_event", name="A")])) == [])
+
+# 家庭归属（用户 11-13 第二轮）：「1103 家庭里不显示共享家庭的规则」。
+# home 为空串 = 还没归属（升级前写的 rules.json 没这个键 / 没登录时建的），
+# 那种规则**在任何家庭都可见**——藏起来会让人以为规则丢了，不是隔离是丢数据。
+check("home 非空才落盘", base_rule(home="1103 家").to_dict().get("home") == "1103 家")
+check("没归属时不写 home 键", "home" not in base_rule().to_dict())
+check("home 能原样读回",
+      Rule.from_dict(base_rule(home="共享家庭").to_dict()).home == "共享家庭")
+check("旧数据没 home 键 → 读成空串",
+      Rule.from_dict({"id": "old", "name": "老规则"}).home == "")
 
 path = _TMP / "rules.json"
 rs = RuleSet(path)
@@ -397,6 +486,70 @@ engine6.trigger("Ctrl+Alt+F7")
 check("失败即停止后续动作", emitter6.calls == ["A", "坏事件"])
 check("失败有日志且释放队列", engine6.log[-1].outcome == FAILED and "r1" not in engine6.running)
 
+# 音箱指令：引擎的第三个出口 say（解析设备 / 清洗文本都不在引擎里）
+spk_rule = base_rule(actions=[
+    Action("speaker", name="客厅音箱", did="d1", text="打开台灯"),
+    Action("virtual_event", name="B"),
+])
+spk = Speaker()
+engine_k, _, _, emitter_k = make_engine(spk_rule, say=spk)
+engine_k.trigger("Ctrl+Alt+F7")
+check("音箱动作走 say 通道（did / 文本 / 静默）",
+      spk.calls == [("d1", "打开台灯", False)], str(spk.calls))
+check("音箱成功日志带音箱名与指令",
+      any("已让「客厅音箱」执行「打开台灯」" in x.detail for x in engine_k.log),
+      str([x.detail for x in engine_k.log]))
+check("音箱之后接着跑下一步", emitter_k.calls == ["B"] and engine_k.log[-1].outcome == DONE)
+
+spk_si = Speaker()
+engine_si, _, _, _ = make_engine(base_rule(actions=[
+    Action("speaker", name="卧室音箱", did="d2", text="小点声", silent=True)]), say=spk_si)
+engine_si.trigger("Ctrl+Alt+F7")
+check("静默一路传到通道", spk_si.calls == [("d2", "小点声", True)], str(spk_si.calls))
+check("静默在日志里写明", any("已静默让" in x.detail for x in engine_si.log),
+      str([x.detail for x in engine_si.log]))
+
+engine_f, _, _, emitter_f = make_engine(base_rule(actions=[
+    Action("speaker", name="客厅", did="d1", text="说点错的"),
+    Action("virtual_event", name="C"),
+]), say=Speaker(fail_on="说点错的"))
+engine_f.trigger("Ctrl+Alt+F7")
+check("音箱失败即停后续动作", emitter_f.calls == [])
+check("音箱失败有日志且释放队列", engine_f.log[-1].outcome == FAILED
+      and "模拟失败" in engine_f.log[-1].detail and "r1" not in engine_f.running,
+      str([x.detail for x in engine_f.log]))
+
+long_text = "把客厅的灯关掉" * 5
+spk_l = Speaker()
+engine_l, _, _, _ = make_engine(base_rule(actions=[
+    Action("speaker", name="客厅", did="d1", text=long_text)]), say=spk_l)
+engine_l.trigger("Ctrl+Alt+F7")
+check("日志里的长指令打省略号", any("…" in x.detail for x in engine_l.log),
+      str([x.detail for x in engine_l.log]))
+check("发给音箱的仍是全文", spk_l.calls == [("d1", long_text, False)], str(spk_l.calls))
+
+
+def _boom(_act, _done) -> None:
+    raise RuntimeError("通道炸了")
+
+
+engine_b, _, _, _ = make_engine(base_rule(actions=[
+    Action("speaker", name="客厅", did="d1", text="开灯")]), say=_boom)
+engine_b.trigger("Ctrl+Alt+F7")
+check("音箱通道抛异常也记失败并释放队列",
+      engine_b.log[-1].outcome == FAILED and "r1" not in engine_b.running,
+      str([x.detail for x in engine_b.log]))
+
+# 没注入 say：明确失败，**不许静默跳过**（否则界面上看着"成功"其实没出声）
+rules_nb = RuleSet(_TMP / "no-speaker.json")
+rules_nb.rules = [base_rule(actions=[
+    Action("speaker", name="客厅", did="d1", text="开灯")])]
+engine_nb = AutomationEngine(rules_nb, state=FakeState(Snapshot(available=True)))
+engine_nb.trigger("Ctrl+Alt+F7")
+check("没接音箱通道时明确报失败", engine_nb.log[-1].outcome == FAILED
+      and "没有配置音箱通道" in engine_nb.log[-1].detail,
+      str([x.detail for x in engine_nb.log]))
+
 # 日志
 engine7, _, _, _ = make_engine(base_rule())
 engine7.trigger("Ctrl+Alt+F7")
@@ -449,6 +602,49 @@ eng_del, _, _, em_del = make_engine(
     base_rule(id="gone", keys="F9", deleted=True, deleted_at=1.0))
 check("已删规则不能被热键触发", eng_del.trigger("F9") == 0 and not em_del.calls)
 check("已删规则不能被测试发送", eng_del.test("gone") is False)
+
+# ---------------------------------------------------------------------------
+section("家庭隔离：列表只看本家庭，热键照旧全局")
+# ---------------------------------------------------------------------------
+
+hpath = _TMP / "homes.json"
+hs = RuleSet(hpath)
+hs.add(base_rule(id="h1", name="1103 的规则", keys="F1", home="1103 家"))
+hs.add(base_rule(id="h2", name="共享家庭的规则", keys="F2", home="共享家庭"))
+hs.add(base_rule(id="h3", name="还没归属的老规则", keys="F3"))
+check("1103 家庭只看到自己那条 + 没归属的",
+      {r.id for r in hs.active("1103 家")} == {"h1", "h3"},
+      str([r.id for r in hs.active("1103 家")]))
+check("共享家庭的规则一条都不漏进 1103",
+      all(r.home != "共享家庭" for r in hs.active("1103 家")))
+check("切到共享家庭只剩它自己的 + 没归属的",
+      {r.id for r in hs.active("共享家庭")} == {"h2", "h3"})
+check("不传 home = 不过滤（热键 / 引擎走这条）",
+      {r.id for r in hs.active()} == {"h1", "h2", "h3"})
+check("热键仍然全部注册（切家庭不该让快捷键失灵）",
+      set(hs.enabled_keys()) == {"F1", "F2", "F3"}, str(hs.enabled_keys()))
+check("引擎按热键找规则也不看家庭",
+      {r.id for r in hs.rules_for("F2")} == {"h2"})
+
+hs.trash("h1")
+check("回收站按家庭过滤", {r.id for r in hs.trashed("1103 家")} == {"h1"})
+check("别的家庭的回收站看不到它", hs.trashed("共享家庭") == [])
+hs.trash("h3")
+check("没归属的规则在哪个家的回收站都能看到（还没认领过）",
+      {r.id for r in hs.trashed("共享家庭")} == {"h3"},
+      str([r.id for r in hs.trashed("共享家庭")]))
+hs.restore("h1")
+hs.restore("h3")
+
+# claim：升级前写的 rules.json 没有 home，登录后一次性认到当时那个家庭
+check("claim 只认领空归属的", hs.claim("1103 家") is True)
+check("认领后老规则有了 home", hs.get("h3").home == "1103 家")
+check("已经归属别家的一动没动", hs.get("h2").home == "共享家庭")
+check("没有可认领的再调返回 False", hs.claim("共享家庭") is False)
+check("claim 落了盘", RuleSet(hpath).get("h3").home == "1103 家")
+check("认领后它不再出现在别的家庭",
+      {r.id for r in hs.active("共享家庭")} == {"h2"},
+      str([r.id for r in hs.active("共享家庭")]))
 
 # ---------------------------------------------------------------------------
 section("日志：中文结果名 / 筛选查找 / 表格列")

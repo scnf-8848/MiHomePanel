@@ -19,7 +19,15 @@ from PySide6.QtWidgets import QDialog, QHBoxLayout, QLabel, QPushButton, QVBoxLa
 from . import theme
 # 焦点策略与次要按钮样式都是四个自动化窗口 + 这里共用的（理由见各自 docstring）
 from .automation_style import ghost_qss, tab_focus_only
-from .chrome import TitleBar, WindowFrame, exec_with_dim_click, surface_bg, surface_border
+from .chrome import (
+    SHADOW_PAD,
+    TitleBar,
+    WindowFrame,
+    exec_with_dim_click,
+    shadow_alpha,
+    surface_bg,
+    surface_border,
+)
 
 
 def _qss(p: theme.Palette, danger: bool) -> str:
@@ -56,15 +64,21 @@ class ConfirmDialog(QDialog):
         self._p = palette
         self.setWindowTitle(title)
         self.setWindowFlags(Qt.Dialog | Qt.FramelessWindowHint)
+        # 浮窗：圆角 18（不是主窗口的 12）+ 外圈阴影留白，见 ``chrome.SHADOW_PAD``
         self._frame = WindowFrame(self, resizable=False,
+                                  radius=theme.RADIUS_CARD,
+                                  shadow=SHADOW_PAD,
+                                  shadow_alpha=shadow_alpha(palette),
                                   fill=lambda: surface_bg(palette),
                                   border=lambda: surface_border(palette))
         self.setStyleSheet(_qss(palette, danger))
 
-        outer = QVBoxLayout(self)
+        # 内容挂 ``body``（= 可见面板），别挂窗口：窗口比面板大一圈
+        outer = QVBoxLayout(self._frame.body)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
-        outer.addWidget(TitleBar(title, palette, buttons=("close",), variant="dialog"))
+        outer.addWidget(TitleBar(title, palette, buttons=("close",),
+                                 variant="dialog", frame=self._frame))
 
         body = QWidget()
         col = QVBoxLayout(body)
@@ -95,8 +109,13 @@ class ConfirmDialog(QDialog):
         row.addWidget(ok)
         col.addLayout(row)
 
-        self.adjustSize()
-        self.setFixedWidth(max(400, self.sizeHint().width()))
+        # 窗口没有自己的布局了（挂在 body 上），``adjustSize()`` 算不出东西，
+        # 只能按面板的 sizeHint 显式加回两圈留白。
+        outer.activate()
+        hint = self._frame.body.sizeHint()
+        pad2 = 2 * SHADOW_PAD
+        self.resize(max(400, hint.width()) + pad2, hint.height() + pad2)
+        self.setFixedWidth(self.width())
         tab_focus_only(self)
 
 

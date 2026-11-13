@@ -255,6 +255,65 @@ def field_bg(p: Palette) -> str:
     return blend(panel_bg(p), p.text, 0.055 if p.is_dark else 0.022)
 
 
+def field_border(p: Palette, fill: str | None = None) -> str:
+    """输入控件的描边。**不能直接拿 ``p.border``**。
+
+    ``p.border`` 是给"卡片压在窗口底上"用的（深色 #26282E 对窗口底 #0E0F12）。
+    输入框长在卡片（``panel_bg`` #28292C）上，同一个 #26282E 压上去只有 **1.01:1**
+    ——描边等于没画，整片输入区融进卡片，深色下只剩一个和卡片同色的方框
+    （用户 11-13 截图报的"暗色主题下输入框的描边没了"）。
+
+    所以描边要从**输入框自己的底**起算，往文字色提一档：
+    深色 #333437 → #4E4F52（1.52:1），浅色 #FAFAFA → #E0E1E1（1.26:1）。
+    两套都同时具备"底色差 + 描边差"两重轮廓，浅色下也比原来那支 #EAEBEE 清楚。
+
+    ``fill`` 给"底不是 ``field_bg``"的场景用（顶栏音箱条：在线时底是 ``p.card``、
+    离线时是 ``p.bg_soft``），传进来就按它起算，别再用面板底算出一支和它无关的线。
+    """
+    return blend(field_bg(p) if fill is None else fill, p.text,
+                 0.14 if p.is_dark else 0.11)
+
+
+def field_qss(
+    p: Palette,
+    selector: str = "QLineEdit",
+    *,
+    radius: int = 8,
+    padding: str = "5px 9px",
+    font_size: int = 12,
+    base: str | None = None,
+) -> str:
+    """输入框（``QLineEdit`` / 只读行编辑）唯一一份配色规则。
+
+    以前四个窗口各写一份 ``background: panel_bg; border: 1px solid p.border``，
+    深色下**每一份都是隐形的**（见 :func:`field_border`）。现在底色走
+    ``field_bg``、描边走 ``field_border``、焦点走 accent，谁要改就改这里。
+
+    ``selector`` 带上 objectName（如 ``QLineEdit#Field``）能压过窗口级通用规则；
+    尺寸参数留给调用方——编辑页 5/9、日志页 7/10、搜索框是胶囊，只有颜色该统一。
+
+    ``base`` 给"底不压在卡片上"的输入框用（顶栏搜索框压在窗口底 ``p.bg`` 上）：
+    传进来就从它起算，别去用面板底——深色下 #333437 压在 #0E0F12 上会亮得像
+    一块凸起。不传 = 卡片上的常规输入框，走 ``field_bg``。
+    """
+    fill = (field_bg(p) if base is None
+            else blend(base, p.text, 0.06 if p.is_dark else 0.05))
+    line = field_border(p, fill)
+    return f"""
+    {selector} {{
+        background: {fill}; color: {p.text}; font-size: {font_size}px;
+        border: 1px solid {line}; border-radius: {radius}px;
+        padding: {padding};
+        selection-background-color: {p.accent}; selection-color: #FFFFFF;
+    }}
+    {selector}:hover {{ border-color: {blend(fill, p.text, 0.24 if p.is_dark else 0.20)}; }}
+    {selector}:focus {{ border-color: {p.accent}; }}
+    {selector}:disabled {{
+        background: {blend(fill, p.bg, 0.45)}; color: {p.text_mute};
+    }}
+    """
+
+
 def popup_bg(p: Palette) -> str:
     """下拉浮层的底：必须和它压着的那张分区卡拉开。
 
@@ -504,6 +563,8 @@ __all__ = [
     "chip_bg",
     "chip_text",
     "field_bg",
+    "field_border",
+    "field_qss",
     "nav_bg",
     "nav_row_bg",
     "panel_bg",

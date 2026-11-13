@@ -24,6 +24,7 @@ from PySide6.QtGui import (
     QCursor,
     QFont,
     QFontMetrics,
+    QImage,
     QPainter,
     QPainterPath,
     QPen,
@@ -41,6 +42,31 @@ EDGE = 5
 CORNER = 12
 #: 窗口圆角。
 WINDOW_RADIUS = theme.RADIUS_WINDOW
+
+#: 浮窗外圈留白（像素）：窗口比可见面板大这么多，空白处铺阴影。
+#: 12 不够——``QGraphicsDropShadowEffect`` 对顶层窗口无效，阴影只能自己画，
+#: 而"软"的最小半径就是 16 上下，留 12 会把最外两圈裁掉（看着像描边不像阴影）。
+SHADOW_PAD = 24
+#: 阴影纵向偏移（光从上面来，影子略向下）。超过 ``SHADOW_PAD`` 的部分会被窗口边界裁掉。
+SHADOW_DY = 4
+
+
+def shadow_alpha(p: theme.Palette) -> float:
+    """阴影浓度。深色主题要更黑才看得出"浮起来"，浅色重了会像脏。
+
+    实测（离屏，贴边像素 vs 背景）：0.24 在浅色下只暗 21%，在深色近黑面板旁边
+    几乎看不出来；提到 0.30 / 0.55 后两边贴边都在 30%~45%，才有"离开背景"的感觉。
+    """
+    return 0.55 if p.is_dark else 0.30
+
+
+def floating_size(w: int, h: int) -> tuple[int, int]:
+    """内容尺寸 → 浮窗窗口尺寸（两边各加一圈阴影留白）。
+
+    各窗口 ``resize()`` 写的都是**内容**尺寸，不改这个换算的话，改成浮窗后
+    内容会凭空少 48px，设置页那种按最小尺寸卡死的页会当场挤掉一行。
+    """
+    return w + 2 * SHADOW_PAD, h + 2 * SHADOW_PAD
 
 
 def rounded_path(rect: QRectF, radius: float, corners: str = "tl tr br bl") -> QPainterPath:
@@ -119,6 +145,7 @@ class TitleBar(QWidget):
         frame: WindowFrame | None = None,
         height: int = BAR_H,
         variant: str = "window",
+        radius: int | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -128,6 +155,10 @@ class TitleBar(QWidget):
         self._buttons = tuple(buttons)
         self._frame = frame
         self._variant = variant
+        # 顶部两角要跟着窗口的圆弧走。浮窗（18）和主窗口（12）不是同一个半径，
+        # 写死常量会让标题栏把面板的弧盖掉——只有浮窗出现后才看得见这个错。
+        self._radius = (radius if radius is not None
+                        else (frame.radius if frame is not None else WINDOW_RADIUS))
         self._hover = -1
         self._down = -1
         self._drag_origin: QPoint | None = None
@@ -168,7 +199,7 @@ class TitleBar(QWidget):
         # 顶部两个角必须自己圆：窗口背景是抗锯齿画的，标题栏这里如果整块铺色，
         # 方角会把窗口的圆弧盖掉（关闭按钮悬停变红时最明显）。用抗锯齿裁剪，
         # 悬停色块也就跟着被裁圆了。
-        p.setClipPath(rounded_path(QRectF(self.rect()), WINDOW_RADIUS, "tl tr"))
+        p.setClipPath(rounded_path(QRectF(self.rect()), self._radius, "tl tr"))
         p.fillRect(self.rect(), QColor(dialog_bar_bg(pal) if is_dialog else bar_bg(pal)))
 
         if is_dialog and self.window().isActiveWindow():
@@ -382,8 +413,8 @@ class _FrameBorder(QWidget):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
         # 0.5 内缩：1px 的描边正好压在第一像素列上，不会糊成 2px
-        path = rounded_path(QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5),
-                            f.radius)
+        panel = QRectF(f.panel_rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        path = rounded_path(panel, f.radius)
         p.setPen(QPen(QColor(f.border_color()), 1))
         p.setBrush(Qt.NoBrush)
         p.drawPath(path)
@@ -397,6 +428,11 @@ class WindowFrame(QObject):
     mask 只有 1 bit，12dp 的圆弧在 1.75 倍屏上就是 21 像素的台阶；卡片圆角是
     ``drawRoundedRect`` 抗锯齿画的，两者放一起，窗口的角会明显更毛。
     代价是窗口矩形的四角对鼠标仍然"存在"（透明但可点），12px 可以接受。
+
+    ``shadow=SHADOW_PAD`` 打开"浮窗"形态：窗口四边各长出这么多透明留白，用来铺
+    手绘阴影；可见面板缩在中间，内容必须放进 :attr:`body`（尺寸自动跟着面板走）。
+    为什么要在窗口里画而不是用 ``QGraphicsDropShadowEffect``：图形效果**对顶层
+    窗口无效**，阴影必须落在窗口矩形里才看得见，所以窗口自己得先够大。
     """
 
     def __init__(
@@ -407,6 +443,8 @@ class WindowFrame(QObject):
         radius: int = WINDOW_RADIUS,
         fill=None,
         border=None,
+        shadow: int = 0,
+        shadow_alpha: float = 0.24,
     ) -> None:
         super().__init__(window)
         self.win = window
@@ -418,6 +456,12 @@ class WindowFrame(QObject):
         self._max = False
         self._normal: QRect | None = None
         self._edges: list[_ResizeEdge] = []
+        self._pad = max(0, int(shadow))
+        self._shadow_alpha = float(shadow_alpha)
+        self._shadow_img: QImage | None = None
+        self._shadow_key: tuple[float, ...] | None = None
+        #: 内容容器。``shadow > 0`` 时才有值，各窗口的根布局挂在这上面。
+        self.body: QWidget | None = None
 
         window.setWindowFlags(window.windowFlags() | Qt.FramelessWindowHint)
         if fill is not None:
@@ -425,6 +469,12 @@ class WindowFrame(QObject):
             window.setAttribute(Qt.WA_TranslucentBackground, True)
             if border is not None:
                 self._overlay = _FrameBorder(window, self)
+        if self._pad > 0:
+            # 普通子控件绘制前不会被 Qt 铺底色（autoFillBackground 默认关），
+            # 但显式关掉系统背景更稳：面板底色由窗口自绘画在它下面。
+            self.body = QWidget(window)
+            self.body.setAttribute(Qt.WA_NoSystemBackground, True)
+            self.body.setObjectName("WindowBody")
         window.installEventFilter(self)
         # Python 侧引用跟着被监控的窗口走。只有 ``self.win`` 不够：调用方若没有
         # 长期持有 frame（对话框常是局部变量），wrapper 被回收而 C++ 对象还挂在
@@ -441,6 +491,31 @@ class WindowFrame(QObject):
 
     def border_color(self) -> str:
         return self._border() if self._border is not None else ""
+
+    # -- 几何 ------------------------------------------------------------
+    @property
+    def shadow_pad(self) -> int:
+        """浮窗外圈留白。0 = 老形态（无阴影，面板铺满整个窗口）。"""
+        return self._pad
+
+    def panel_rect(self) -> QRect:
+        """可见面板在窗口内的矩形（不含阴影留白）。"""
+        if self._pad <= 0:
+            return self.win.rect()
+        return QRect(self.win.rect()).adjusted(self._pad, self._pad,
+                                               -self._pad, -self._pad)
+
+    def panel_geometry(self) -> QRect:
+        """可见面板的**全局**矩形。点击层挖洞要用它：阴影不是窗口的一部分。"""
+        return self.panel_rect().translated(self.win.frameGeometry().topLeft())
+
+    def set_shadow_alpha(self, alpha: float) -> None:
+        """切主题时调（深色要更黑）。只丢缓存，不重建窗口。"""
+        if abs(alpha - self._shadow_alpha) < 1e-3:
+            return
+        self._shadow_alpha = float(alpha)
+        self._shadow_key = None
+        self.win.update()
 
     def eventFilter(self, obj, event) -> bool:  # noqa: N802
         if obj is self.win:
@@ -469,10 +544,59 @@ class WindowFrame(QObject):
             # 最大化时不能留圆角，否则四角会漏出桌面
             p.fillRect(rect, QColor(self.fill_color()))
         else:
+            if self._pad > 0:
+                self._paint_shadow(p)
+                rect = QRectF(self.panel_rect())
             # 路径落在整数像素边界上：直边是满覆盖（不会糊成半透明的一圈），
             # 只有圆弧处的边缘像素才带 alpha
             p.fillPath(rounded_path(rect, self.radius), QColor(self.fill_color()))
         p.end()
+
+    def _paint_shadow(self, p: QPainter) -> None:
+        key = (self.win.width(), self.win.height(), self.win.devicePixelRatioF() or 1.0,
+               float(self.radius), self._shadow_alpha, float(self._pad))
+        if self._shadow_key != key or self._shadow_img is None:
+            self._shadow_img = self._build_shadow(key)
+            self._shadow_key = key
+        # 阴影图是半分辨率生成的，放大时要平滑，否则圆弧外沿会看到方块
+        p.setRenderHint(QPainter.SmoothPixmapTransform)
+        p.drawImage(QRectF(self.win.rect()), self._shadow_img)
+
+    def _build_shadow(self, key: tuple[float, ...]) -> QImage:
+        """把阴影画进一张透明位图并缓存。
+
+        顶层窗口用不了 ``QGraphicsDropShadowEffect``，手绘高斯又太重，这里用
+        **多层扩张**近似：从最外圈往里叠 ``pad`` 层圆角矩形，每层 alpha 很小，
+        越靠里累积越浓。窗口不动时这张图一直复用，每帧只是一次 ``drawImage``。
+        """
+        w, h, dpr, radius, alpha, pad = key
+        # 半分辨率：阴影本来就是糊的，24 层 fillPath 的耗时与像素数成正比，
+        # 砍到 1/4 后 resize 那一下从 ~3ms 降到 ~1ms，放大看不出差别。
+        # 图不带 dpr，绘制端显式给目标矩形（见 ``_paint_shadow``）。
+        ratio = max(0.25, dpr * 0.5)
+        img = QImage(max(1, int(round(w * ratio))), max(1, int(round(h * ratio))),
+                     QImage.Format_ARGB32_Premultiplied)
+        img.fill(Qt.transparent)
+        p = QPainter(img)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.scale(ratio, ratio)
+
+        layers = max(1, int(pad))
+        peak = max(0.0, min(1.0, alpha)) * 255.0
+        panel = QRectF(self.panel_rect()).translated(0.0, float(SHADOW_DY))
+        # 每层 alpha 要按**权重归一**，不能直接除以层数：贴边处被所有层覆盖，
+        # 那里的累计值才是 peak。除层数会得到 peak/2 左右（曲线平均值），阴影淡到
+        # 看不见——第一版就是这么翻的。
+        weights = [((1.0 - (i / layers) ** 2) ** 1.6) for i in range(layers, 0, -1)]
+        total = sum(weights) or 1.0
+        for i, w in zip(range(layers, 0, -1), weights):
+            a = int(round(peak * w / total))
+            if a <= 0:
+                continue
+            p.fillPath(rounded_path(panel.adjusted(-i, -i, i, i), radius + i),
+                       QColor(0, 0, 0, a))
+        p.end()
+        return img
 
     # -- 最大化 ----------------------------------------------------------
     def toggle_maximize(self) -> None:
@@ -525,6 +649,10 @@ class WindowFrame(QObject):
         self._edges = [_ResizeEdge(self.win, edges, cursor) for edges, cursor in specs]
 
     def _place(self) -> None:
+        if self.body is not None:
+            # 内容容器跟着面板走：窗口比面板大一圈（阴影留白），
+            # 各窗口的根布局挂在这上面，子控件就不会画进阴影区。
+            self.body.setGeometry(self.panel_rect())
         if self._overlay is not None:
             # 描边层永远压在最上面：子控件是后加的，尺寸变化后要重新抬一次
             self._overlay.setGeometry(self.win.rect())
@@ -535,16 +663,20 @@ class WindowFrame(QObject):
             for edge in self._edges:
                 edge.hide()
             return
-        w, h = self.win.width(), self.win.height()
+        # 热区贴在**面板**边（不是窗口边），阴影区不参与缩放——那块是透明留白，
+        # 用户看它不属于窗口。
+        panel = self.panel_rect()
+        x, y, w, h = panel.x(), panel.y(), panel.width(), panel.height()
         geo = {
-            Qt.TopEdge: QRect(CORNER, 0, w - CORNER * 2, EDGE),
-            Qt.BottomEdge: QRect(CORNER, h - EDGE, w - CORNER * 2, EDGE),
-            Qt.LeftEdge: QRect(0, CORNER, EDGE, h - CORNER * 2),
-            Qt.RightEdge: QRect(w - EDGE, CORNER, EDGE, h - CORNER * 2),
-            Qt.TopEdge | Qt.LeftEdge: QRect(0, 0, CORNER, CORNER),
-            Qt.TopEdge | Qt.RightEdge: QRect(w - CORNER, 0, CORNER, CORNER),
-            Qt.BottomEdge | Qt.LeftEdge: QRect(0, h - CORNER, CORNER, CORNER),
-            Qt.BottomEdge | Qt.RightEdge: QRect(w - CORNER, h - CORNER, CORNER, CORNER),
+            Qt.TopEdge: QRect(x + CORNER, y, w - CORNER * 2, EDGE),
+            Qt.BottomEdge: QRect(x + CORNER, y + h - EDGE, w - CORNER * 2, EDGE),
+            Qt.LeftEdge: QRect(x, y + CORNER, EDGE, h - CORNER * 2),
+            Qt.RightEdge: QRect(x + w - EDGE, y + CORNER, EDGE, h - CORNER * 2),
+            Qt.TopEdge | Qt.LeftEdge: QRect(x, y, CORNER, CORNER),
+            Qt.TopEdge | Qt.RightEdge: QRect(x + w - CORNER, y, CORNER, CORNER),
+            Qt.BottomEdge | Qt.LeftEdge: QRect(x, y + h - CORNER, CORNER, CORNER),
+            Qt.BottomEdge | Qt.RightEdge: QRect(x + w - CORNER, y + h - CORNER,
+                                                CORNER, CORNER),
         }
         for edge in self._edges:
             edge.setGeometry(geo[edge._edges])  # noqa: SLF001
@@ -708,13 +840,25 @@ class DimClickShield(QWidget):
                        .toFillPolygon().toPolygon())
         holes = QRegion()
         for w in self._stack():
-            holes += QRegion(w.frameGeometry().translated(-self.x(), -self.y()))
+            holes += QRegion(self._hit_rect(w).translated(-self.x(), -self.y()))
         self.setMask(base.subtracted(holes))
         return True
 
+    @staticmethod
+    def _hit_rect(w: QWidget) -> QRect:
+        """弹窗的**可见面板**（全局坐标），浮窗要去掉阴影留白。
+
+        阴影是透明留白，点它算"点外侧"——那圈本来就不算窗口。``_place`` 与
+        ``_over_dialog`` 必须用同一个矩形，否则会出现"点得到但不关窗"。
+        """
+        frame = getattr(w, "_window_frame", None)
+        if isinstance(frame, WindowFrame):
+            return frame.panel_geometry()
+        return w.frameGeometry()
+
     def _over_dialog(self, global_pos: QPoint) -> bool:
         for w in self._stack():
-            if w.frameGeometry().contains(global_pos):
+            if self._hit_rect(w).contains(global_pos):
                 return True
         return False
 
@@ -771,13 +915,17 @@ __all__ = [
     "BAR_H",
     "DimClickShield",
     "DimOverlay",
+    "SHADOW_DY",
+    "SHADOW_PAD",
     "TitleBar",
     "WINDOW_RADIUS",
     "WindowFrame",
     "bar_bg",
     "dialog_bar_bg",
     "exec_with_dim_click",
+    "floating_size",
     "rounded_path",
+    "shadow_alpha",
     "surface_bg",
     "surface_border",
 ]

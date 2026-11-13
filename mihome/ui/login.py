@@ -17,7 +17,15 @@ from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import QDialog, QLabel, QVBoxLayout, QWidget
 
 from . import theme
-from .chrome import TitleBar, WindowFrame, surface_bg, surface_border
+from .chrome import (
+    SHADOW_PAD,
+    TitleBar,
+    WindowFrame,
+    floating_size,
+    shadow_alpha,
+    surface_bg,
+    surface_border,
+)
 
 
 
@@ -52,17 +60,21 @@ class LoginDialog(QDialog):
         self.setWindowTitle("登录米家账号")
         self.setWindowFlags(Qt.Dialog | Qt.FramelessWindowHint)
         self._frame = WindowFrame(self, resizable=False,
+                                  radius=theme.RADIUS_CARD,
+                                  shadow=SHADOW_PAD,
+                                  shadow_alpha=shadow_alpha(palette),
                                   fill=lambda: surface_bg(palette),
                                   border=lambda: surface_border(palette))
-        self.setFixedSize(380, 508)
+        self.setFixedSize(*floating_size(380, 508))
         self.setStyleSheet("QDialog{background:transparent;}")
 
-        outer = QVBoxLayout(self)
+        outer = QVBoxLayout(self._frame.body)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
 
         self.titlebar = TitleBar("登录米家账号", palette, subtitle="扫码",
-                                 buttons=("close",), variant="dialog")
+                                 buttons=("close",), variant="dialog",
+                                 frame=self._frame)
         outer.addWidget(self.titlebar)
 
         content = QWidget()

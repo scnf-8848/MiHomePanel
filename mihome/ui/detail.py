@@ -44,7 +44,15 @@ from . import theme, tooltip
 from .camera_popout import CameraPopoutWindow
 from .camera_view import CameraView, PlaybackOwnership, playbacks
 from .card_controls import MAX_SEGMENTS, CardSeg, CardSlider, CardStepper
-from .chrome import TitleBar, WindowFrame, surface_bg, surface_border
+from .chrome import (
+    SHADOW_PAD,
+    TitleBar,
+    WindowFrame,
+    floating_size,
+    shadow_alpha,
+    surface_bg,
+    surface_border,
+)
 from .combo import Combo
 from .ptz_pad import PtzPad
 from .widgets import ElidedLabel, IconProvider, ToggleSwitch, draw_text
@@ -404,20 +412,24 @@ class DetailDialog(QDialog):
         self._mode_pending = False
         self.setWindowTitle(state.name)
         self.setWindowFlags(Qt.Dialog | Qt.FramelessWindowHint)
+        # 浮窗：圆角 18 + 外圈阴影（窗口比可见面板大一圈，内容挂 ``body``）
         self._frame = WindowFrame(self, resizable=True,
+                                  radius=theme.RADIUS_CARD,
+                                  shadow=SHADOW_PAD,
+                                  shadow_alpha=shadow_alpha(self._p),
                                   fill=lambda: surface_bg(self._p),
                                   border=lambda: surface_border(self._p))
-        self.resize(480, 700)
-        self.setMinimumSize(400, 460)
+        self.resize(*floating_size(480, 700))
+        self.setMinimumSize(*floating_size(400, 460))
 
-        # 外面留 1px 给描边（QSS 的 border 画在窗口最外圈，内容要缩进来才看得见）
-        outer = QVBoxLayout(self)
+        outer = QVBoxLayout(self._frame.body)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
 
         # 自绘标题栏：设备名 + 房间，和主窗口同一套观感（没有最大化）
         self.titlebar = TitleBar(state.name, palette, subtitle=state.room or "",
-                                 buttons=("close",), variant="dialog")
+                                 buttons=("close",), variant="dialog",
+                                 frame=self._frame)
         outer.addWidget(self.titlebar)
 
         scroll = QScrollArea()

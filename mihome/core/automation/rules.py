@@ -7,9 +7,23 @@
 
 形状（v1，对应米家 App「创建自动化」页）：
 
-    {id, name, enabled, keys, condition_mode, conditions[], actions[], cooldown_ms}
+    {id, name, enabled, keys, condition_mode, conditions[], actions[], cooldown_ms[, home]}
     conditions[] = {type, op, arg}        空数组 = 无条件
-    actions[]    = {type:"virtual_event", name} | {type:"delay", ms[, unit:"s"]}
+    actions[]    = {type:"virtual_event", name}
+                 | {type:"delay", ms[, unit:"s"]}
+                 | {type:"speaker", did, name, text[, silent:true]}
+
+**规则按家庭隔离**（用户 11-13）：``home`` 记规则创建时所在的米家家庭名，列表窗 /
+回收站 / 日志的规则筛选只显示**当前家庭**的那几条，免得在 1103 家庭里看到共享家庭
+建的规则。三条约定：
+
+* ``home`` 为**空串 = 还没归属**（旧版本 ``rules.json`` 没这个键、或者没登录时建的）。
+  这种规则在**任何**家庭都可见，不会被藏起来——升级后不能让人以为规则丢了。
+  ``RuleSet.claim()`` 会在登录后把它们一次性认到当时那个家庭（``service.adopt_home``）。
+* **热键与引擎不过滤家庭**：热键是这台电脑的系统资源，被自动化的也是这台电脑，
+  切到别的家庭去看设备不该让自己的快捷键失灵。家庭只决定"在哪个页面能看到和改"。
+* 执行时按 ``did`` 全家庭找音箱（见 ``service._say``），所以指向别的家庭音箱的规则
+  只要那台设备还在，照样能跑。
 
 **软删除**：列表里的「删除」只是打 ``deleted`` 标记（连同 ``deleted_at`` 一起落盘），
 规则仍留在 ``rules.json`` 里，但 ``active()`` / ``enabled_keys()`` / ``rules_for()``
@@ -31,6 +45,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .. import paths
+from ..speaker import MAX_CHARS as MAX_SPEAK_CHARS
 from .hotkeys import normalize, reserved_reason
 
 SCHEMA_VERSION = 1
@@ -62,9 +77,9 @@ OPS: dict[str, str] = {
     "equals": "等于",
 }
 
-#: 落盘的动作类型。界面上的「延迟（秒）」不新增类型，它是 ``delay`` 的另一种
-#: 录入刻度（见 ``Action.unit``）——两种规格存的是同一个 ``ms``。
-ACTION_TYPES = ("virtual_event", "delay")
+#: 落盘的动作类型。**延迟只有一种**，界面上的「毫秒 / 秒」是 ``Action.unit``
+#: 那把尺子（两种规格存的是同一个 ``ms``），所以这里不该出现 ``delay_s``。
+ACTION_TYPES = ("virtual_event", "delay", "speaker")
 
 
 def _text(value: Any, limit: int = MAX_NAME_LEN) -> str:
@@ -77,6 +92,16 @@ def _integer(value: Any, default: int, low: int, high: int) -> int:
     except (TypeError, ValueError):
         return default
     return min(high, max(low, out))
+
+
+def _in_home(rule: Rule, home: str | None) -> bool:
+    """这条规则属不属于 ``home`` 这个家庭。
+
+    ``home is None`` = 不按家庭过滤（热键注册 / 引擎触发走这条）；**空归属的规则
+    在任何家庭都算**——那是升级前的老数据，藏起来会让人以为规则丢了
+    （判据与 ``speaker.collect_home`` 同一套，别分头写）。
+    """
+    return home is None or not rule.home or rule.home == home
 
 
 @dataclass(slots=True)
@@ -110,11 +135,17 @@ class Condition:
 
 @dataclass(slots=True)
 class Action:
-    """一个动作。``virtual_event`` 用 ``name``，``delay`` 用 ``ms``。
+    """一个动作。三种类型各用各的字段：
 
-    ``unit`` 只是**输入刻度**，语义永远由 ``ms`` 决定：校验、存盘、引擎执行全按
-    毫秒算。留着它是为了重开编辑页时「延迟（秒）」那一行仍显示 ``30`` 而不是
-    ``30000``——用户 11-13 要的是两种录入规格（毫秒 / 秒），不是两套数据。
+    * ``virtual_event`` —— 用 ``name``（事件名，要和米家自动化里监听的完全一致）；
+    * ``delay`` —— 用 ``ms``；
+    * ``speaker`` —— 用 ``did``（音箱设备 id）+ ``text``（要说的话）+ ``silent``
+      （静默执行）。**``name`` 在这里存的是音箱显示名快照**，只给日志和界面回显用；
+      设备被移除 / 改名时执行仍按 ``did`` 走（见 ``service._say``）。
+
+    ``unit`` 只是 ``delay`` 的**输入刻度**，语义永远由 ``ms`` 决定：校验、存盘、引擎
+    执行全按毫秒算。留着它是为了重开编辑页时「秒」那一档仍显示 ``30`` 而不是
+    ``30000``——用户 11-13 要的是两种录入规格，不是两套数据。
     旧文件没有这个键，读进来就是 ``"ms"``；非 ``"s"`` 的值一律退回 ``"ms"``。
     """
 
@@ -122,6 +153,9 @@ class Action:
     name: str = ""
     ms: int = 0
     unit: str = "ms"
+    did: str = ""
+    text: str = ""
+    silent: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         if self.type == "delay":
@@ -129,6 +163,12 @@ class Action:
             # 毫秒是默认刻度，不写这个键，rules.json 对旧版本仍然是原样
             if self.unit == "s":
                 out["unit"] = "s"
+            return out
+        if self.type == "speaker":
+            out = {"type": "speaker", "did": self.did, "name": self.name, "text": self.text}
+            # 不静默是默认值：不写键，读旧文件的代码也不受影响
+            if self.silent:
+                out["silent"] = True
             return out
         return {"type": "virtual_event", "name": self.name}
 
@@ -140,6 +180,13 @@ class Action:
         if kind == "delay":
             unit = "s" if _text(raw.get("unit"), 4) == "s" else "ms"
             return cls(kind, "", _integer(raw.get("ms"), 0, 0, MAX_DELAY_MS), unit)
+        if kind == "speaker":
+            return cls(
+                kind, _text(raw.get("name"), 120), 0, "ms",
+                _text(raw.get("did"), 64),
+                _text(raw.get("text"), MAX_SPEAK_CHARS),
+                raw.get("silent") is True,
+            )
         if kind == "virtual_event":
             return cls(kind, _text(raw.get("name"), 120), 0)
         return None
@@ -151,6 +198,9 @@ class Rule:
 
     ``deleted`` = 在回收站里。它**不是**启停：停用规则还会显示、还能改，删除的规则
     从列表和所有触发路径里消失。``deleted_at`` 是 epoch 秒，只给回收站显示时间用。
+
+    ``home`` = 这条规则属于哪个米家家庭（见模块 docstring）。空串表示还没归属，
+    这种规则在所有家庭都可见——**别把它当成"无家庭的规则"藏起来**。
     """
 
     id: str
@@ -163,6 +213,7 @@ class Rule:
     cooldown_ms: int = DEFAULT_COOLDOWN_MS
     deleted: bool = False
     deleted_at: float = 0.0
+    home: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         out = {
@@ -179,6 +230,9 @@ class Rule:
         if self.deleted:
             out["deleted"] = True
             out["deleted_at"] = self.deleted_at
+        # 没归属（升级前的老数据）不写键更干净，读回来仍是空串
+        if self.home:
+            out["home"] = self.home
         return out
 
     @classmethod
@@ -209,6 +263,7 @@ class Rule:
                                  0, MAX_COOLDOWN_MS),
             deleted=raw.get("deleted") is True,
             deleted_at=deleted_at,
+            home=_text(raw.get("home"), 80),
         )
 
     def clone(self) -> Rule:
@@ -230,7 +285,10 @@ def validate_rule(rule: Rule) -> list[str]:
     for i, cond in enumerate(rule.conditions, 1):
         spec = CONDITION_TYPES.get(cond.type)
         if spec is None:
-            errors.append(f"条件 {i} 的类型未知")
+            # 空串 = 编辑页那档「-」（还没选），不是"写错了"：两种说法别混，
+            # 否则用户在空行上看到"类型未知"会以为自己填错了什么。
+            errors.append(f"条件 {i} 还没选条件类型" if not cond.type
+                          else f"条件 {i} 的类型未知")
             continue
         if cond.op not in spec[1]:
             errors.append(f"条件 {i} 的比较符不适用")
@@ -251,14 +309,31 @@ def validate_rule(rule: Rule) -> list[str]:
     if not rule.actions:
         errors.append("至少要有一个动作")
     for i, act in enumerate(rule.actions, 1):
+        if act.type not in ACTION_TYPES:
+            # 编辑页的动作行默认停在「-」上（11-13 用户第八条）。这一层必须拦，
+            # 否则 ``Action.to_dict`` 会把空类型当成 virtual_event 写进 rules.json，
+            # 而 ``Action.from_dict`` 又读不回它——存进去就变成了另一条动作。
+            errors.append(f"动作 {i} 还没选动作类型")
+            continue
         if act.type == "virtual_event" and not act.name.strip():
             errors.append(f"动作 {i} 没填虚拟事件名")
         elif act.type == "delay" and not (0 <= act.ms <= MAX_DELAY_MS):
             # 界面上延迟有两种录入刻度，上限只写毫秒的话「秒」档用户得自己换算
             errors.append(f"动作 {i} 的延迟要在 0–{MAX_DELAY_MS} 毫秒"
                           f"（{MAX_DELAY_MS // 1000} 秒）之间")
-    if not any(a.type == "virtual_event" and a.name.strip() for a in rule.actions):
-        errors.append("动作里至少要有一条「发虚拟事件」")
+        elif act.type == "speaker":
+            if not act.did.strip():
+                errors.append(f"动作 {i} 没选音箱")
+            if not act.text.strip():
+                errors.append(f"动作 {i} 没填要说的话")
+            elif len(act.text) > MAX_SPEAK_CHARS:
+                errors.append(f"动作 {i} 的指令超过 {MAX_SPEAK_CHARS} 个字符")
+    # 「至少有一条真会干事的动作」——以前只认虚拟事件，加了音箱指令之后
+    # 一条「按键 → 让音箱说句话」的规则完全成立，不能再拿老条件卡它。
+    if not any((a.type == "virtual_event" and a.name.strip())
+               or (a.type == "speaker" and a.did.strip() and a.text.strip())
+               for a in rule.actions):
+        errors.append("动作里至少要有一条「发虚拟事件」或「发音箱指令」")
     if not (0 <= rule.cooldown_ms <= MAX_COOLDOWN_MS):
         errors.append("冷静期超出范围")
     return errors
@@ -323,13 +398,17 @@ class RuleSet:
         return ok
 
     # -- 查询 ------------------------------------------------------------
-    def active(self) -> list[Rule]:
-        """列表窗 / 热键注册 / 触发用的规则。**回收站里的不算**。"""
-        return [r for r in self.rules if not r.deleted]
+    def active(self, home: str | None = None) -> list[Rule]:
+        """列表窗用的规则。**回收站里的不算**。
 
-    def trashed(self) -> list[Rule]:
+        ``home`` 传家庭名就只留那个家庭的（列表 / 回收站 / 日志筛选都这么调）；
+        传 ``None`` = 不按家庭过滤（热键注册、引擎触发走这条，见模块 docstring）。
+        """
+        return [r for r in self.rules if not r.deleted and _in_home(r, home)]
+
+    def trashed(self, home: str | None = None) -> list[Rule]:
         """回收站里的规则，按删除时间倒序（最近删的在上面）。"""
-        return sorted((r for r in self.rules if r.deleted),
+        return sorted((r for r in self.rules if r.deleted and _in_home(r, home)),
                       key=lambda r: r.deleted_at, reverse=True)
 
     # -- 增删改 ----------------------------------------------------------
@@ -339,6 +418,26 @@ class RuleSet:
             rid = uuid.uuid4().hex[:8]
             if rid not in used:
                 return rid
+
+    def claim(self, home: str) -> bool:
+        """把**还没归属**的规则一次性认到 ``home``。返回是否真改了东西。
+
+        什么时候会出现没归属的规则：升级前写的 ``rules.json`` 里没有 ``home``
+        键、或者登录之前就建好了规则。不认领它们，用户升级后会发现"规则全都不
+        见了"——它们会在所有家庭可见，但那不是长久之计，下一次在哪个家庭打开就
+        归到哪儿。
+
+        **不触发 ``on_changed``**：调用方是 ``AutomationService``（构造期注册表还
+        没建好）和切家庭的处理，什么时候刷 UI 由它们决定。要写盘就当场写，
+        否则下次启动又得猜一遍。
+        """
+        touched = [r for r in self.rules if not r.home]
+        if not touched:
+            return False
+        for rule in touched:
+            rule.home = home
+        self.save()
+        return True
 
     def get(self, rule_id: str, *, include_deleted: bool = False) -> Rule | None:
         """默认只返回在用的规则；回收站 UI 才传 ``include_deleted=True``。
@@ -428,6 +527,7 @@ __all__ = [
     "MAX_COOLDOWN_MS",
     "MAX_DELAY_MS",
     "MAX_NAME_LEN",
+    "MAX_SPEAK_CHARS",
     "OPS",
     "RULES_FILE",
     "SCHEMA_VERSION",

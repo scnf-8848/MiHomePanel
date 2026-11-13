@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""电脑自动化 v1：热键 → 条件 → 按序动作（发虚拟事件 / 延迟）。
+"""电脑自动化 v1：热键 → 条件 → 按序动作（发虚拟事件 / 延迟 / 发音箱指令）。
 
 纯逻辑层（**不 import Qt、不碰网络**，验证脚本能纯离线跑）：
 
@@ -66,6 +66,7 @@ from .rules import (
     DEFAULT_COOLDOWN_MS,
     MAX_COOLDOWN_MS,
     MAX_DELAY_MS,
+    MAX_SPEAK_CHARS,
     OPS,
     SCHEMA_VERSION,
     Action,
@@ -88,6 +89,7 @@ __all__ = [
     "FIRED",
     "MAX_COOLDOWN_MS",
     "MAX_DELAY_MS",
+    "MAX_SPEAK_CHARS",
     "MOD_CONTROL",
     "MOD_NOREPEAT",
     "MOD_SHIFT",

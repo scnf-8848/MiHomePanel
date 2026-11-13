@@ -42,8 +42,19 @@ from PySide6.QtWidgets import (
 from ..core.automation import Rule
 from ..core.automation.service import AutomationService
 from . import theme
-from .automation_style import CARD_H, common_qss, fit_height, tab_focus_only
-from .chrome import TitleBar, WindowFrame, exec_with_dim_click, surface_bg, surface_border
+from .automation_style import (
+    CARD_H, common_qss, fit_height, reserve_scrollbar, tab_focus_only,
+)
+from .chrome import (
+    SHADOW_PAD,
+    TitleBar,
+    WindowFrame,
+    exec_with_dim_click,
+    floating_size,
+    shadow_alpha,
+    surface_bg,
+    surface_border,
+)
 from .settings import dialog_qss
 from .widgets import ToggleSwitch
 
@@ -171,20 +182,24 @@ class AutomationListDialog(QDialog):
         self.setWindowFlags(Qt.Dialog | Qt.FramelessWindowHint)
         self._frame = WindowFrame(
             self, resizable=True,
+            radius=theme.RADIUS_CARD,
+            shadow=SHADOW_PAD,
+            shadow_alpha=shadow_alpha(self._p),
             fill=lambda: surface_bg(self._p),
             border=lambda: surface_border(self._p),
         )
-        self.resize(640, fit_height(580))
-        self.setMinimumSize(520, 420)
+        self.resize(*floating_size(640, fit_height(580, reserve=2 * SHADOW_PAD)))
+        self.setMinimumSize(*floating_size(520, 420))
         self.setStyleSheet(_list_qss(palette))
 
-        outer = QVBoxLayout(self)
+        outer = QVBoxLayout(self._frame.body)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
-        self.title_bar = TitleBar("电脑自动化", palette, buttons=("close",), variant="dialog")
+        self.title_bar = TitleBar("电脑自动化", palette, buttons=("close",),
+                                  variant="dialog", frame=self._frame)
         outer.addWidget(self.title_bar)
 
-        body = QWidget(self)
+        body = QWidget(self._frame.body)  # 内容区，别挂窗口（窗口大一圈）
         col = QVBoxLayout(body)
         col.setContentsMargins(18, 12, 18, 12)
         col.setSpacing(10)
@@ -193,9 +208,15 @@ class AutomationListDialog(QDialog):
         hint.setObjectName("ListHint")
         hint.setWordWrap(True)
         col.addWidget(hint)
+        # 规则按家庭隔离：这一层只列出**当前家庭**的规则，标题栏顺带写清楚，
+        # 免得在别的家庭里看到"0 条规则"却以为规则丢了
+        if home := str(getattr(self.service, "current_home", "") or ""):
+            hint.setText(f"{hint.text()}\n只显示「{home}」这个家庭的规则。")
 
         self.scroll = QScrollArea(body)
         self.scroll.setWidgetResizable(True)
+        # 滚动条常驻占位：条目多到要滚时卡片不会突然变窄（见 automation_style）
+        reserve_scrollbar(self.scroll)
         self.list_body = QWidget(self.scroll)
         self.list_body.setObjectName("RuleListBody")
         self.list_col = QVBoxLayout(self.list_body)
@@ -248,13 +269,17 @@ class AutomationListDialog(QDialog):
             if widget is not None:
                 widget.setParent(None)
                 widget.deleteLater()
-        rules = self.service.rules.active()
-        trashed = self.service.rules.trashed()
+        # 规则按家庭隔离：这一层只列出**当前家庭**的规则
+        home = str(getattr(self.service, "current_home", "") or "")
+        rules = self.service.rules.active(home)
+        trashed = self.service.rules.trashed(home)
         self.title_bar.set_subtitle(f"{len(rules)} 条规则")
         self.trash_btn.setToolTip(
-            f"回收站：{len(trashed)} 条已删除规则" if trashed else "回收站是空的")
+            f"回收站：{len(trashed)} 条已删除规则" if trashed else "这是本家庭的回收站，目前是空的")
         if not rules:
-            empty = QLabel("还没有自动化规则\n点下面的「＋ 新建规则」开始配置", self.list_body)
+            extra = (f"\n列表只显示「{home}」这个家庭的规则" if home else "")
+            empty = QLabel("还没有自动化规则\n点下面的「＋ 新建规则」开始配置" + extra,
+                           self.list_body)
             empty.setObjectName("EmptyHint")
             empty.setAlignment(Qt.AlignCenter)
             self.list_col.addWidget(empty, 1)

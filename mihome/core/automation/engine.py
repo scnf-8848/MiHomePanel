@@ -1,10 +1,13 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 """纯逻辑规则引擎：三层防重、条件求值、按序动作队列、触发日志。
 
-**不 import Qt、不 import ctypes、不碰网络。** 两个出口由外部注入：
+**不 import Qt、不 import ctypes、不碰网络。** 三个出口由外部注入：
 
 * ``emit(name, done)`` —— 发一条中枢虚拟事件；``done(error)`` 在结果回来后调用
   （生产里由 ``jobs.SerialWorker`` 提交、主线程 ``drain()`` 回调，不能跨线程 emit Qt 信号）。
+* ``say(action, done)`` —— 让某台音箱执行一条文本指令（``Action.did/text/silent``）；
+  ``done(error)`` 语义同 ``emit``。**解析设备、清洗文本、拼入参全在调用方**
+  （``core/speaker.py`` + ``AutomationService._say``），引擎不认设备也不认型号。
 * ``call_later(ms, fn)`` —— 延迟动作；生产里必须接到**成员 QTimer**，不能在 UI 线程
   ``time.sleep()``。默认实现是同步立即执行，仅供离线验证兜底。
 
@@ -36,6 +39,7 @@ FAILED = "failed"
 DONE = "done"
 
 Emit = Callable[[str, Callable[[str], None]], None]
+Say = Callable[[Action, Callable[[str], None]], None]
 Later = Callable[[int, Callable[[], None]], Any]
 
 
@@ -62,6 +66,10 @@ def _no_channel(name: str, done: Callable[[str], None]) -> None:
     done("没有配置发送通道")
 
 
+def _no_speaker(_act: Action, done: Callable[[str], None]) -> None:
+    done("没有配置音箱通道")
+
+
 class AutomationEngine:
     """一台常驻的规则执行器。**挂在主窗口 / 服务层，别挂在会被销毁的对话框上。**"""
 
@@ -71,6 +79,7 @@ class AutomationEngine:
         *,
         state: Any = None,
         emit: Emit | None = None,
+        say: Say | None = None,
         call_later: Later | None = None,
         now: Callable[[], float] | None = None,
         wall_now: Callable[[], float] | None = None,
@@ -80,6 +89,7 @@ class AutomationEngine:
         self.rules = rules
         self.state = state if state is not None else PcState()
         self.emit = emit or _no_channel
+        self.say = say or _no_speaker
         self.call_later = call_later or _immediate
         self._now = now or time.monotonic
         self._wall_now = wall_now or time.time
@@ -175,6 +185,9 @@ class AutomationEngine:
                           else f"延迟 {act.ms} ms")
             self.call_later(act.ms, lambda: self._step(rule, actions, index + 1))
             return
+        if act.type == "speaker":
+            self._speak(rule, actions, index, act)
+            return
         if act.type != "virtual_event":
             self._running.discard(rule.id)
             self._add_log(rule, FAILED, f"未知动作类型 {act.type}，队列已停止")
@@ -195,6 +208,29 @@ class AutomationEngine:
         except Exception as exc:  # noqa: BLE001  发送通道抛异常也要收尾，别让 _running 卡死
             self._running.discard(rule.id)
             self._add_log(rule, FAILED, f"发送「{act.name}」异常：{exc}")
+
+    def _speak(self, rule: Rule, actions: tuple[Action, ...], index: int,
+               act: Action) -> None:
+        """音箱指令这一步。解析设备 / 清洗文本都在注入的 ``say`` 里做。"""
+        label = act.name or "音箱"
+        text = act.text if len(act.text) <= 24 else act.text[:24] + "…"
+
+        def done(error: str) -> None:
+            if self._closed or rule.id not in self._running:
+                return
+            if error:
+                self._running.discard(rule.id)
+                self._add_log(rule, FAILED, f"让「{label}」执行失败：{error}，队列已停止")
+                return
+            self._add_log(rule, SENT,
+                          f"已{'静默' if act.silent else ''}让「{label}」执行「{text}」")
+            self._step(rule, actions, index + 1)
+
+        try:
+            self.say(act, done)
+        except Exception as exc:  # noqa: BLE001  同 emit：通道抛异常也要收尾
+            self._running.discard(rule.id)
+            self._add_log(rule, FAILED, f"让「{label}」执行异常：{exc}")
 
     # -- 日志 ------------------------------------------------------------
     def _add_log(self, rule: Rule, outcome: str, detail: str) -> None:

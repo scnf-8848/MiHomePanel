@@ -52,6 +52,7 @@ from PySide6.QtCore import QPoint, QPointF, QRect, QRectF, Qt  # noqa: E402
 from PySide6.QtGui import (  # noqa: E402
     QColor,
     QFont,
+    QFontMetrics,
     QImage,
     QKeyEvent,
     QPainter,
@@ -74,7 +75,10 @@ from mihome.ui.combo import (  # noqa: E402
     ITEM_H,
     ITEM_INSET_X,
     ITEM_PAD_X,
+    POPUP_BAR_W,
     POPUP_GAP,
+    POPUP_MAX_EXTRA,
+    VIEW_PAD,
     Combo,
     PopupDelegate,
     combo_qss,
@@ -213,6 +217,10 @@ def section_qss() -> None:
         check_true(f"{pal.name}：列表不许用 palette.highlight 画方底",
                    "selection-background-color: transparent" in qss
                    and "show-decoration-selected: 0" in qss)
+        # 一行里四格挨着（编辑页 [类型][单位][值] 之类），下拉有边框、输入框没边框
+        # 会读成两种控件：描边必须和 theme.field_qss 出的那支完全一样。
+        check_true(f"{pal.name}：描边与输入框同一支（theme.field_border）",
+                   theme.field_border(pal) in qss)
         pop = popup_qss(pal)
         check_true(f"{pal.name}：弹出层有圆角", f"border-radius: {theme.RADIUS_SMALL}px" in pop)
         # 底色不能写在 QSS 里：QFrame 一旦有 background/border，就会在圆角外
@@ -353,6 +361,108 @@ def section_popup(app: QApplication) -> None:
         check(f"{pal.name}：行高 34", v.visualRect(v.model().index(0, 0)).height(), 34)
         c.hidePopup()
         c.close()
+
+
+def popup_clipped(c: Combo) -> list[str]:
+    """弹出层里会被省略号吃掉的项。逐项按 delegate 的框宽 elide 一遍。
+
+    框宽和 ``PopupDelegate.paint`` 里那个 ``box`` 同构：
+    ``view 宽 - 左右外缩进 - 左右内留白 - 右侧勾槽``。
+    """
+    view = c.view()
+    fm = QFontMetrics(view.font())
+    box = view.width() - 2 * ITEM_INSET_X - 2 * ITEM_PAD_X - CHECK_W
+    out = []
+    for i in range(c.count()):
+        text = c.itemText(i)
+        if fm.elidedText(text, Qt.ElideRight, max(1, box)) != text:
+            out.append(text)
+    return out
+
+
+def section_popup_width(app: QApplication) -> None:
+    """弹出层宽度**和控件分开算**（用户 11-13 第二轮报）。
+
+    控件宽度是布局给的：编辑页一行四格，单位那格 80px、音箱条静默那格 88px，
+    写「毫秒」「不静默」进去必然被省略成「…」「不…」。弹出层是浮层，没人跟它
+    抢地方——按最长一项撑开即可，只要别超过 ``POPUP_MAX_EXTRA`` 和屏幕。
+    """
+    print("\n7) 弹出层比控件宽：长选项不再被省略号吃掉")
+    cases = (
+        (80, ["毫秒", "秒"], "编辑页单位格"),
+        (88, ["不静默", "静默"], "音箱条静默格"),
+        (118, ["发虚拟事件", "延迟", "发音箱指令"], "编辑页动作类型"),
+        (176, ["小爱音箱Pro", "卧室的小爱音箱 Play 增强版"], "编辑页选音箱"),
+    )
+    for pal in (theme.LIGHT, theme.DARK):
+        for width, items, label in cases:
+            c = Combo(pal)
+            c.setFixedWidth(width)
+            c.move(300, 200)  # 离屏幕左边远一点，右对齐才不会被夹到 0
+            c.addItems(items)
+            c.show()
+            app.processEvents()
+            c.showPopup()
+            app.processEvents()
+            app.processEvents()
+            cont, view = c._popup, c.view()  # noqa: SLF001
+            fm = QFontMetrics(view.font())
+            longest = max(items, key=len)
+            text_w = fm.horizontalAdvance(longest)
+            need = (text_w + 2 * ITEM_INSET_X + 2 * ITEM_PAD_X + CHECK_W
+                    + POPUP_BAR_W + 2 * VIEW_PAD)
+            check_true(f"{pal.name}·{label}：控件 {width}px 太窄，弹出层撑宽了",
+                       cont.width() > width, f"{width} → {cont.width()}")
+            check_true(f"{pal.name}·{label}：view 铺满容器",
+                       abs(view.width() - cont.width()) <= 2,
+                       f"view {view.width()} / cont {cont.width()}")
+            check_true(f"{pal.name}·{label}：宽度够放最长项（含滚动条与勾槽）",
+                       cont.width() >= need or cont.width() >= text_w + CHECK_W,
+                       f"需 {need} / 实 {cont.width()}")
+            check_true(f"{pal.name}·{label}：一项都没被省略",
+                       not popup_clipped(c), str(popup_clipped(c)))
+            geo = cont.geometry()
+            right = c.mapToGlobal(QPoint(c.width(), 0)).x()
+            check_true(f"{pal.name}·{label}：加宽后右边缘仍与控件对齐",
+                       abs(geo.right() - right) <= 2, f"{geo.right()} vs {right}")
+            check_true(f"{pal.name}·{label}：没盖住控件",
+                       geo.top() - c.mapToGlobal(QPoint(0, c.height())).y() >= POPUP_GAP - 1)
+            c.hidePopup()
+            c.close()
+
+        # 控件本来就够宽 → 不动它，别无事生非地长出去
+        wide = Combo(pal)
+        wide.setFixedWidth(400)
+        wide.move(300, 200)
+        wide.addItems(["毫秒", "秒"])
+        wide.show()
+        app.processEvents()
+        wide.showPopup()
+        app.processEvents()
+        check_true(f"{pal.name}：控件够宽时弹出层不额外增长",
+                   abs(wide._popup.width() - 400) <= 2,  # noqa: SLF001
+                   f"{wide._popup.width()}")  # noqa: SLF001
+        wide.hidePopup()
+        wide.close()
+
+        # 超长项：上界是控件宽 + POPUP_MAX_EXTRA，不许无限长出去
+        huge = Combo(pal)
+        huge.setFixedWidth(150)
+        huge.move(300, 200)
+        huge.addItem("一条特别长的自定义自动化规则名称" * 6)
+        huge.show()
+        app.processEvents()
+        huge.showPopup()
+        app.processEvents()
+        check_true(f"{pal.name}：超长项时宽度有上限（≤ 控件 + {POPUP_MAX_EXTRA}）",
+                   huge._popup.width() <= 150 + POPUP_MAX_EXTRA,  # noqa: SLF001
+                   f"{huge._popup.width()}px")  # noqa: SLF001
+        check_true(f"{pal.name}：上限内也不出屏幕",
+                   huge._popup.geometry().right()  # noqa: SLF001
+                   <= (QApplication.primaryScreen().availableGeometry().right() + 1),
+                   f"right={huge._popup.geometry().right()}")  # noqa: SLF001
+        huge.hidePopup()
+        huge.close()
 
 
 def section_wheel(app: QApplication) -> None:
@@ -656,6 +766,7 @@ def main() -> int:
         section_qss()
         section_arrow(app)
         section_popup(app)
+        section_popup_width(app)
         section_wheel(app)
         section_wiring(app)
         section_check(app)

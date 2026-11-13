@@ -1,9 +1,13 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""顶栏音箱指令条：左边选音箱，右边输指令，回车发出。
+"""顶栏音箱指令条：左边选音箱，中间选静默/不静默，右边输指令，回车发出。
 
 位置就在主界面卡片墙上方那条横带上——**和顶部警告条浮层是同一条带**。警告条是
 不进布局的浮层，以后出现时会正好压在输入条上，这是 2026-11-11 定下的预期行为，
 不去调解层级（``MainWindow._place_alert`` 的边距就是为了让两者同宽同高）。
+
+结构（2026-11-13 用户第七条反馈定为三格，与自动化「发音箱指令」动作一致）::
+
+    [选音箱 v] [不静默/静默 v] [指令输入框]
 
 几个刻意的选择
 --------------
@@ -17,13 +21,13 @@
 3. **下拉不是菜单，是一块横向设备面板**（``_Panel``，2026-11-11 按参考图改）：
    图标 + 名字横排，像启动器一样一眼认得出是哪台；文字列表十行里认设备太慢。
    图标 56px——产品图是"认设备"的主要线索，缩小了反而得靠读名字。
-   面板左下角放「静默执行」（见下一条）。
-4. **「静默」是全局偏好，不是某台音箱的属性**，但它只影响"这一条怎么发"，所以
-   跟设备选择放在同一个面板里、贴着左下角，而不是塞进设置页——半夜想安静一下
-   要翻两层设置，那这个开关就白做了。默认**关**（米家实测：开着问「现在几点」
-   音箱一声不出，用户会以为发失败了）。状态存 ``Prefs.speaker_silent``。
-   **视觉上刻意做弱**：11px 弱色文字 + 16px 勾选框（``_QuietCheck``），不用设置页
-   那颗 44×24 的绿色胶囊——它只是修饰语，不该比设备方块更抢眼。
+4. **「静默」是全局偏好，不是某台音箱的属性**（存 ``Prefs.speaker_silent``），
+   但它只影响"这一条怎么发"，所以就在条上、贴着设备选择器，而不是塞进设置页——
+   半夜想安静一下要翻两层设置，那这个开关就白做了。默认**关**（米家实测：开着问
+   「现在几点」音箱一声不出，用户会以为发失败了）。
+   **2026-11-13 从小勾选框改成下拉**：用户要的是「[选音箱][静默/不静默][输入]」
+   这个和自动化动作行一致的三格结构，勾选框挪到面板左下角那一版已经去掉了。
+   视觉上仍刻意做弱：12px 弱色字 + 无边框 + 透明底，不与"发给哪台"抢注意力。
 5. **面板是独立顶层窗口**（``Qt.Popup``），和 ``ui/menu.py`` 一样必须自己透明：
    否则圆角外面还有一块方底。它不进布局，所以**条高 48 与警告条几何一个字不改**。
 6. **不清洗就不发**：清洗规则全在 ``core/speaker.py``，这里只负责把结果讲给用户
@@ -34,7 +38,7 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import QEvent, QPoint, QRectF, Qt, Signal
+from PySide6.QtCore import QEvent, QPoint, QRectF, QSignalBlocker, Qt, Signal
 from PySide6.QtGui import (
     QColor,
     QFont,
@@ -45,10 +49,11 @@ from PySide6.QtGui import (
     QPalette,
     QPen,
 )
-from PySide6.QtWidgets import QHBoxLayout, QLabel, QLineEdit, QSizePolicy, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QHBoxLayout, QLineEdit, QSizePolicy, QVBoxLayout, QWidget
 
 from ..core import speaker
 from . import theme, tooltip
+from .combo import Combo, combo_qss
 from .widgets import IconProvider
 
 #: 条高。与 ``AlertBar.H`` 一致：警告条浮层要正好压住它。
@@ -61,6 +66,10 @@ ICON = 20
 #: 名字最长画多宽，超出按省略号收。200px 够放下「Xiaomi 智能家庭屏 6」这种默认名，
 #: 再长（用户自己起的长名字）就让它省略——输入框比名字重要，不能被挤没
 NAME_MAX = 200
+#: 静默 / 不静默下拉的宽度。3 个全角字 + 左侧 6px + 右侧给 chevron 留的 26px
+SILENT_W = 88
+#: 中间那格的选项。data 就是布尔值，直接进 ``speaker.directive``
+SILENT_LABELS = ((False, "不静默"), (True, "静默"))
 
 # -- 面板尺寸 ---------------------------------------------------------------
 #: 设备方块：上内边距 10 + 图标 56 + 间隙 8 + 名字 18
@@ -344,171 +353,8 @@ class _Tile(QWidget):
         super().mouseReleaseEvent(event)
 
 
-class _QuietCheck(QWidget):
-    """静默开关用的小勾选框，16×16。
-
-    为什么不用 ``ToggleSwitch``：那是设置页和卡片上"一眼看出谁开着"的主角控件，
-    44×24 的绿色胶囊塞进这块面板，比下面任何一个设备方块都抢眼——而「静默」只是
-    "这一条怎么发"的修饰语，不是面板的主要内容（2026-11-11 用户原话：存在感很强）。
-    换成小号的勾选框后，关着只剩一圈弱描边，扫过去就过去了；开着才有色，用的还是
-    与"当前设备"同源的 ``pal.accent``。
-
-    交互上仍复用 ``_SilentRow`` 那套：整行可点，这个小方块自己也吃点击（不往父控件
-    冒泡，免得一次点击切两下）。
-    """
-
-    toggled = Signal(bool)
-
-    SIDE = 16
-    R = 4
-
-    def __init__(self, on: bool, palette: theme.Palette, parent: QWidget) -> None:
-        super().__init__(parent)
-        self._p = palette
-        self._on = bool(on)
-        self._hover = False
-        self.setFixedSize(self.SIDE, self.SIDE)
-        self.setCursor(Qt.PointingHandCursor)
-
-    # -- 状态 ------------------------------------------------------------
-    def is_on(self) -> bool:
-        return self._on
-
-    def set_on(self, on: bool, animate: bool = True) -> None:
-        # 签名对齐 ``ToggleSwitch.set_on``：调用方（含验证脚本）不必区分是哪种控件。
-        # 16px 的方块没有滑块可滑，动画没有意义，animate 只是接住不用。
-        on = bool(on)
-        if on == self._on:
-            return
-        self._on = on
-        self.update()
-
-    def set_palette(self, palette: theme.Palette) -> None:
-        self._p = palette
-        self.update()
-
-    # -- 绘制 ------------------------------------------------------------
-    def paintEvent(self, event) -> None:  # noqa: N802
-        pal = self._p
-        p = QPainter(self)
-        p.setRenderHint(QPainter.Antialiasing)
-        r = QRectF(self.rect()).adjusted(0.75, 0.75, -0.75, -0.75)
-        if self._on:
-            fill = pal.accent
-            if self._hover:
-                fill = theme.blend(fill, pal.text, 0.12)
-            p.setPen(Qt.NoPen)
-            p.setBrush(QColor(fill))
-            p.drawRoundedRect(r, self.R, self.R)
-            # 勾：两段折线，圆头；白色在深色/浅色的 accent 上都读得出来
-            cy = r.center().y()
-            path = QPainterPath()
-            path.moveTo(r.left() + 3.6, cy + 0.2)
-            path.lineTo(r.left() + 6.4, cy + 3.0)
-            path.lineTo(r.right() - 3.2, cy - 3.0)
-            p.setBrush(Qt.NoBrush)
-            p.setPen(QPen(QColor("#FFFFFF"), 1.8, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
-            p.drawPath(path)
-        else:
-            p.setPen(QPen(QColor(pal.text if self._hover else pal.text_mute), 1.2))
-            p.setBrush(Qt.NoBrush)
-            p.drawRoundedRect(r, self.R, self.R)
-        p.end()
-
-    # -- 交互 ------------------------------------------------------------
-    def enterEvent(self, event) -> None:  # noqa: N802
-        self._hover = True
-        self.update()
-
-    def leaveEvent(self, event) -> None:  # noqa: N802
-        self._hover = False
-        self.update()
-
-    def mouseReleaseEvent(self, event) -> None:  # noqa: N802
-        if event.button() == Qt.LeftButton and self.rect().contains(
-            event.position().toPoint()
-        ):
-            self.set_on(not self._on)
-            self.toggled.emit(self._on)
-            return
-        super().mouseReleaseEvent(event)
-
-
-class _SilentRow(QWidget):
-    """「静默执行」+ 小勾选框。整行可点，别逼用户去戳那 16×16 的小方块。
-
-    文字放右边、勾选框放左边：面板的左下角是它该待的地方，与参考图一致；开关在左，
-    视线从设备行落下来第一眼就撞上它，不用横着找。
-
-    视觉权重刻意压到最低（11px + 弱色文字 + 16px 勾选框）：它是"这一条怎么发"的
-    修饰语，不该和"发给哪台设备"抢同一层注意力。关着时文字走 ``text_mute``，开着才
-    提到正文色——颜色本身就是状态提示，不需要再用文字重复一遍"已开启"。
-    """
-
-    toggled = Signal(bool)
-
-    def __init__(self, palette: theme.Palette, on: bool, parent: QWidget) -> None:
-        super().__init__(parent)
-        self._p = palette
-        row = QHBoxLayout(self)
-        row.setContentsMargins(0, 0, 0, 0)
-        row.setSpacing(7)
-        self.switch = _QuietCheck(on, palette, self)
-        row.addWidget(self.switch, 0, Qt.AlignVCenter)
-        # QLabel 必须带 parent：无父控件的 QWidget 就是顶层窗口（会弹小窗）
-        self.label = QLabel("静默执行", self)
-        row.addWidget(self.label, 0, Qt.AlignVCenter)
-        # 行本身没有底色，视觉高度只有 16px；撑到 20 是为了点击目标别太窄
-        # （整行仍然可点，边框看不见但不影响命中）
-        self.setMinimumHeight(20)
-        self.switch.toggled.connect(self._on_switch)
-        self.setCursor(Qt.PointingHandCursor)
-        tooltip.watch(self, self._tip)
-        self._sync_label()
-
-    def set_palette(self, palette: theme.Palette) -> None:
-        self._p = palette
-        self.switch.set_palette(palette)
-        self._sync_label()
-
-    def is_on(self) -> bool:
-        return self.switch.is_on()
-
-    def set_on(self, on: bool, animate: bool = True) -> None:
-        self.switch.set_on(on, animate)
-        self._sync_label()
-
-    def _on_switch(self, on: bool) -> None:
-        self._sync_label()
-        self.toggled.emit(on)
-
-    def _sync_label(self) -> None:
-        color = self._p.text if self.switch.is_on() else self._p.text_mute
-        self.label.setStyleSheet(
-            f"color:{color};font-size:11px;background:transparent;"
-        )
-
-    def _tip(self) -> str:
-        return (
-            "开：音箱只执行、不念结果（问「现在几点」不会报时）。\n"
-            "关：正常出声回答。这是全局偏好，换音箱也跟着走。"
-        )
-
-    def mouseReleaseEvent(self, event) -> None:  # noqa: N802
-        # 点勾选框本身由 ``_QuietCheck`` 自己处理（它不往上冒泡），所以这里只管
-        # 点到文字或空白的那一下，不会双重切换。
-        if event.button() == Qt.LeftButton and self.rect().contains(
-            event.position().toPoint()
-        ):
-            self.switch.set_on(not self.switch.is_on())
-            self._sync_label()
-            self.toggled.emit(self.switch.is_on())
-            return
-        super().mouseReleaseEvent(event)
-
-
 class _Panel(QWidget):
-    """选音箱的横向面板：一排设备方块 + 左下角「静默执行」。
+    """选音箱的横向面板：只放设备方块（「静默」2026-11-13 挪到条上做下拉了）。
 
     它是 ``Qt.Popup``：点外面、按 Esc 都会自己收起（Qt 内建行为），所以这里只需要
     在"点了某台设备"时主动 ``hide()``。窗口必须自己透明（``WA_TranslucentBackground``
@@ -517,7 +363,6 @@ class _Panel(QWidget):
     """
 
     picked = Signal(str)
-    silent_changed = Signal(bool)
 
     def __init__(
         self,
@@ -525,7 +370,6 @@ class _Panel(QWidget):
         icons: IconProvider,
         targets: list[speaker.Target],
         current_did: str,
-        silent: bool,
         parent: QWidget,
     ) -> None:
         super().__init__(
@@ -557,16 +401,11 @@ class _Panel(QWidget):
         row.addStretch(1)
         col.addLayout(row)
 
-        self.silent_row = _SilentRow(palette, silent, self)
-        self.silent_row.toggled.connect(self.silent_changed)
-        col.addWidget(self.silent_row, 0, Qt.AlignLeft)
-
     # -- 对外 ------------------------------------------------------------
     def set_palette(self, palette: theme.Palette) -> None:
         self._p = palette
         for tile in self.tiles:
             tile.set_palette(palette)
-        self.silent_row.set_palette(palette)
         self.update()
 
     def silent(self) -> bool:
@@ -682,6 +521,20 @@ class SpeakerBar(QWidget):
         self.picker.clicked.connect(self._open_panel)
         row.addWidget(self.picker)
 
+        # 静默 / 不静默：和自动化「发音箱指令」动作同一套三格结构里的中间那格。
+        # 用项目统一的 Combo（弹层圆角、滚轮不误切、下拉不盖住控件都已解决），
+        # 但在这里改成"无边框透明底"，否则条里会套出一个双层框。
+        self.silent_combo = Combo(palette, self)
+        for value, label in SILENT_LABELS:
+            self.silent_combo.addItem(label, value)
+        self.silent_combo.setFixedHeight(PICKER_H)
+        self.silent_combo.setFixedWidth(SILENT_W)
+        self.silent_combo.setToolTip(
+            "开：音箱只执行、不念结果（问「现在几点」不会报时）。\n"
+            "关：正常出声回答。这是全局偏好，换音箱也跟着走。")
+        self.silent_combo.currentIndexChanged.connect(self._on_silent_pick)
+        row.addWidget(self.silent_combo, 0, Qt.AlignVCenter)
+
         self.input = _Input(self)
         self.input.returnPressed.connect(self._send)
         self.input.textChanged.connect(self._on_text_changed)
@@ -689,6 +542,7 @@ class SpeakerBar(QWidget):
         row.addWidget(self.input, 1)
 
         self._apply_input_style()
+        self._apply_silent_style()
         self._refresh_enabled()
 
     # -- 对外 ------------------------------------------------------------
@@ -699,8 +553,19 @@ class SpeakerBar(QWidget):
         return self._silent
 
     def set_silent(self, on: bool) -> None:
-        """设静默开关（面板里点一下，或启动时从偏好读进来）。"""
+        """设静默开关（条上下拉里点一下，或启动时从偏好读进来）。"""
         on = bool(on)
+        with QSignalBlocker(self.silent_combo):
+            index = self.silent_combo.findData(on)
+            if index >= 0:
+                self.silent_combo.setCurrentIndex(index)
+        if on == self._silent:
+            return
+        self._silent = on
+        self.silent_changed.emit(on)
+
+    def _on_silent_pick(self, *_args) -> None:
+        on = bool(self.silent_combo.currentData())
         if on == self._silent:
             return
         self._silent = on
@@ -709,6 +574,8 @@ class SpeakerBar(QWidget):
     def set_palette(self, palette: theme.Palette) -> None:
         self._p = palette
         self.picker.set_palette(palette)
+        self.silent_combo.set_palette(palette)
+        self._apply_silent_style()
         self._apply_input_style()
         self.update()
 
@@ -776,6 +643,25 @@ class SpeakerBar(QWidget):
         qp.setColor(QPalette.Text, QColor(pal.text))
         self.input.setPalette(qp)
 
+    def _apply_silent_style(self) -> None:
+        """静默下拉在条里要"无边框透明底"，否则 48px 的条里会套出一个双层框。
+
+        ``Combo`` 自己那份 ``combo_qss`` 有底有色有边框（详情页 / 设置页要的），
+        这里在它后面追加覆盖：同特异性、写在后面就赢。**每次 set_palette 都要重
+        设一遍**——``Combo.set_palette`` 会整份重写样式表，把这份覆盖冲掉。
+        字色走 ``text_soft``：它只是修饰语，不该比"发给哪台"抢注意力；鼠标移上去
+        才提到正文色（``Combo`` 自己也按 hover 重画 chevron）。
+        """
+        pal = self._p
+        self.silent_combo.setStyleSheet(combo_qss(pal) + f"""
+        QComboBox {{
+            background: transparent; border: none;
+            padding: 0 26px 0 6px; font-size: 12px; color: {pal.text_soft};
+        }}
+        QComboBox:hover {{ color: {pal.text}; }}
+        QComboBox:disabled {{ background: transparent; color: {pal.text_mute}; }}
+        """)
+
     def _on_text_changed(self, _text: str) -> None:
         if self.input.trim():
             self.notice(f"最多 {speaker.MAX_CHARS} 个字符，多的没写进去")
@@ -802,7 +688,6 @@ class SpeakerBar(QWidget):
             self._icons,
             self._targets,
             self._target.did if self._target is not None else "",
-            self._silent,
             self,
         )
 
@@ -811,7 +696,6 @@ class SpeakerBar(QWidget):
             return
         panel = self._build_panel()
         panel.picked.connect(self._on_panel_pick)
-        panel.silent_changed.connect(self.set_silent)
         # 挂到**整条**的左下角，不是 picker 的左下角：面板是"这条输入框的下拉"，
         # 与条同宽起步，视觉上才像从条里抽出来的一张纸（参考图就是这个关系）
         panel.show_at(self.mapToGlobal(QPoint(0, self.height() + 6)))
@@ -835,13 +719,17 @@ class SpeakerBar(QWidget):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
         body = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        # 描边按**这一态自己的底**起算（见 theme.field_border）：原来两态都用
+        # pal.border，深色下对 card(#1B1D22) 只有 1.13:1、对 bg_soft 1.27:1，
+        # 整条读成一个没有边界的灰块——和编辑页输入框是同一个毛病。
         if not self._live:
             # 没有可用音箱 / 目标离线：底色压一档，免得白得像个还能点的框
-            p.setPen(QPen(QColor(pal.border), 1))
-            p.setBrush(QColor(pal.bg_soft))
+            fill = pal.bg_soft
         else:
-            p.setPen(QPen(QColor(pal.accent if self._focus else pal.border), 1))
-            p.setBrush(QColor(pal.card))
+            fill = pal.card
+        line = theme.field_border(pal, fill)
+        p.setPen(QPen(QColor(pal.accent if self._focus else line), 1))
+        p.setBrush(QColor(fill))
         p.drawRoundedRect(body, R, R)
         p.end()
 

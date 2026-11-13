@@ -3,7 +3,11 @@
 
     ① 当以下情况发生时 —— 快捷键（录制 / 手动选键）+ 注册状态 + **冷静期**
     ② 满足全部 / 任一状态条件 —— 电脑条件行，可为空
-    ③ 则执行动作 —— 发虚拟事件 / 延迟，按从上到下顺序执行，可加减与调序
+    ③ 则执行动作 —— 发虚拟事件 / 延迟 / 发音箱指令，按从上到下顺序执行，可加减与调序
+
+② 和 ③ 都只有**一枚**「＋ 添加…」按钮（11-13 用户第八条）：加出来的那一行落在空档
+「-」上，用户自己在下拉里挑类型，② 和 ③ 因此长得一样。空档是**还没选**，不是"类型
+写错了"——不选就点保存会被拦（见 ``ActionRow.needs_kind``），但刚加进来不先亮红字。
 
 **四层窗口**：点功能区「电脑自动化」弹的是 ``ui/automation_list.py`` 的规则列表，
 点卡片「编辑」/「＋ 新建规则」才叠出这一层。所以本窗口只认一个 ``rule_id``
@@ -42,11 +46,14 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from ..core import speaker
 from ..core.automation import (
+    ACTION_TYPES,
     CONDITION_TYPES,
     DEFAULT_COOLDOWN_MS,
     MAX_COOLDOWN_MS,
     MAX_DELAY_MS,
+    MAX_SPEAK_CHARS,
     OPS,
     Action,
     Condition,
@@ -59,8 +66,18 @@ from ..core.automation import (
 from ..core.automation.hotkeys import MOD_ALT, MOD_CONTROL, MOD_SHIFT, MOD_WIN, key_choices
 from ..core.automation.service import AutomationService
 from . import theme
-from .automation_style import chip_border, chip_fill, common_qss, fit_height, tab_focus_only
-from .chrome import TitleBar, WindowFrame, surface_bg, surface_border
+from .automation_style import (
+    chip_border, chip_fill, common_qss, fit_height, reserve_scrollbar, tab_focus_only,
+)
+from .chrome import (
+    SHADOW_PAD,
+    TitleBar,
+    WindowFrame,
+    floating_size,
+    shadow_alpha,
+    surface_bg,
+    surface_border,
+)
 from .combo import Combo
 from .confirm import confirm, notice
 from .settings import dialog_qss
@@ -69,15 +86,26 @@ from .settings_rows import SettingsCard
 #: 条件 / 动作行右侧的小图标按钮统一尺寸（命中区 ≥28px，padding 必须为 0）
 _ICON_BTN = 30
 
-#: 下拉里三个动作类型的顺序即列表顺序。``delay_s`` 不是新动作类型，只是
-#: ``delay`` 的另一种录入刻度（值仍然折算成毫秒存，见 ``Action.unit``）。
-_ACTION_LABELS = (("virtual_event", "发虚拟事件"),
-                  ("delay", "延迟（毫秒）"),
-                  ("delay_s", "延迟（秒）"))
-#: 两种延迟规格，换算只在这两者之间做
-_DELAY_KINDS = ("delay", "delay_s")
-#: 换成延迟档时的默认值：两种规格都是 1 秒，切换规格不跳数量级
-_DELAY_DEFAULTS = {"delay": "1000", "delay_s": "1"}
+#: 动作行最左那格「1.」的宽度，以及行内控件间距（``ActionRow`` 与 ``ConditionRow``
+#: 都用 8）。③底部「＋ 添加动作」要对齐**类型下拉**的左边缘，而不是卡片左边缘：
+#: 动作行比条件行多一格序号，所以按钮得右移这么多（11-13 用户第八条）。
+_INDEX_W = 20
+_ROW_GAP = 8
+_ACTION_INDENT = _INDEX_W + _ROW_GAP
+
+#: 动作类型下拉的四档。首档是**空档**「-」= 还没选（11-13 用户第八条：③ 只留一枚
+#: 「＋ 添加动作」，加出来先落在空档上，用户再挑类型）。**延迟只有一种**，毫秒 / 秒
+#: 是它旁边那格单位下拉（同一份 ``ms`` 的两把尺子，见 ``Action.unit``）。
+_ACTION_LABELS = (("", "-"),
+                  ("virtual_event", "发虚拟事件"),
+                  ("delay", "延迟"),
+                  ("speaker", "发音箱指令"))
+#: 延迟的单位下拉。data 直接就是 ``Action.unit`` 的取值
+_UNIT_LABELS = (("ms", "毫秒"), ("s", "秒"))
+#: 换成延迟时的默认值：两种单位都是 1 秒，换单位不跳数量级
+_DELAY_DEFAULTS = {"ms": "1000", "s": "1"}
+#: 音箱指令的「静默」下拉。data 是 bool，直接进 ``Action.silent``
+_SILENT_LABELS = ((False, "不静默"), (True, "静默"))
 #: 秒档最多几位小数。**执行精度是 1 ms，所以 3 位刚好无损**：再多存不进去，
 #: 再少（比如只留 1 位）就会让 1234 ms 之类的值重开一次就变样。改这个数要连着
 #: `_delay_text` 的格式化一起看。
@@ -91,15 +119,27 @@ _HINT_TIPS = {
         f"执行精度是 1 毫秒，第 {MAX_DELAY_DECIMALS + 1} 位以后存不进去"
         f"（1.234 秒 = 1234 毫秒）",
     "要填延迟时间": "延迟必须有值；不想等待就删掉这一行动作",
+    "要先选动作类型": "这一行还没选类型：点左边的下拉挑「发虚拟事件 / 延迟 / 发音箱指令」；"
+                    "不想加这条就点右边的 × 删掉",
     "不能小于 0": "延迟不能是负数",
     f"不能超过 {MAX_DELAY_MS} 毫秒": f"单条延迟上限 {MAX_DELAY_MS} 毫秒（{MAX_DELAY_MS // 1000} 秒）",
     f"不能超过 {MAX_DELAY_MS // 1000} 秒": f"单条延迟上限 {MAX_DELAY_MS} 毫秒（{MAX_DELAY_MS // 1000} 秒）",
+    "要先选音箱": "这一行要先挑一台音箱；下拉里只有当前家庭里支持「执行文本指令」的那几台",
+    "没有可选音箱": "当前家庭里没有支持「执行文本指令」的音箱（小爱音箱多数支持，"
+                    "触屏音箱不一定），先在米家 App 里确认设备在线",
+    "要填指令": "音箱指令不能为空；不想说话就删掉这一行动作",
+    # ② 条件行（用户 11-13 第九条：② 也改成行内红字）
+    "要先选条件类型": "这一行还没选条件类型：点左边的下拉挑「某程序正在运行 / 电脑空闲 / …」；"
+                    "不想加就点右边的 × 删掉",
+    "要填参数": "这一格是条件的判断依据：进程名、分钟数、标题片段、是 / 否、ac / battery，"
+              "看左边类型那格的 placeholder",
+    "参数要填数字": "这一格只收数字（分钟数、电量百分比这类），中文和单位后缀都不行",
+    "填「是」或「否」": "锁屏条件只认四种写法：是 / 否 / true / false",
+    "填 ac 或 battery": "供电条件只认 ac（插电）或 battery（电池），不区分大小写",
+    "要填程序名": "「程序已运行 N 分钟」要同时知道程序名和分钟数，右边这格填可执行文件名",
+    # 「多了 N 个字」「含 N 个发不出的字符」带数字，由 ActionRow._hint_tip 现拼
 }
 _MODE_LABELS = (("all", "满足全部状态条件"), ("any", "满足任一状态条件"))
-
-
-def _delay_unit(kind: str) -> str:
-    return "s" if kind == "delay_s" else "ms"
 
 
 def _delay_text(ms: int, unit: str) -> str:
@@ -178,12 +218,9 @@ def _error_color(p: theme.Palette) -> str:
 
 
 def _page_qss(p: theme.Palette) -> str:
-    return dialog_qss(p) + f"""
-    QLineEdit#Field {{
-        background: {theme.panel_bg(p)}; color: {p.text}; font-size: 12px;
-        border: 1px solid {p.border}; border-radius: 8px; padding: 5px 9px;
-    }}
-    QLineEdit#Field:focus {{ border-color: {p.accent}; }}
+    return dialog_qss(p) + theme.field_qss(
+        p, "QLineEdit#Field", radius=8, padding="5px 9px", font_size=12
+    ) + f"""
     QLabel#Hint {{ color: {p.text_soft}; font-size: 11px; }}
     QLabel#Warn {{ color: {_error_color(p)}; font-size: 11px; }}
     QLabel#Ok {{ color: {theme.ACCENT_GREEN}; font-size: 11px; }}
@@ -223,10 +260,13 @@ def _page_qss(p: theme.Palette) -> str:
     QPushButton#Disclosure:hover {{ color: {p.accent}; }}
     QPushButton#Disclosure:pressed {{ color: {theme.blend(p.accent, p.bg, 0.32)}; }}
     QPushButton#Disclosure:checked {{ color: {p.text}; }}
+    /* 键帽是"点击进入录制的输入框"，不是普通按钮：底与描边都按输入控件那套算
+       （panel_bg + p.border 在深色下只有 1.01:1，键位文字会浮在一块没有边界的灰上，
+       和编辑页输入框是同一个坑，见 theme.field_border）。 */
     QPushButton#Keycap {{
-        background: {theme.panel_bg(p)}; color: {p.text}; font-size: 13px;
-        border: 1px solid {p.border}; border-radius: 8px; padding: 7px 12px;
-        min-width: 150px; text-align: left;
+        background: {theme.field_bg(p)}; color: {p.text}; font-size: 13px;
+        border: 1px solid {theme.field_border(p)}; border-radius: 8px;
+        padding: 7px 12px; min-width: 150px; text-align: left;
     }}
     QPushButton#Keycap:hover {{ border-color: {p.accent}; }}
     QPushButton#Keycap[recording="true"] {{ border-color: {p.accent}; color: {p.accent}; }}
@@ -252,7 +292,17 @@ def _icon_button(text: str, tip: str, parent: QWidget) -> QPushButton:
 # ---------------------------------------------------------------------------
 
 class ConditionRow(QWidget):
-    """一行 = 类型 + 比较符 + 参数（+ 程序名）+ 删除。"""
+    """一行 = 类型 + 比较符 + 参数（+ 程序名）+ 行内红字 + 删除。
+
+    类型下拉首档是空档「-」：② 只有一枚「＋ 添加条件」，加出来的行落在空档上，
+    用户再挑条件类型（11-13 用户第八条）。空档时后面几格灰掉、比较符清空，
+    ``value()`` 交出去的 ``type`` 是空串。
+
+    **红字和 ③ 动作行同一套**（用户 11-13 第九条）：``hint``（``QLabel#Warn``）夹在
+    参数 / 程序名与 × 之间，``textChanged`` 就刷，边打边判；空档那条「要先选条件类型」
+    只在点过保存后才亮（``reveal_missing()``），理由同 ③——刚加一行就一片红是在骂人。
+    判据必须和 ``rules.validate_rule`` 逐条对齐，否则会出现"行内没红字、底部却报错"。
+    """
 
     def __init__(self, cond: Condition, palette: theme.Palette,
                  on_change: Callable[[], None], on_remove: Callable[[QWidget], None],
@@ -260,13 +310,17 @@ class ConditionRow(QWidget):
         super().__init__(parent)
         self._p = palette
         self._on_change = on_change
+        self._show_missing = False
+        # 构造期回填会触发 textChanged；照 ActionRow 的做法挡住标脏
+        self._loading = True
         lay = QHBoxLayout(self)
         lay.setContentsMargins(0, 3, 0, 3)
-        lay.setSpacing(8)
+        lay.setSpacing(_ROW_GAP)
 
         self.kind = Combo(palette, self)
         # addItem 会发 currentIndexChanged；此时其它控件还没建好，连接必须放到最后
         with QSignalBlocker(self.kind):
+            self.kind.addItem("-", "")
             for key, (label, *_rest) in CONDITION_TYPES.items():
                 self.kind.addItem(label, key)
         self.kind.setFixedWidth(160)
@@ -277,13 +331,18 @@ class ConditionRow(QWidget):
         self.arg = QLineEdit(self)
         self.arg.setObjectName("Field")
         self.arg.setPlaceholderText("参数")
-        self.arg.textChanged.connect(on_change)
+        self.arg.textChanged.connect(self._on_text)
 
         self.target = QLineEdit(self)
         self.target.setObjectName("Field")
         self.target.setPlaceholderText("程序名，如 python.exe")
         self.target.setFixedWidth(150)
-        self.target.textChanged.connect(on_change)
+        self.target.textChanged.connect(self._on_text)
+
+        self.hint = QLabel("", self)
+        self.hint.setObjectName("Warn")
+        self.hint.setWordWrap(False)
+        self.hint.setVisible(False)
 
         self.remove_btn = _icon_button("×", "删除这条条件", self)
         self.remove_btn.clicked.connect(lambda: on_remove(self))
@@ -292,8 +351,12 @@ class ConditionRow(QWidget):
         lay.addWidget(self.op)
         lay.addWidget(self.arg, 1)
         lay.addWidget(self.target)
+        lay.addWidget(self.hint)
         lay.addWidget(self.remove_btn)
         self.kind.currentIndexChanged.connect(self._kind_changed)
+        # 比较符以前没接：改「≥ / ≤」「是 / 不是」既不刷新红字也不标脏，
+        # 关窗不会提示未保存。顺手补上（同一个 _on_text 就够）。
+        self.op.currentIndexChanged.connect(self._on_text)
 
         idx = self.kind.findData(cond.type)
         self.kind.setCurrentIndex(max(0, idx))
@@ -303,66 +366,183 @@ class ConditionRow(QWidget):
         self.arg.setText(cond.arg)
         self.target.setText(cond.target)
         self._sync_visibility()
+        self._loading = False
+        self.sync_hint()
+
+    def _on_text(self, *_args: Any) -> None:
+        self.sync_hint()
+        if not self._loading:
+            self._on_change()
+
+    def _kind_key(self) -> str:
+        return str(self.kind.currentData() or "")
 
     def _fill_ops(self, kind: str) -> None:
         with QSignalBlocker(self.op):
             self.op.clear()
-            for op in CONDITION_TYPES[kind][1]:
+            spec = CONDITION_TYPES.get(kind)
+            if spec is None:  # 空档：比较符留空，免得 currentData 交出 None
+                return
+            for op in spec[1]:
                 self.op.addItem(OPS[op], op)
 
     def _kind_changed(self) -> None:
-        kind = str(self.kind.currentData())
+        kind = self._kind_key()
         self._fill_ops(kind)
         self.arg.clear()  # 旧参数换类型后多半不再适用，别留着混进新条件
-        self.arg.setPlaceholderText(CONDITION_TYPES[kind][2])
+        self._show_missing = False  # 选了类型就不再是"还没选"
         self._sync_visibility()
-        self._on_change()
+        self.sync_hint()
+        if not self._loading:
+            self._on_change()
 
     def _sync_visibility(self) -> None:
-        kind = str(self.kind.currentData())
+        kind = self._kind_key()
+        spec = CONDITION_TYPES.get(kind)
         self.target.setVisible(kind == "process_elapsed")
-        self.arg.setPlaceholderText(CONDITION_TYPES[kind][2])
+        self.arg.setPlaceholderText(spec[2] if spec else "先选条件类型")
+        # 空档时比较符 / 参数没有意义：灰掉但**保留位置**，行宽别跟着跳
+        self.op.setEnabled(spec is not None)
+        self.arg.setEnabled(spec is not None)
+
+    # -- 行内红字（与 rules.validate_rule 的条件那一段逐条对齐） -----------
+    def error_text(self) -> str:
+        """这一行的问题，没有则返回空串。文案要短——宽度是从参数输入框那里抢的。"""
+        kind = self._kind_key()
+        spec = CONDITION_TYPES.get(kind)
+        if spec is None:
+            return "要先选条件类型" if self._show_missing else ""
+        arg = self.arg.text().strip()
+        if not arg:
+            return "要填参数"
+        if spec[3]:
+            try:
+                float(arg)
+            except ValueError:
+                return "参数要填数字"
+        elif kind == "locked" and arg.lower() not in ("true", "false", "是", "否"):
+            return "填「是」或「否」"
+        elif kind == "power" and self._op_key() == "is" \
+                and arg.lower() not in ("ac", "battery"):
+            return "填 ac 或 battery"
+        if kind == "process_elapsed" and not self.target.text().strip():
+            return "要填程序名"
+        return ""
+
+    def needs_kind(self) -> bool:
+        return self._kind_key() not in CONDITION_TYPES
+
+    def reveal_missing(self) -> None:
+        """点保存时把「要先选条件类型」亮出来；选了类型会自动撤掉。"""
+        if not self.needs_kind():
+            return
+        self._show_missing = True
+        self.sync_hint()
+
+    def sync_hint(self) -> None:
+        text = self.error_text()
+        self.hint.setText(text)
+        self.hint.setToolTip(_HINT_TIPS.get(text, ""))
+        self.hint.setVisible(bool(text))
+
+    def focus_widget(self) -> QWidget:
+        """出错时焦点该给谁：没选类型 / 参数灰着 → 类型下拉；缺程序名 → 那格。"""
+        if self.needs_kind() or not self.arg.isEnabled():
+            return self.kind
+        if not self.target.isHidden() and not self.target.text().strip():
+            return self.target
+        return self.arg
+
+    def _op_key(self) -> str:
+        return str(self.op.currentData() or "")
 
     def value(self) -> Condition:
         return Condition(
-            str(self.kind.currentData()), str(self.op.currentData()),
+            self._kind_key(), self._op_key(),
             self.arg.text().strip(), self.target.text().strip(),
         )
 
 
-class ActionRow(QWidget):
-    """一行 = 类型 + 事件名 / 延迟值 + 上移 / 下移 / 删除。
+def _speaker_targets(service: AutomationService) -> list[speaker.Target]:
+    """当前家庭里能「执行文本指令」的音箱；取不到就当没有。
 
-    延迟有两种录入规格（毫秒 / 秒），下拉里就是两档；**存的一律是毫秒**，
-    秒档只是把输入框里的数字 ×1000，见 ``_delay_ms`` / ``_delay_text``。
+    为什么要吞异常：这一层只决定"下拉里有几项"，探测失败不该把整个编辑窗带崩
+    （离线验证用的假 service 根本没有这个方法）。
+    """
+    getter = getattr(service, "speaker_targets", None)
+    if not callable(getter):
+        return []
+    try:
+        return list(getter())
+    except Exception:  # noqa: BLE001
+        return []
+
+
+class ActionRow(QWidget):
+    """一行 = 类型 + 该类型自己那几个下拉 + 值 + 上移 / 下移 / 删除。
+
+    列数跟着类型走（用户 11-13 第七条反馈）::
+
+        -（未选）     —
+        发虚拟事件    [事件名]
+        延迟          [毫秒/秒] [值]
+        发音箱指令    [音箱] [不静默/静默] [要说的话]
+
+    首档空档「-」= **还没选类型**：③ 只有一枚「＋ 添加动作」，加出来的行落在这里，
+    用户再点下拉挑（11-13 用户第八条）。空档时输入框灰着只留一行 placeholder，
+    ``needs_kind()`` 为真；红字**不立刻亮**，点保存才由 ``reveal_missing()`` 亮出来
+    ——刚点「＋ 添加动作」就一片红是在骂用户。
+
+    **延迟只有一种动作**：毫秒 / 秒是同一份 ``ms`` 的两把尺子（见 ``Action.unit``），
+    所以它退回"下拉里的一档 + 单位下拉"，不再像上一版那样在类型下拉里占两行。
+    上一版 ``rules.json`` 里带 ``unit:"s"`` 的延迟读进来会落在「秒」这档上，无损。
     """
 
     def __init__(self, action: Action, palette: theme.Palette,
                  on_change: Callable[[], None], on_remove: Callable[[QWidget], None],
                  on_move: Callable[[QWidget, int], None],
+                 targets: list[speaker.Target] | None = None,
                  parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._on_change = on_change
         self._loading = True
-        self._kind = "virtual_event"  # 上一次的类型，_kind_changed 里判"是不是同一把尺子"
+        self._targets = list(targets or [])
+        self._kind = action.type  # 上一次的类型：判"换的是不是同一种动作"
+        self._prev_unit = action.unit if action.unit == "s" else "ms"
+        # 空档的"还没选"红字只在点保存后亮（见 needs_kind / reveal_missing）
+        self._show_missing = False
         lay = QHBoxLayout(self)
         lay.setContentsMargins(0, 3, 0, 3)
-        lay.setSpacing(8)
+        lay.setSpacing(_ROW_GAP)
 
         self.index_label = QLabel("", self)
         self.index_label.setObjectName("Hint")
-        self.index_label.setFixedWidth(20)
+        self.index_label.setFixedWidth(_INDEX_W)
 
         self.kind = Combo(palette, self)
-        with QSignalBlocker(self.kind):
-            for key, label in _ACTION_LABELS:
-                self.kind.addItem(label, key)
-        # 6 个全角字（延迟（毫秒））+ 左右内边距 12/38，118 会把括号挤成省略号
-        self.kind.setFixedWidth(138)
+        for key, label in _ACTION_LABELS:
+            self.kind.addItem(label, key)
+        # 「发音箱指令」5 个全角字 + 左右内边距 12/38：118 刚好不省略
+        self.kind.setFixedWidth(118)
+
+        # 延迟的单位：同一份毫秒值的两把尺子
+        self.unit = Combo(palette, self)
+        for key, label in _UNIT_LABELS:
+            self.unit.addItem(label, key)
+        self.unit.setFixedWidth(80)
+
+        self.speaker = Combo(palette, self)
+        self.speaker.setFixedWidth(176)
+        self._fill_speakers(action)
+        self.speak_targets = list(self._targets)  # 给验证脚本读，别去翻 combo 的 itemData
+
+        self.silent = Combo(palette, self)
+        for value, label in _SILENT_LABELS:
+            self.silent.addItem(label, value)
+        self.silent.setFixedWidth(92)
 
         self.value_edit = QLineEdit(self)
         self.value_edit.setObjectName("Field")
-        self.value_edit.setPlaceholderText("虚拟事件名（要和米家自动化里监听的完全一致）")
         self.value_edit.textChanged.connect(self._on_text)
 
         # 就地报错（用户 11-13 第六条反馈）：照①「注册状态：…」的样子长在本行右侧，
@@ -381,26 +561,92 @@ class ActionRow(QWidget):
 
         lay.addWidget(self.index_label)
         lay.addWidget(self.kind)
+        lay.addWidget(self.unit)
+        lay.addWidget(self.speaker)
+        lay.addWidget(self.silent)
         lay.addWidget(self.value_edit, 1)
         lay.addWidget(self.hint)
         for btn in (self.up_btn, self.down_btn, self.delete_btn):
             lay.addWidget(btn)
-        self.kind.currentIndexChanged.connect(self._kind_changed)
 
-        # 连接已建好：setCurrentIndex 会触发 _kind_changed，构造期用 _loading 挡住，
-        # 否则它会把下面刚回填的值清空。
-        kind = "delay_s" if action.type == "delay" and action.unit == "s" else action.type
-        self.kind.setCurrentIndex(max(0, self.kind.findData(kind)))
-        # 记下当前规格：_kind_changed 靠它判断"是不是同一把尺子"，是就只换算不重置
-        self._kind = self._kind_key()
-        self.value_edit.setText(action.name if action.type == "virtual_event"
-                                else _delay_text(action.ms, self._unit()))
+        # 控件都建好再连：下面回填值时不能让 _kind_changed 抢先清空输入框
+        self.kind.currentIndexChanged.connect(self._kind_changed)
+        self.unit.currentIndexChanged.connect(self._unit_changed)
+        self.speaker.currentIndexChanged.connect(self._selection_changed)
+        self.silent.currentIndexChanged.connect(self._selection_changed)
+
+        # 认不出的类型（空串 / 旧版本残留）一律落在空档上，别偷偷替用户选成虚拟事件
+        kind = action.type if action.type in dict(_ACTION_LABELS) else ""
+        with QSignalBlocker(self.kind), QSignalBlocker(self.unit), \
+                QSignalBlocker(self.speaker), QSignalBlocker(self.silent):
+            self.kind.setCurrentIndex(max(0, self.kind.findData(kind)))
+            self.unit.setCurrentIndex(max(0, self.unit.findData(self._prev_unit)))
+            self.speaker.setCurrentIndex(
+                max(0, self.speaker.findData(action.did if kind == "speaker" else "")))
+            self.silent.setCurrentIndex(
+                max(0, self.silent.findData(bool(action.silent))))
+        self._kind = kind
+        if kind == "delay":
+            self.value_edit.setText(_delay_text(action.ms, self._prev_unit))
+        elif kind == "speaker":
+            self.value_edit.setText(action.text)
+        else:
+            self.value_edit.setText(action.name if kind else "")
         self._loading = False
+        self._sync_columns()
         self._sync_placeholder()
         self.sync_hint()
 
+    # -- 候选 ------------------------------------------------------------
+    def _fill_speakers(self, action: Action) -> None:
+        """音箱候选 = 当前家庭里能执行文本指令的那几台（由调用方筛好传进来）。
+
+        规则里存的是 did，若那台音箱已经不在这个家庭的候选里（设备被移除 / 换了家庭），
+        仍然把它作为一条**特殊项**补在最前面，让这一行有东西可显示；保存不拦它，
+        执行时服务层会按 did 在全家庭里找，真找不到才报错。
+        """
+        dids = {t.did for t in self._targets}
+        for t in self._targets:
+            label = t.name or t.model or t.did
+            if not t.online:
+                label += "（离线）"
+            self.speaker.addItem(label, t.did)
+            self.speaker.setItemData(self.speaker.count() - 1, label, Qt.ToolTipRole)
+        if action.type == "speaker" and action.did and action.did not in dids:
+            self.speaker.insertItem(0, f"{action.name or action.did}（不在当前家庭）",
+                                    action.did)
+        if not self._targets and not (action.type == "speaker" and action.did):
+            self.speaker.addItem("没有可用音箱", "")
+            self.speaker.setEnabled(False)
+            return
+        if not self._targets:
+            self.speaker.setEnabled(False)
+
+    def _current_did(self) -> str:
+        return str(self.speaker.currentData() or "")
+
+    def _pick_default_speaker(self) -> None:
+        """从别的类型切到音箱指令：没选就挑第一台在线的，别让用户先空跑一次校验。"""
+        if self._current_did():
+            return
+        best = next((t for t in self._targets if t.online), None) or (
+            self._targets[0] if self._targets else None)
+        if best is not None:
+            with QSignalBlocker(self.speaker):
+                self.speaker.setCurrentIndex(
+                    max(0, self.speaker.findData(best.did)))
+
+    # -- 事件 ------------------------------------------------------------
     def _on_text(self, *_args: Any) -> None:
         """输入即校验：红字跟着光标走，不用等点保存才发现填错。"""
+        if self._loading:
+            return
+        self.sync_hint()
+        self._on_change()
+
+    def _selection_changed(self, *_args: Any) -> None:
+        if self._loading:
+            return
         self.sync_hint()
         self._on_change()
 
@@ -409,49 +655,118 @@ class ActionRow(QWidget):
             return
         # 换类型必须换掉旧值：把「发虚拟事件」切成「延迟」后残留的事件名
         # 会被 int() 解析失败，用户看到的是"明明填了东西却报校验错"。
-        # 但毫秒 ↔ 秒是同一个量，换算一下就行，别把刚填的 2000 重置成 1。
         kind = self._kind_key()
-        if kind in _DELAY_KINDS and self._kind in _DELAY_KINDS:
-            ms = _delay_ms(self.value_edit.text(), _delay_unit(self._kind))
-            self.value_edit.setText(_delay_text(ms, _delay_unit(kind)) if ms >= 0
-                                    else _DELAY_DEFAULTS[kind])
-        elif kind in _DELAY_KINDS:
-            self.value_edit.setText(_DELAY_DEFAULTS[kind])
+        if kind == self._kind:
+            return
+        if kind == "delay":
+            self.value_edit.setText(_DELAY_DEFAULTS[self._unit()])
         else:
             self.value_edit.setText("")
+            if kind == "speaker":
+                self._pick_default_speaker()
         self._kind = kind
+        # 选了类型就不再是"还没选"，之前那条红字跟着撤掉
+        self._show_missing = False
+        self._sync_columns()
         self._sync_placeholder()
         self.sync_hint()
         self._on_change()
 
+    def _unit_changed(self) -> None:
+        """毫秒 ↔ 秒只换算不重置：2000 ms ⇄ 2 秒是同一个量。"""
+        if self._loading:
+            return
+        unit = self._unit()
+        if self._kind_key() == "delay" and unit != self._prev_unit:
+            ms = _delay_ms(self.value_edit.text(), self._prev_unit)
+            self.value_edit.setText(_delay_text(ms, unit) if ms >= 0
+                                    else _DELAY_DEFAULTS[unit])
+        self._prev_unit = unit
+        self._sync_placeholder()
+        self.sync_hint()
+        self._on_change()
+
+    def _sync_columns(self) -> None:
+        """按类型显隐那几列。隐藏的控件在 QHBoxLayout 里不占位置。
+
+        空档（还没选类型）时输入框**留着但灰掉**：直接隐藏会让后面 ×↑↓ 三枚按钮
+        左跳到下拉旁边，选完类型又跳回来，一行之内抖两下。
+        """
+        kind = self._kind_key()
+        self.unit.setVisible(kind == "delay")
+        self.speaker.setVisible(kind == "speaker")
+        self.silent.setVisible(kind == "speaker")
+        self.value_edit.setEnabled(bool(kind))
+
     def _kind_key(self) -> str:
-        return str(self.kind.currentData())
+        return str(self.kind.currentData() or "")
+
+    def needs_kind(self) -> bool:
+        """还没选动作类型（空档）。空行刚加进来不算错，点保存才算（11-13 用户第八条）。"""
+        return self._kind_key() not in ACTION_TYPES
+
+    def focus_widget(self) -> QWidget:
+        """出错时焦点该给谁：空档行的输入框是禁用的，交给类型下拉。"""
+        return self.value_edit if self.value_edit.isEnabled() else self.kind
+
+    def reveal_missing(self) -> None:
+        """点保存时把「要先选动作类型」亮出来；选了类型会自动撤掉。"""
+        if not self.needs_kind():
+            return
+        self._show_missing = True
+        self.sync_hint()
 
     def _is_delay(self) -> bool:
-        return self._kind_key() in _DELAY_KINDS
+        return self._kind_key() == "delay"
 
     def _unit(self) -> str:
         """当前录入刻度："ms" / "s"。存盘与校验一律用毫秒。"""
-        return _delay_unit(self._kind_key())
+        return str(self.unit.currentData() or "ms")
+
+    def _is_silent(self) -> bool:
+        return bool(self.silent.currentData())
 
     def _sync_placeholder(self) -> None:
-        if self._is_delay():
+        kind = self._kind_key()
+        if not kind:
+            self.value_edit.setPlaceholderText("先选左边的动作类型，这里才知道要填什么")
+        elif kind == "delay":
             self.value_edit.setPlaceholderText(
                 "秒，如 30 或 1.5（最多 3 位小数）" if self._unit() == "s"
                 else "毫秒，如 2000（只填整数）")
+        elif kind == "speaker":
+            self.value_edit.setPlaceholderText("要说的话，如「打开客厅灯」")
         else:
             self.value_edit.setPlaceholderText("虚拟事件名（要和米家自动化里监听的完全一致）")
 
     def format_error(self) -> str:
-        """这一行延迟**填法**的问题，没有则返回空串。
+        """这一行**填法**的问题，没有则返回空串（延迟的进制 / 位数、音箱指令的长度）。
 
-        只能在这一层判：``Action`` 交出去的只有毫秒，core 看不出用户敲的是
+        延迟只能在这一层判：``Action`` 交出去的只有毫秒，core 看不出用户敲的是
         ``1.5 秒`` 还是 ``1500 毫秒``，更看不出多打了第 4 位小数。两条规矩：
         毫秒档只收整数（半毫秒没有意义）；秒档最多 3 位小数（执行精度就是 1 ms）。
         超出就**明说**，不静默四舍五入——用户专门问过精度这件事。
 
         文案是**行内红字**：挂在输入框右边，得短。来龙去脉进 tooltip。
         """
+        if self.needs_kind():
+            # 「还没选类型」只在点过保存之后才说（用户 11-13 第八条）：刚点
+            # 「＋ 添加动作」就一片红，等于边让人挑边骂人。
+            return "要先选动作类型" if self._show_missing else ""
+        if self._kind_key() == "speaker":
+            text = self.value_edit.text()
+            # 超长不静默截断（主窗口的发送框才那么干：它没有"存下来再说"的机会）。
+            # 编辑页要落盘，**报出差额**让用户自己决定删哪句，比悄悄砍掉尾巴好。
+            extra = len(text) - MAX_SPEAK_CHARS
+            if extra > 0:
+                return f"多了 {extra} 个字"
+            # 字符白名单与主窗口共用 ``speaker.clean``：米家只收中英文、数字、
+            # 空格与「，。？！」。不在这里拦的话，规则存进去是"脏"的，执行时
+            # 服务层会悄悄清洗掉——用户只会发现"音箱少念了几个字"。
+            dropped = speaker.clean(text).dropped
+            if dropped:
+                return f"含 {len(dropped)} 个发不出的字符"
+            return ""
         if not self._is_delay():
             return ""
         raw = self.value_edit.text().strip()
@@ -475,13 +790,22 @@ class ActionRow(QWidget):
     def error_text(self) -> str:
         """行内红字的全文；空串 = 这一行合规矩。
 
-        顺序是先具体后笼统：填法（整数 / 位数）→ 空值 → 范围。**范围也在这层判**，
-        以前只有点保存后由 ``validate_rule`` 在底部说"延迟超出范围"，现在跟填法
-        一样就地红字，用户不用点保存才知道填大了。
+        顺序是先具体后笼统：填法（整数 / 位数 / 字数）→ 缺失项（音箱 / 值）→ 范围。
+        **范围也在这层判**，以前只有点保存后由 ``validate_rule`` 在底部说"延迟超出
+        范围"，现在跟填法一样就地红字，用户不用点保存才知道填大了。
         """
         err = self.format_error()
-        if err or not self._is_delay():
+        if err:
             return err
+        kind = self._kind_key()
+        if kind == "speaker":
+            if not self._current_did():
+                return "没有可选音箱" if not self._targets else "要先选音箱"
+            if not self.value_edit.text().strip():
+                return "要填指令"
+            return ""
+        if not self._is_delay():
+            return ""
         raw = self.value_edit.text().strip()
         if not raw:
             return "要填延迟时间"
@@ -496,8 +820,24 @@ class ActionRow(QWidget):
     def sync_hint(self) -> None:
         text = self.error_text()
         self.hint.setText(text)
-        self.hint.setToolTip(_HINT_TIPS.get(text, ""))
+        self.hint.setToolTip(self._hint_tip(text))
         self.hint.setVisible(bool(text))
+
+    def _hint_tip(self, text: str) -> str:
+        """红字的来龙去脉。带数字的文案（「多了 37 个字」「含 3 个发不出的字符」）
+        没法预先写进 ``_HINT_TIPS``，音箱指令这两条按当前内容现拼。"""
+        tip = _HINT_TIPS.get(text)
+        if tip or self._kind_key() != "speaker":
+            return tip or ""
+        raw = self.value_edit.text()
+        if len(raw) > MAX_SPEAK_CHARS:
+            return (f"米家「自定义指令」上限 {MAX_SPEAK_CHARS} 个字符；"
+                    f"当前 {len(raw)} 个，删掉 {len(raw) - MAX_SPEAK_CHARS} 个才能保存")
+        dropped = speaker.clean(raw).dropped
+        if dropped:
+            return ("米家只接受中英文、数字、空格和「，。？！」；"
+                    f"这几个要删掉或换掉：{dropped}")
+        return ""
 
     def set_index(self, number: int) -> None:
         self.index_label.setText(f"{number}.")
@@ -511,9 +851,22 @@ class ActionRow(QWidget):
 
     def value(self) -> Action:
         """读回一条动作。延迟**永远是毫秒**，秒档在这里折算，界面之外没人认"秒"。"""
-        if self._is_delay():
+        kind = self._kind_key()
+        if kind == "delay":
             unit = self._unit()
             return Action("delay", "", _delay_ms(self.value_edit.text(), unit), unit)
+        if kind == "speaker":
+            did = self._current_did()
+            target = next((t for t in self._targets if t.did == did), None)
+            # name 只是显示名快照（日志 / 重新打开时回显），执行永远按 did 走
+            name = target.name if target is not None else self.speaker.currentText()
+            return Action("speaker", name, 0, "ms", did,
+                          self.value_edit.text().strip(), self._is_silent())
+        if not kind:
+            # 空档如实出去：``type`` 空串，ui 层 _save 会拦，core 的 validate_rule
+            # 也认这个（见 rules.validate_rule）。别默认成 virtual_event，
+            # 那等于替用户选了一个他从没选过的类型。
+            return Action("")
         return Action("virtual_event", self.value_edit.text().strip(), 0)
 
 
@@ -535,38 +888,58 @@ class AutomationDialog(QDialog):
         self.service = service
         self._p = palette
         self._is_new = rule_id is None
+        # 当前家庭：新建 / 认领归属都用它。``getattr`` 兜底是因为验证脚本里的
+        # 假 service 未必实现这个属性（真 service 上是 property）。
+        self._home = str(getattr(service, "current_home", "") or "")
         source = service.rules.get(rule_id) if rule_id else None
         self._draft: Rule = (
             source.clone() if source is not None else Rule(
                 id=service.rules.new_id(), name="新规则", keys="", conditions=[],
-                actions=[Action("virtual_event", "", 0)],
+                # 新建先给一行**空档**动作：用户自己挑类型（11-13 用户第八条）。
+                # 预选成「发虚拟事件」会让人以为事件是默认动作、找不到音箱那档。
+                actions=[Action("")],
                 cooldown_ms=DEFAULT_COOLDOWN_MS, enabled=True,
+                # 新建时归属**当前家庭**：切到别的家庭就不再列出来（规则按家庭隔离，
+                # 见 core/automation/rules.py 模块 docstring）
+                home=self._home,
             )
         )
+        # 编辑升级前的老规则（没 home）时顺手认到当前家庭——否则它会在所有家庭都
+        # 列出来（规则按家庭隔离，见 core/automation/rules.py）。已归属别的家庭的
+        # 规则**不动**：被翻开编辑不等于要搬到当前家庭。
+        if not self._draft.home:
+            self._draft.home = self._home
         self._dirty = False
         self._loading = False
         self._recording = False
         self._cond_rows: list[ConditionRow] = []
         self._action_rows: list[ActionRow] = []
+        # 「发音箱指令」的候选：**当前家庭**里能执行文本指令的那几台。
+        # 取一次就够——本窗是模态的，开着的时候切不了家庭。
+        self._speaker_targets = _speaker_targets(service)
 
         title = "新建规则" if self._is_new else "编辑规则"
         self.setWindowTitle(title)
         self.setWindowFlags(Qt.Dialog | Qt.FramelessWindowHint)
         self._frame = WindowFrame(self, resizable=True,
+                                  radius=theme.RADIUS_CARD,
+                                  shadow=SHADOW_PAD,
+                                  shadow_alpha=shadow_alpha(self._p),
                                   fill=lambda: surface_bg(self._p),
                                   border=lambda: surface_border(self._p))
-        self.resize(860, fit_height(900))
-        self.setMinimumSize(760, 620)
+        self.resize(*floating_size(860, fit_height(900, reserve=2 * SHADOW_PAD)))
+        self.setMinimumSize(*floating_size(760, 620))
         self.setStyleSheet(_page_qss(palette))
 
-        outer = QVBoxLayout(self)
+        outer = QVBoxLayout(self._frame.body)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
         self.title_bar = TitleBar(title, palette, subtitle=self._draft.name,
-                                  buttons=("close",), variant="dialog")
+                                  buttons=("close",), variant="dialog",
+                                  frame=self._frame)
         outer.addWidget(self.title_bar)
 
-        body = QWidget(self)
+        body = QWidget(self._frame.body)  # 内容区，别挂窗口（窗口大一圈）
         col = QVBoxLayout(body)
         col.setContentsMargins(18, 10, 20, 8)
         col.setSpacing(0)
@@ -614,6 +987,9 @@ class AutomationDialog(QDialog):
 
         area = QScrollArea(root)
         area.setWidgetResizable(True)
+        # 滚动条常驻占位：③动作一多就出现竖向滚动条，以前会把三段内容挤窄 10px，
+        # 保存前后输入框宽度跳一下（同列表窗，见 automation_style）。
+        reserve_scrollbar(area)
         self.area = area  # 保存时要滚到出错的那一行
         content = QWidget(area)
         col = QVBoxLayout(content)
@@ -724,7 +1100,10 @@ class AutomationDialog(QDialog):
         crow.setContentsMargins(0, 4, 0, 4)
         add_cond = QPushButton("＋ 添加条件", cond_btns)
         add_cond.setObjectName("Tool")
-        add_cond.clicked.connect(lambda: self._add_condition(Condition()))
+        add_cond.setCursor(Qt.PointingHandCursor)
+        # 加出来落在空档「-」上，用户再挑条件类型（和③一致，用户 11-13 第八条）
+        add_cond.clicked.connect(
+            lambda: self._add_condition(Condition(type="", op="")))
         crow.addWidget(add_cond)
         crow.addStretch(1)
         card2.add_unit(cond_btns)
@@ -741,19 +1120,17 @@ class AutomationDialog(QDialog):
         card3.add_unit(self.action_box)
         action_btns = QWidget(content)
         arow = QHBoxLayout(action_btns)
-        arow.setContentsMargins(0, 4, 0, 4)
-        # 延迟两种规格各一枚按钮（用户 11-13 要的）：等量的延迟在「秒」档里好填
-        # （30 秒 vs 30000 毫秒），坏处只有一个——多占一格地方，所以三枚挤在
-        # 一行里，靠文本自适应的 padding 而不是定宽，窄窗也不会被挤成省略号。
-        for text, act in (
-            ("＋ 发虚拟事件", Action("virtual_event", "", 0)),
-            ("＋ 延迟（毫秒）", Action("delay", "", 1000)),
-            ("＋ 延迟（秒）", Action("delay", "", 1000, "s")),
-        ):
-            btn = QPushButton(text, action_btns)
-            btn.setObjectName("Tool")
-            btn.clicked.connect(lambda _=False, a=act: self._add_action(a))
-            arow.addWidget(btn)
+        # 左内边距 = 行首「1.」那格 + 行内间距：按钮左边缘要跟动作行的**类型下拉**
+        # 对齐，不是跟卡片对齐（动作行比条件行多一格序号，用户 11-13 第八条）
+        arow.setContentsMargins(_ACTION_INDENT, 4, 0, 4)
+        # 只有一枚按钮（和②的「＋ 添加条件」一样）：加出来的行落在空档「-」上，
+        # 用户自己在下拉里挑虚拟事件 / 延迟 / 发音箱指令。以前是三个按钮各加一种，
+        # 加完还得回来改类型才知道有别的档。
+        add_action = QPushButton("＋ 添加动作", action_btns)
+        add_action.setObjectName("Tool")
+        add_action.setCursor(Qt.PointingHandCursor)
+        add_action.clicked.connect(lambda: self._add_action(Action("")))
+        arow.addWidget(add_action)
         arow.addStretch(1)
         card3.add_unit(action_btns)
         col.addWidget(card3)
@@ -845,6 +1222,10 @@ class AutomationDialog(QDialog):
         self.cond_empty.setVisible(False)
         if not quiet:
             self._mark_dirty()
+            if not row._kind_key():
+                # 空档行（同 ③）：滚进视野 + 焦点落到类型下拉
+                self.area.ensureWidgetVisible(row, 0, 24)
+                row.kind.setFocus()
 
     def _remove_condition(self, row: QWidget) -> None:
         if row in self._cond_rows:
@@ -857,12 +1238,18 @@ class AutomationDialog(QDialog):
 
     def _add_action(self, action: Action, *, quiet: bool = False) -> None:
         row = ActionRow(action, self._p, self._mark_dirty,
-                        self._remove_action, self._move_action, self.action_box)
+                        self._remove_action, self._move_action,
+                        self._speaker_targets, self.action_box)
         self.action_layout.addWidget(row)
         self._action_rows.append(row)
         self._renumber()
         if not quiet:
             self._mark_dirty()
+            if row.needs_kind():
+                # 空档行：滚进视野、焦点直接落到类型下拉——用户刚点了「添加动作」，
+                # 下一步必然是挑类型，别让他再去点一次
+                self.area.ensureWidgetVisible(row, 0, 24)
+                row.kind.setFocus()
 
     def _remove_action(self, row: QWidget) -> None:
         if row in self._action_rows:
@@ -967,13 +1354,17 @@ class AutomationDialog(QDialog):
     # -- 保存 ------------------------------------------------------------
     def _save(self, *, quiet: bool = False) -> bool:
         rule = self._collect()
+        # 还没选类型的行：刚加进来时不亮红字，**点到保存**才亮（11-13 用户第八条）
+        for row in [*self._cond_rows, *self._action_rows]:
+            row.reveal_missing()
         # 填法 / 范围都只在本行报（用户 11-13 指定）：core 只拿到毫秒，看不出
         # 用户敲了什么，混进 validate_rule 只会得到"要在 0–600000 毫秒之间"这种
         # 答非所问。这里也不写底部错误条、不弹 notice——红字就在输入框右边亮着，
-        # 再在下面重复一遍是噪音。
-        bad = [row for row in self._action_rows if row.error_text()]
+        # 再在下面重复一遍是噪音。② 条件行同样走这条路（11-13 第九条）。
+        rows = [*self._cond_rows, *self._action_rows]  # 按从上到下的顺序找第一处
+        bad = [row for row in rows if row.error_text()]
         if bad:
-            for row in self._action_rows:
+            for row in rows:
                 row.sync_hint()  # 边打边判已经刷过，这里兜住 quiet 保存的路径
             self._set_error("")
             self._reveal_row(bad[0])
@@ -1013,15 +1404,16 @@ class AutomationDialog(QDialog):
             self.accept()
 
     def _reveal_row(self, row: QWidget) -> None:
-        """把出错的行滚进视野、焦点交回它的输入框。
+        """把出错的行滚进视野、焦点交给它该改的那一格。
 
         行内红字现在是**唯一**的提示（不在底部重复），所以必须保证看得见：
-        ③ 里动作一多，出错那行很可能正好滚在视野外面。
+        ③ 里动作一多，出错那行很可能正好滚在视野外面。焦点由行自己说了算
+        （``focus_widget()``）：空档行给类型下拉，条件行缺程序名时给那格。
         """
         self.area.ensureWidgetVisible(row, 0, 24)
-        edit = getattr(row, "value_edit", None)
-        if edit is not None:
-            edit.setFocus()
+        widget = row.focus_widget() if hasattr(row, "focus_widget") else None
+        if widget is not None:
+            widget.setFocus()
 
     # -- 状态 ------------------------------------------------------------
     def _refresh_status(self) -> None:

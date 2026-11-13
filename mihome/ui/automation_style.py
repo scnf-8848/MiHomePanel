@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QApplication, QWidget, QPushButton
+from PySide6.QtWidgets import QAbstractScrollArea, QApplication, QWidget, QPushButton
 
 from . import theme
 
@@ -29,15 +29,16 @@ CARD_RADIUS = 14
 STEP_COLORS = ("accent", "SLIDER_WARM", "ACCENT_GREEN")
 
 
-def fit_height(default_h: int, ratio: float = 0.85) -> int:
+def fit_height(default_h: int, ratio: float = 0.85, reserve: int = 0) -> int:
     """窗口默认高度不能写死：小屏幕上 900px 会顶出任务栏。
 
+    ``reserve`` 是给浮窗阴影留白扣的（窗口比内容大一圈，不扣就顶出去）。
     离屏渲染 / 没有屏幕对象时退回默认，验证脚本不受影响。
     """
     screen = QApplication.primaryScreen()
     if screen is None:
         return default_h
-    available = int(screen.availableGeometry().height() * ratio)
+    available = int(screen.availableGeometry().height() * ratio) - reserve
     return max(420, min(default_h, available))
 
 
@@ -110,17 +111,68 @@ def tab_focus_only(root: QWidget) -> None:
         btn.setFocusPolicy(Qt.TabFocus)
 
 
+def reserve_scrollbar(scroll: QAbstractScrollArea, *, lock_horizontal: bool = True) -> None:
+    """竖向滚动条**常驻占位**：内容宽度不随「条目多没多到要滚」跳 10px。
+
+    默认的 ``ScrollBarAsNeeded`` 下，条目一多滚动条从无到有，viewport 当场被挤掉
+    10px，卡牌整排缩一圈；删掉两条又弹回原宽——滚动前后卡片宽度不一样（用户 11-13 报）。
+    改成常驻后宽度恒定，卡片不再跟着列表长短变。
+
+    代价是"内容不够高时轨道也在"。Qt 在滚动范围为零时会把滑块拉满整条，透明轨道
+    上就多出一根竖线，比没有滚动条还显眼。所以按 ``rangeChanged`` 给滚动条挂
+    ``idle`` 属性，``common_qss`` 里把 idle 的 handle 画成透明：
+
+    * 能滚 —— 正常滑块；
+    * 不能滚 —— 只剩 10px 透明轨道，看不出任何东西。
+
+    ``QScrollArea`` 和 ``QTableWidget`` / ``QAbstractItemView`` 都是
+    ``QAbstractScrollArea``，三者都能接（列表、回收站、编辑窗、日志表格）。
+
+    ``lock_horizontal`` 默认把横向条关掉——竖向滚动区里横向本来就不该出现。
+    表格例外：列多到放不下时横向条是必需的，传 ``False`` 保留 ``AsNeeded``
+    （横向条只在底下占高度，不影响列宽）。
+
+    四窗都在 ``common_qss`` 末尾拼了那条 idle 规则，所以**只有走 ``common_qss`` 的
+    窗口**能调这个函数；别处要占位得先确认 QSS 里有 ``QScrollBar[idle="true"]``。
+    """
+    scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
+    if lock_horizontal:
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+    bar = scroll.verticalScrollBar()
+
+    def _sync(*_args: object) -> None:
+        idle = bar.maximum() <= bar.minimum()
+        current = bar.property("idle")
+        if current is not None and bool(current) == idle:
+            return
+        bar.setProperty("idle", idle)
+        # 动态属性改了必须重新 polish，否则 QSS 属性选择器不重算（同 StepBadge）
+        bar.style().unpolish(bar)
+        bar.style().polish(bar)
+
+    bar.rangeChanged.connect(_sync)
+    _sync()
+
+
 def common_qss(p: theme.Palette) -> str:
     """四窗共用片段，必须拼在各窗口 stylesheet 的**末尾**。"""
     warm = theme.SLIDER_WARM
     green = theme.ACCENT_GREEN
     return f"""
-    /* 卡片：深色用相对 surface_bg 提亮的 panel_bg，不能直接用 p.card */
+    /* 卡片：深色用相对 surface_bg 提亮的 panel_bg，不能直接用 p.card。
+       **描边宽度两个状态必须一样**（停用 2px 中性色 / 启用 2px accent，只换颜色）：
+       以前停用写 1px、启用写 2px，描边一换宽，QSS 的 frameWidth 就变，内容区
+       跟着缩 1px——启停一下卡片里的文字就挪一下（用户 11-13 报，和按钮
+       「焦点只换颜色不换宽度」是同一条规矩）。 */
     QFrame#RuleCard, QFrame#TrashCard {{
         background: {theme.panel_bg(p)};
-        border: 1px solid {p.border}; border-radius: {CARD_RADIUS}px;
+        border: 2px solid {p.border}; border-radius: {CARD_RADIUS}px;
     }}
     QFrame#RuleCard[on="true"] {{ border: 2px solid {p.accent}; }}
+    /* 滚动条常驻占位（见 reserve_scrollbar）：不能滚时把滑块藏掉，
+       只留 10px 透明轨道，否则零范围下 Qt 会把滑块拉满整条。 */
+    QScrollBar[idle="true"]::handle:vertical,
+    QScrollBar[idle="true"]::handle:vertical:hover {{ background: transparent; }}
     /* 说明文字统一 text_soft（浅色 text_mute 对白卡只有 2.54:1） */
     QLabel#RowSub, QLabel#PageHint, QLabel#Hint, QLabel#LogHint,
     QLabel#LogStatus, QLabel#TrashMeta, QLabel#TrashHint, QLabel#TrashEmpty,
@@ -177,6 +229,7 @@ __all__ = [
     "common_qss",
     "fit_height",
     "ghost_qss",
+    "reserve_scrollbar",
     "surface_fill",
     "tab_focus_only",
 ]

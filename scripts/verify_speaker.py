@@ -98,10 +98,11 @@ def make_spec(*, service: str = "intelligent-speaker", siid: int = 7, act: int =
     return parse_raw(raw)
 
 
-def make_state(did: str, name: str, spec, *, online: bool = True, room: str = "客厅"):
+def make_state(did: str, name: str, spec, *, online: bool = True, room: str = "客厅",
+               home: str = ""):
     return SimpleNamespace(
         did=did, name=name, spec=spec, online=online, room=room,
-        node=SimpleNamespace(model="xiaomi-demo", did=did, name=name),
+        node=SimpleNamespace(model="xiaomi-demo", did=did, name=name, home=home),
     )
 
 
@@ -176,6 +177,39 @@ def test_collect() -> None:
     check("在线的排前面", got and got[0].online and got[-1].online is False)
     check("房间名带过来了", got and got[0].room == "客厅", str(got and got[0].room))
     check("空列表不炸", S.collect([]) == [])
+
+
+def test_collect_home() -> None:
+    """不同家庭互相独立：1103 的页面里选音箱只该看到 1103 的音箱。
+
+    顶栏指令条和自动化编辑页共用这一份判据——分两处写筛选，早晚会出现
+    「指令条看不到、编辑页能选到」这种对不上的情况。
+    """
+    spec = make_spec()
+    states = [
+        make_state("d1", "客厅音箱", spec, home="1103 家"),
+        make_state("d2", "卧室音箱", spec, home="1103 家"),
+        make_state("d3", "老家的音箱", spec, home="老家"),
+        make_state("d4", "没挂家庭的音箱", spec, home=""),
+    ]
+    ids = [t.did for t in S.collect_home(states, "1103 家")]
+    check("只返回当前家庭的音箱（+ 不挂家庭的那台）", set(ids) == {"d1", "d2", "d4"},
+          str(ids))
+    check("别的家庭一个都不漏进来", "d3" not in ids)
+    check("没挂家庭的设备哪个家庭都可见（云端没给 home 字段）", "d4" in ids)
+    check("切到另一个家庭就换成它自己的",
+          set(t.did for t in S.collect_home(states, "老家")) == {"d3", "d4"},
+          str([t.did for t in S.collect_home(states, "老家")]))
+    check("home 传空串 = 只留没挂家庭的",
+          [t.did for t in S.collect_home(states, "")] == ["d4"])
+    check("家庭里没有音箱时不抛错", all(t.did == "d4" for t in S.collect_home(states, "不存在的家")),
+          str([t.did for t in S.collect_home(states, "不存在的家")]))
+    check("collect_home([]) 不炸", S.collect_home([], "1103 家") == [])
+    # node 缺 home 字段（旧缓存 / 别的设备类型）不能把整条链路炸掉
+    bare = SimpleNamespace(did="d9", name="x", spec=spec, online=True, room="客厅",
+                           node=SimpleNamespace(model="m", did="d9", name="x"))
+    check("node 没有 home 字段时按不挂家庭处理",
+          [t.did for t in S.collect_home([bare], "1103 家")] == ["d9"])
 
 
 def test_clean() -> None:
@@ -420,45 +454,51 @@ def test_bar(app: QApplication) -> None:
     panel._on_pick("d2")  # noqa: SLF001
     check("点某台会发出 picked 并收起面板", got == ["d2"] and not panel.isVisible(), str(got))
 
-    # -- 静默开关：默认关、能切、会往上抛 -------------------------------------
-    panel = bar._build_panel()  # noqa: SLF001
-    check("静默默认关", not panel.silent() and not bar.silent())
+    # -- 静默：条上下拉（2026-11-13 从小勾选框改的）--------------------------
+    bar.set_silent(False)
+    check("静默下拉默认「不静默」", bar.silent() is False
+          and bar.silent_combo.currentText() == "不静默",
+          bar.silent_combo.currentText())
+    check("下拉只有两档（静默 / 不静默）", bar.silent_combo.count() == 2,
+          str(bar.silent_combo.count()))
     seen: list[bool] = []
     bar.silent_changed.connect(seen.append)
-    panel.silent_changed.connect(bar.set_silent)
-    panel.silent_row.switch.set_on(True)
-    panel.silent_row.toggled.emit(True)
-    check("面板里打开静默会传到指令条", bar.silent() is True and seen == [True], str(seen))
-    check("整行可点（文字那半边也能切）", panel.silent_row.label.text() == "静默执行",
-          panel.silent_row.label.text())
-    # 静默行刻意做弱：小号勾选框 + 弱色文字，别和"选哪台设备"抢注意力
-    sw = panel.silent_row.switch
-    check("静默开关是小号勾选框（16px），不是设置页那颗胶囊",
-          sw.width() <= 16 and sw.height() <= 16, f"{sw.width()}×{sw.height()}")
-    off_css = panel.silent_row.label.styleSheet()
-    panel.silent_row.set_on(True)
-    on_css = panel.silent_row.label.styleSheet()
-    check("关着时文字走弱色", theme.LIGHT.text_mute in off_css, off_css)
-    check("开着时文字才提到正文色",
-          theme.LIGHT.text in on_css and on_css != off_css, on_css)
-    panel.silent_row.set_on(False)
+    bar.silent_combo.setCurrentIndex(bar.silent_combo.findData(True))
+    check("条上选「静默」会传到 MainWindow", bar.silent() is True and seen == [True],
+          str(seen))
     bar.set_silent(False)
     check("同值重复设置不再发信号", seen == [True, False], str(seen))
+    check("下拉无边框透明底（不套双层框）",
+          "border: none" in bar.silent_combo.styleSheet(), bar.silent_combo.styleSheet()[:60])
+    # 三格顺序：选音箱 → 静默 → 输入框
+    bar.resize(860, SB.H)
+    bar.show()
+    app.processEvents()
+    check("三格从左到右：音箱 / 静默 / 输入框",
+          bar.picker.geometry().left() < bar.silent_combo.geometry().left()
+          < bar.input.geometry().left(),
+          f"{bar.picker.geometry().left()} / {bar.silent_combo.geometry().left()} "
+          f"/ {bar.input.geometry().left()}")
+    check("静默下拉与选音箱那格等高",
+          bar.silent_combo.height() == bar.picker.height(),
+          f"{bar.silent_combo.height()} / {bar.picker.height()}")
+    # 同一个状态不给第二个开关：面板里那一行已经删掉了
+    check("面板里不再有第二个静默开关", not hasattr(panel, "silent_row"))
 
-    # 面板尺寸：设备方块 + 左下角开关，条本身仍是 48（不参与布局）
+    # 面板尺寸：只有一排设备方块，条本身仍是 48（不参与布局）
     panel = bar._build_panel()  # noqa: SLF001
     panel.adjustSize()
-    check("面板至少容纳一排方块与开关行",
+    check("面板至少容纳一排方块",
           panel.height() >= SB.TILE_H + SB.PANEL_PAD * 2, str(panel.height()))
-    check("开关行在面板左下角",
-          panel.silent_row.geometry().left() == SB.PANEL_PAD, str(panel.silent_row.geometry()))
-    # 真正画一遍：面板/方块/开关三处 paintEvent 有异常会在这里冒出来
+    # 真正画一遍：面板/方块两处 paintEvent 有异常会在这里冒出来
     shot = panel.grab()
-    check("面板能画出来（圆角底 + 方块 + 开关）", not shot.isNull() and shot.width() > 0,
+    check("面板能画出来（圆角底 + 方块）", not shot.isNull() and shot.width() > 0,
           f"{shot.width()}×{shot.height()}")
 
     bar.set_palette(theme.DARK)
     check("换主题不炸", bar.input.isEnabled())
+    check("换主题后静默下拉的覆盖样式还在",
+          "background: transparent" in bar.silent_combo.styleSheet())
 
 
 def test_panel_flow(app: QApplication) -> None:
@@ -518,13 +558,13 @@ def test_panel_flow(app: QApplication) -> None:
     check("选完就收起", shown() == [], str(len(shown())))
 
     p = open_one()
-    QTest.mouseClick(p.silent_row.label, Qt.LeftButton)  # 点文字那半边
+    check("面板里没有第二个静默开关（状态只在条上那一格）",
+          not hasattr(p, "silent_row"))
+    # 条上的下拉在面板开着时也能用，且不会把面板收掉（选完设备才收）
+    bar.silent_combo.setCurrentIndex(bar.silent_combo.findData(True))
     app.processEvents()
-    check("点「静默执行」文字也能切", bar.silent() is True)
-    check("切完面板不收起（要能连着看/连着想）", shown() != [], str(len(shown())))
-    QTest.mouseClick(p.silent_row.switch, Qt.LeftButton)
-    app.processEvents()
-    check("再点开关切回来", bar.silent() is False)
+    check("条上切静默不收起面板", bar.silent() is True and shown() != [], str(len(shown())))
+    bar.set_silent(False)
     host.close()
 
 
@@ -667,6 +707,7 @@ def test_main_window(app: QApplication) -> None:
 def main() -> int:
     test_capability()
     test_collect()
+    test_collect_home()
     test_clean()
     test_wire()
     app = QApplication.instance() or QApplication([])

@@ -165,6 +165,21 @@ def collect(states: Iterable[Any]) -> list[Target]:
     return out
 
 
+def collect_home(states: Iterable[Any], home: str) -> list[Target]:
+    """只取**某个家庭**里的音箱（``home`` 为空 = 只留没挂家庭的设备）。
+
+    主窗口顶栏那条指令条和自动化编辑页的「发音箱指令」下拉共用这一份判据：
+    两边各自写一遍筛选，迟早会出现"指令条看不到、编辑页能选到"这种对不上的情况。
+    没挂家庭的设备（云端没给 home 字段）按现有约定算作任何家庭都可见。
+    """
+    keep = []
+    for st in states:
+        owner = getattr(getattr(st, "node", None), "home", "")
+        if not owner or owner == home:
+            keep.append(st)
+    return collect(keep)
+
+
 def wake_ref(spec: Any) -> tuple[int, int] | None:
     """``wake-up`` 的 ``(siid, aiid)``。无参，直接 ``run_action`` 即可。"""
     act = _find_action(spec, WAKE_ACTION)
@@ -259,6 +274,7 @@ __all__ = [
     "Target",
     "clean",
     "collect",
+    "collect_home",
     "directive",
     "target_for",
     "wake_ref",

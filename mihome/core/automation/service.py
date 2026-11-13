@@ -16,11 +16,12 @@ from typing import Any, Callable
 
 from PySide6.QtCore import QObject, QTimer, Signal
 
+from .. import speaker
 from ..jobs import PRIORITY_CONTROL
 from .engine import AutomationEngine, LogEntry
 from .hotkeys_win import HotkeyRegistry
 from .pc_state import PcState
-from .rules import RuleSet
+from .rules import Action, RuleSet
 from .sender import VirtualEventSender
 
 
@@ -42,13 +43,19 @@ class AutomationService(QObject):
         parent: QObject | None = None,
     ) -> None:
         super().__init__(parent)
+        self.store = store
         self.rules = RuleSet(path)
+        self.rules.on_changed = self._on_rules_changed
+        # 升级前写的老规则没有 home，登录后第一时间认到当时那个家庭。
+        # 必须排在 registry / engine 建好之前（claim 不触发 on_changed，安全）。
+        self.adopt_home()
         self.sender = VirtualEventSender(
             lambda: client.raw(), lambda: store.devices.values())
         self.engine = AutomationEngine(
             self.rules,
             state=PcState(),
             emit=self._emit,
+            say=self._say,
             call_later=self._call_later,
             on_log=self._on_log,
             # 独立日志窗要能翻到「昨天那一串」；日志只在内存，放宽上限几乎不花内存
@@ -59,7 +66,6 @@ class AutomationService(QObject):
         self.registry.status_changed.connect(self.status_changed)
         self.worker = worker
         self._timers: dict[int, QTimer] = {}
-        self.rules.on_changed = self._on_rules_changed
         self.sync()
 
     # -- 生命周期 --------------------------------------------------------
@@ -76,12 +82,40 @@ class AutomationService(QObject):
         self.registry.release_all()
 
     # -- 查询（给页面） --------------------------------------------------
+    @property
+    def current_home(self) -> str:
+        """当前在看的家庭名（未加载 / 未登录时是空串）。规则归属以它为准。"""
+        return str(getattr(self.store, "active_home", "") or "")
+
+    def adopt_home(self) -> bool:
+        """把还没归属的规则认到当前家庭。返回是否真改了。
+
+        调用点：构造期（升级前的 ``rules.json``）、切家庭、设备列表加载完成。
+        认领过之后规则就有了 ``home``，切到别的家庭就看不到了——这正是用户要的
+        "1103 家庭里不显示共享家庭的规则"。
+
+        **只认领空归属的**，已经归属别的家庭的规则原样不动：在 A 家庭建的规则，
+        切到 B 家庭不该被顺手搬过去。
+        """
+        home = self.current_home
+        return bool(home) and self.rules.claim(home)
+
     def status_for(self, keys: str) -> str:
         return self.registry.status(keys)
 
     def target_label(self) -> str:
         target, why = self.sender.resolve()
         return target.label if target is not None else why
+
+    def speaker_targets(self, home: str | None = None) -> list[speaker.Target]:
+        """某个家庭里能「执行文本指令」的音箱。默认 = 当前家庭。
+
+        编辑页的「发音箱指令」候选就从这里来——所以 1103 家庭点进自动化，下拉里
+        只有 1103 的音箱。判据与顶栏指令条共用 ``speaker.collect_home``，别在两处
+        各写一份筛选。
+        """
+        want = getattr(self.store, "active_home", "") if home is None else home
+        return speaker.collect_home(getattr(self.store, "devices", {}).values(), want)
 
     def test(self, rule_id: str) -> bool:
         """按 id 立即触发一次（不走热键、绕过冷静期）。
@@ -138,6 +172,40 @@ class AutomationService(QObject):
         self.worker.submit(
             self.sender.call, (target, name),
             callback=finished, priority=PRIORITY_CONTROL, label="发虚拟事件",
+        )
+
+    # -- 音箱指令 --------------------------------------------------------
+    def _speaker_by_did(self, did: str) -> speaker.Target | None:
+        """按 did 找音箱。**不按当前家庭过滤**：规则是全局的，家庭只决定界面上
+        能选哪些候选；执行时那台音箱在哪个家庭都照样能喊。"""
+        return next((t for t in speaker.collect(getattr(self.store, "devices", {}).values())
+                     if t.did == did), None)
+
+    def _say(self, act: Action, done: Callable[[str], None]) -> None:
+        """执行一条「发音箱指令」。清洗 / 拼入参都在 ``core/speaker.py``。
+
+        和设备动作走同一条 ``Store.run_action``：后台线程发请求、主线程回调。
+        ``done`` 只收一句中文原因，空串 = 成功（和 ``emit`` 的语义对齐）。
+        """
+        target = self._speaker_by_did(act.did)
+        if target is None:
+            done(f"找不到音箱「{act.name or act.did}」（可能已从家庭移除）")
+            return
+        if not target.online:
+            done(f"「{target.name}」当前离线")
+            return
+        got = speaker.clean(act.text)
+        if got.empty:
+            done("指令为空（字符都被清洗掉了）")
+            return
+
+        def finished(code: int, reason: str) -> None:
+            done("" if code == 0 else (reason or f"错误码 {code}"))
+
+        self.store.run_action(
+            target.did, target.siid, target.aiid,
+            speaker.directive(target, got.text, act.silent),
+            on_done=finished,
         )
 
 

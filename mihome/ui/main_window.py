@@ -425,6 +425,9 @@ class MainWindow(QMainWindow):
         if s.value("ui/theme", "light") == "dark":
             self.palette_ref = theme.DARK
         self.store.active_home = str(s.value("ui/active_home", "") or "")
+        # 上次看的家庭恢复了，才有得谈"把没归属的老规则认到哪个家庭"。
+        # 自动化服务在构造**早期**就建好了（那时 active_home 还是空），所以这里补一次。
+        self._adopt_rules()
 
     def showEvent(self, event) -> None:  # noqa: N802
         super().showEvent(event)
@@ -775,7 +778,20 @@ class MainWindow(QMainWindow):
         self._settings().setValue("ui/active_home", name)
         self._update_header()
         self._refresh_speakers()
+        self._adopt_rules()
         self.store.poll()
+
+    def _adopt_rules(self) -> None:
+        """把还没归属家庭的老规则认到当前家庭（用户 11-13：规则按家庭隔离）。
+
+        只处理 ``home`` 为空的——那是升级前的 ``rules.json``，或者登录之前就建好
+        的规则。已经有归属的原样不动。改了才发 ``rules_changed``，列表窗若开着
+        会自己刷新（模态下多半关着，但下一个窗口读的就是新值）。
+        """
+        # 构造期（家庭标签栏还没建 / 服务还没起）也会走到这里，别硬取
+        service = getattr(self, "automation", None)
+        if service is not None and service.adopt_home():
+            service.rules_changed.emit()
 
     def _refresh_tabs(self) -> None:
         """把家庭列表 + 排列方式重新灌给顶部标签栏（只影响显示，不动设定顺序）。"""
@@ -841,6 +857,7 @@ class MainWindow(QMainWindow):
             self.wall.update_cards(set(self.store.devices))
         self._update_header()
         self._refresh_speakers()
+        self._adopt_rules()
         self.store.poll()
 
     # -- 顶栏音箱指令条 --------------------------------------------------
@@ -849,19 +866,16 @@ class MainWindow(QMainWindow):
 
         每轮轮询后都会走一次（``_on_changed``）：在线状态一变，候选列表的置灰与
         输入框的可用性就要跟着变。构造都是轻量 dataclass，三条五条不构成开销。
-
-        只取**当前家庭**的设备：指令条跟着这一屏的卡片墙走，跨家庭把别处的音箱列进来
-        会让人找不到是哪台（判据与 ``_update_header`` 的台数统计一致）。
         """
         bar = getattr(self, "speaker_bar", None)
         if bar is None:  # 构造期间（store 回调早于指令条）
             return
-        active = self.store.active_home
-        states = [
-            d for d in self.store.devices.values()
-            if not d.node.home or d.node.home == active
-        ]
-        bar.set_targets(speaker.collect(states), self.prefs.speaker_command_did)
+        # 只取**当前家庭**的设备：指令条跟着这一屏的卡片墙走，跨家庭把别处的音箱列进来
+        # 会让人找不到是哪台。筛选与自动化编辑页共用 ``speaker.collect_home``。
+        bar.set_targets(
+            speaker.collect_home(self.store.devices.values(), self.store.active_home),
+            self.prefs.speaker_command_did,
+        )
 
     def _on_speaker_target(self, did: str) -> None:
         self.prefs.set_speaker_command_did(did)
@@ -1074,11 +1088,12 @@ class MainWindow(QMainWindow):
         tray = getattr(self, "tray", None)
         if tray is not None:
             tray.set_palette(pal)
+        # 搜索框压在**窗口底**上（不是卡片），所以底色从 pal.bg 起算：原来用
+        # bg_soft + pal.border，深色下 #15171C 对 #0E0F12 只有 1.07:1、描边
+        # 1.22:1，整个胶囊几乎看不见（用户 11-13：暗色下输入框的描边没了）。
         self.search.setStyleSheet(
-            f"QLineEdit{{background:{pal.bg_soft};color:{pal.text};"
-            f"border:1px solid {pal.border};border-radius:16px;padding:0 14px;font-size:13px;"
-            f"selection-background-color:{pal.accent};}}"
-            f"QLineEdit:focus{{background:{pal.card};border:1px solid {pal.accent};}}"
+            theme.field_qss(pal, radius=16, padding="0 14px", font_size=13,
+                            base=pal.bg)
         )
 
 

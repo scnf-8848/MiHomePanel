@@ -43,7 +43,15 @@ from ..core import autostart
 from ..core.prefs import CAMERA_NETWORKS
 from ..core.store import Store
 from . import theme, tray
-from .chrome import TitleBar, WindowFrame, surface_bg, surface_border
+from .chrome import (
+    SHADOW_PAD,
+    TitleBar,
+    WindowFrame,
+    floating_size,
+    shadow_alpha,
+    surface_bg,
+    surface_border,
+)
 from .combo import Combo
 from .home_tabs import (
     PLACEMENT_ACTIVE_FIRST,
@@ -132,7 +140,10 @@ def dialog_qss(p: theme.Palette) -> str:
         background: {theme.ACCENT_GREEN};
         color: #FFFFFF;
         border: none;
-        border-radius: {theme.RADIUS_BUTTON}px;
+        /* 圆角矩形不是胶囊（与四窗主按钮同一档，见 common_qss）。
+           退出登录那颗是同位置的 Ghost，两者必须同一形状，否则登录 / 未登录
+           切换时按钮会"变形"。 */
+        border-radius: {theme.RADIUS_BUTTON_SOFT}px;
         padding: 11px 22px;
         font-size: 13px;
         font-weight: 600;
@@ -144,7 +155,9 @@ def dialog_qss(p: theme.Palette) -> str:
         background: {theme.blend(p.bg, p.text, 0.22 if p.is_dark else 0.52)};
         color: rgba(255, 255, 255, 0.94);
         border: none;
-        border-radius: {theme.RADIUS_BUTTON}px;
+        /* 圆角矩形，不是胶囊：RADIUS_BUTTON(20) 在 40px 高的按钮上就是胶囊，
+           与四窗里的主按钮（10px）不一致。用户 11-13 要求统一。 */
+        border-radius: {theme.RADIUS_BUTTON_SOFT}px;
         padding: 11px 22px;
         font-size: 13px;
     }}
@@ -241,22 +254,27 @@ class SettingsDialog(QDialog):
         self.setWindowTitle("设置")
         self.setWindowFlags(Qt.Dialog | Qt.FramelessWindowHint)
         self._frame = WindowFrame(self, resizable=True,
+                                  radius=theme.RADIUS_CARD,
+                                  shadow=SHADOW_PAD,
+                                  shadow_alpha=shadow_alpha(self._p),
                                   fill=lambda: surface_bg(self._p),
                                   border=lambda: surface_border(self._p))
-        self.resize(820, 680)
+        # 尺寸写的是**内容**尺寸，``floating_size`` 负责加回两圈阴影留白
+        self.resize(*floating_size(820, 680))
         # 最小高度按"最高的一页"定：外观页是"标题 + 说明 + 三张卡"（主题预览 130 +
         # 家庭标签两行 + 预览 + 摄像头一行），实测需要 567，最小窗口 600 只给到 528，
         # 摄像头那行会被裁掉。取 640（567 + 余量）留出取整空间。
         # 没有做整页滚动——排序 / 隐藏页里本来就是可滚动的树，外面再套一层滚动
         # 会变成滚动套滚动
-        self.setMinimumSize(700, 640)
+        self.setMinimumSize(*floating_size(700, 640))
 
-        outer = QVBoxLayout(self)
+        outer = QVBoxLayout(self._frame.body)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
 
         self.titlebar = TitleBar("设置", palette, subtitle="外观 · 排序 · 隐藏设备 · 账号",
-                                 buttons=("close",), variant="dialog")
+                                 buttons=("close",), variant="dialog",
+                                 frame=self._frame)
         outer.addWidget(self.titlebar)
 
         body = QWidget()
@@ -308,6 +326,9 @@ class SettingsDialog(QDialog):
         # 重新 setStyleSheet 就全跟着换了，不必逐个控件设色
         self.setStyleSheet(dialog_qss(palette))
         self.titlebar.set_palette(palette)
+        # 浮窗阴影不跟 QSS：深色要更黑（见 ``chrome.shadow_alpha``）。设置页是唯一
+        # 能在"窗口开着的时候"换主题的子窗口，这一句必须补。
+        self._frame.set_shadow_alpha(shadow_alpha(palette))
         for box in (
             getattr(self, "cb_placement", None),
             getattr(self, "cb_style", None),

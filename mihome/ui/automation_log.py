@@ -47,9 +47,17 @@ from ..core.automation import (
 from ..core.automation.service import AutomationService
 from . import theme
 from .automation_style import (
-    chip_border, common_qss, fit_height, surface_fill, tab_focus_only,
+    chip_border, common_qss, fit_height, reserve_scrollbar, surface_fill, tab_focus_only,
 )
-from .chrome import TitleBar, WindowFrame, surface_bg, surface_border
+from .chrome import (
+    SHADOW_PAD,
+    TitleBar,
+    WindowFrame,
+    floating_size,
+    shadow_alpha,
+    surface_bg,
+    surface_border,
+)
 from .combo import Combo, combo_qss
 from .settings import dialog_qss
 
@@ -59,12 +67,9 @@ MAX_ROWS = 500
 
 
 def _log_qss(p: theme.Palette) -> str:
-    return dialog_qss(p) + f"""
-    QLineEdit#Field {{
-        background: {theme.panel_bg(p)}; color: {p.text}; font-size: 12px;
-        border: 1px solid {p.border}; border-radius: 9px; padding: 7px 10px;
-    }}
-    QLineEdit#Field:focus {{ border-color: {p.accent}; }}
+    return dialog_qss(p) + theme.field_qss(
+        p, "QLineEdit#Field", radius=9, padding="7px 10px", font_size=12
+    ) + f"""
     QLabel#LogHint {{ color: {p.text_soft}; font-size: 11px; }}
     QLabel#LogStatus {{ color: {p.text_soft}; font-size: 12px; }}
     /* 这一排按钮长在**对话框底**上（不在卡片里），底色必须从 surface_bg 起算：
@@ -128,23 +133,27 @@ class AutomationLogDialog(QDialog):
         self.setWindowFlags(Qt.Dialog | Qt.FramelessWindowHint)
         self._frame = WindowFrame(
             self, resizable=True,
+            radius=theme.RADIUS_CARD,
+            shadow=SHADOW_PAD,
+            shadow_alpha=shadow_alpha(self._p),
             fill=lambda: surface_bg(self._p),
             border=lambda: surface_border(self._p),
         )
-        self.resize(900, fit_height(620))
-        self.setMinimumSize(720, 420)
+        self.resize(*floating_size(900, fit_height(620, reserve=2 * SHADOW_PAD)))
+        self.setMinimumSize(*floating_size(720, 420))
         self.setStyleSheet(_log_qss(palette))
         # 浅色下纯 #F3BE44 对白底只有 1.7:1，压深一点才读得清
         self._amber = (theme.SLIDER_WARM if palette.is_dark
                        else theme.blend(theme.SLIDER_WARM, palette.text, 0.35))
 
-        outer = QVBoxLayout(self)
+        outer = QVBoxLayout(self._frame.body)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
-        self.title_bar = TitleBar("触发日志", palette, buttons=("close",), variant="dialog")
+        self.title_bar = TitleBar("触发日志", palette, buttons=("close",),
+                                  variant="dialog", frame=self._frame)
         outer.addWidget(self.title_bar)
 
-        body = QWidget(self)
+        body = QWidget(self._frame.body)  # 内容区，别挂窗口（窗口大一圈）
         col = QVBoxLayout(body)
         col.setContentsMargins(18, 12, 18, 14)
         col.setSpacing(10)
@@ -189,6 +198,10 @@ class AutomationLogDialog(QDialog):
         for i in range(4):
             hh.setSectionResizeMode(i, QHeaderView.ResizeToContents)
         hh.setSectionResizeMode(4, QHeaderView.Stretch)
+        # 竖向滚动条常驻占位（同列表窗）：记录少的时候"时刻/规则"那几列不会因为
+        # 滚动条忽有忽无而左右跳。横向条**保留**——列多到放不下时它还得能滚，
+        # 而且它在底部只占高度，不影响列宽。
+        reserve_scrollbar(self.table, lock_horizontal=False)
         col.addWidget(self.table, 1)
 
         self.empty = QLabel(
@@ -234,7 +247,12 @@ class AutomationLogDialog(QDialog):
     def _fill_combos(self) -> None:
         # 规则下拉要包含「已经彻底删掉、但历史里还留着名字」的规则，否则那段历史筛不出来
         names: dict[str, str] = {}
+        home = str(getattr(self.service, "current_home", "") or "")
         for rule in self.service.rules.rules:
+            # 规则按家庭隔离：下拉只列本家庭的；历史里别的家庭留下的记录由下面的
+            # setdefault 补进来，那段日志仍筛得出来
+            if home and rule.home and rule.home != home:
+                continue
             names[rule.id] = rule.name or "未命名规则"
         for entry in self.service.engine.log:
             names.setdefault(entry.rule_id, entry.rule_name or "未命名规则")

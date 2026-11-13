@@ -53,6 +53,18 @@ def rgb_gap(a: str, b: str) -> int:
                abs(ca.blue() - cb.blue()))
 
 
+def contrast(a: str, b: str) -> float:
+    """WCAG 对比度。输入框描边这种 1px 细线只能靠它判断"看不看得见"。"""
+    def _lum(c: QColor) -> float:
+        def _f(v: float) -> float:
+            return v / 12.92 if v <= 0.03928 else ((v + 0.055) / 1.055) ** 2.4
+        return 0.2126 * _f(c.redF()) + 0.7152 * _f(c.greenF()) + 0.0722 * _f(c.blueF())
+
+    la, lb = _lum(QColor(a)), _lum(QColor(b))
+    hi, lo = max(la, lb), min(la, lb)
+    return (hi + 0.05) / (lo + 0.05)
+
+
 def main() -> int:
     app = QApplication(sys.argv[:1])  # noqa: F841
 
@@ -248,6 +260,47 @@ def main() -> int:
     check_true("最短也有 56px", short.width() >= 56, f"{short.width()}")
     short.setText("1 台设备 · 1 台开启")
     check_true("setText 之后宽度重算", short.width() > 56)
+
+    # -- 8. 输入框在深色下要看得见（用户 11-13 第三轮报的） -----------------
+    print("\n8) 输入框的底与描边")
+    for pal in (theme.LIGHT, theme.DARK):
+        fill = theme.field_bg(pal)
+        line = theme.field_border(pal)
+        card = theme.panel_bg(pal)
+        if pal.is_dark:
+            # 深色：卡片本身已经比窗口亮一档，输入框必须再亮一档才读得出"凹陷/可输入"
+            check_true(f"{pal.name} 输入框底与卡片分得开（≥1.12:1）",
+                       contrast(fill, card) >= 1.12, f"{fill} vs {card} "
+                       f"{contrast(fill, card):.2f}:1")
+        else:
+            # 浅色：白卡上再压深一档会读成"禁用"，轮廓交给描边（见下一条）
+            check_true("light 底与卡片几乎同色，轮廓交给描边",
+                       contrast(fill, card) < 1.08, f"{fill} vs {card} "
+                       f"{contrast(fill, card):.2f}:1")
+        check_true(f"{pal.name} 输入框描边看得见（≥1.2:1）",
+                   contrast(line, fill) >= 1.2, f"{line} vs {fill} "
+                   f"{contrast(line, fill):.2f}:1")
+    # 反向证明：旧写法（p.border 直接上输入框）在深色下确实等于没画
+    check_true("深色下 p.border 压在卡片上几乎不可见（旧写法）",
+               contrast(theme.DARK.border, theme.panel_bg(theme.DARK)) < 1.05,
+               f"{contrast(theme.DARK.border, theme.panel_bg(theme.DARK)):.2f}:1")
+    check_true("深色下新描边比 p.border 明显（≥1.3:1 的差距）",
+               contrast(theme.field_border(theme.DARK), theme.panel_bg(theme.DARK))
+               >= contrast(theme.DARK.border, theme.panel_bg(theme.DARK)) + 0.3)
+    qss = theme.field_qss(theme.DARK)
+    check_true("field_qss 用的是 field_bg + field_border",
+               theme.field_bg(theme.DARK) in qss
+               and theme.field_border(theme.DARK) in qss
+               and "border: 1px solid" in qss)
+    check_true("field_qss 焦点换成 accent",
+               f"QLineEdit:focus {{ border-color: {theme.DARK.accent}; }}" in qss)
+    check_true("不带 base 时不出现面板底当底色",
+               theme.panel_bg(theme.DARK) not in qss)
+    # 顶栏搜索框压在窗口底上：底色必须从 bg 起算，不能亮成一块凸起
+    top = theme.field_qss(theme.DARK, radius=16, base=theme.DARK.bg)
+    check_true("传 base 时底色按窗口底重算",
+               theme.field_bg(theme.DARK) not in top
+               and theme.blend(theme.DARK.bg, theme.DARK.text, 0.06) in top)
 
     print()
     if FAILS:

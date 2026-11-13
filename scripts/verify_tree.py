@@ -532,7 +532,9 @@ def section_rail() -> None:
 
         rail = dlg._rail
         bar = px(rail, 30, rail.height() - 20)  # 栏底：左下角往里，避开文字
-        canvas = px(dlg, dlg.width() - 6, 300)  # body 右边距那一条，稳定是窗口底色
+        # 窗口比面板大一圈（浮窗阴影留白），底色要取面板内的那一条，
+        # 取窗口边缘会落到透明阴影上（grab 出来是纯黑）
+        canvas = px(dlg, dlg.width() - dlg._frame.shadow_pad - 6, 300)
         gap = abs(bar.lightness() - canvas.lightness())
         check(f"{pal.name}：分类栏与内容区不同色（Δ ≥ 12）", gap >= 12,
               f"栏 {bar.name()} L={bar.lightness()} / 内容 {canvas.name()} L={canvas.lightness()}")

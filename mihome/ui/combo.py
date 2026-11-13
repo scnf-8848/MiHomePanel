@@ -45,6 +45,12 @@
    行都预留同一个右侧勾槽**（文字 elide 边界不随鼠标跳动）；临时高亮只用一层更淡
    的中性色跟着鼠标走。这样鼠标移到别处，勾仍钉在原选项上。
 
+6. **弹出层宽度跟着控件走，长选项被省略成「…」**。Qt 让 container 和 combo 同宽，
+   可控件宽度是布局给的：编辑页一行四格，单位那格 80px，「毫秒」写不下；音箱条
+   上那格 88px，「不静默」变成「不…」。**两者本来就该分开算**——控件窄是为了不
+   挤邻居，弹出层是浮层，没人跟它抢地方。``showPopup`` 里按最长一项把 container
+   和 view 一起撑宽（上限 ``POPUP_MAX_EXTRA``、且不出屏幕），再按新宽度对右边缘。
+
 样式集中在 ``combo_qss()`` / ``popup_qss()``，设置窗口和设备详情页共用同一份。
 """
 
@@ -95,11 +101,23 @@ CHECK_MARK_W = 11.0
 CHECK_MARK_H = 6.0
 CHECK_PEN = 1.9
 
+#: 弹出层**允许比控件本身宽出多少**（px）。控件宽度是一行格子让出来的——编辑页
+#: 一行四格，「秒」那格只有 80px，把「毫秒」写进去就只剩「…」。但弹出层是浮层，
+#: 往右多长出去一点不会挤别的控件，宁可让它长出去，也别把选项缩成省略号
+#: （用户 11-13 第二轮报：宽度跟控件绑死是根本原因）。
+POPUP_MAX_EXTRA = 220
+#: 算宽度时先给竖向滚动条留位置：留少了，条一出现文字区又变窄，照样省略。
+POPUP_BAR_W = 14
+#: view 自己的 QSS padding（``combo_qss`` 里写的 6px，四边），算宽度要加回来。
+VIEW_PAD = 6
+
 
 def combo_qss(p: theme.Palette) -> str:
     """主控件 + 弹出列表里每一项的样式。"""
     field = theme.field_bg(p)
-    line = theme.blend(field, p.text, 0.10)
+    # 描边与输入框同一支（theme.field_border）：一行里四格挨着，下拉有边框、
+    # 输入框没边框会读成两种控件。以前这里单独算 0.10，深色下比输入框更淡。
+    line = theme.field_border(p)
     return f"""
     QComboBox {{
         background: {field};
@@ -109,7 +127,9 @@ def combo_qss(p: theme.Palette) -> str:
         padding: 6px 38px 6px 12px;
         font-size: 13px;
     }}
-    QComboBox:hover {{ border-color: {theme.blend(field, p.text, 0.20)}; }}
+    QComboBox:hover {{
+        border-color: {theme.blend(field, p.text, 0.24 if p.is_dark else 0.20)};
+    }}
     QComboBox:disabled {{
         color: {p.text_mute};
         background: {theme.blend(field, p.bg, 0.45)};
@@ -294,6 +314,7 @@ class Combo(QComboBox):
         self._open = True
         self._style_popup()
         if self._popup is not None:
+            self._widen_popup()          # 先按内容撑宽，再据此摆位
             self._place_below(self._popup)
         self.update()  # 箭头翻成 "^"
 
@@ -347,6 +368,51 @@ class Combo(QComboBox):
         cont.setGeometry(geo)
         cont.show()
         cont.raise_()
+
+    def _popup_min_width(self) -> int:
+        """弹出层要多宽才不被省略号吃掉。
+
+        Qt 默认让弹出层和控件同宽（老式组合框的"影子"行为）。控件宽度是布局给
+        的——编辑页一行四格，单位那格只有 80px，「毫秒」根本放不下，于是列表里
+        变成「…」；音箱条上那格 88px，「不静默」变成「不…」。**控件和弹出层本来
+        就该分开算**：控件窄是为了不挤邻居，弹出层是浮层，没人跟它抢地方。
+
+        宽度 = 最长一项的文字 + 行内左右留白 + 右侧勾槽 + 竖向滚动条 + view 的
+        内边距。滚动条那 14px 必须**先留出来**——不算它，条一出现文字区又缩回去，
+        长选项照样省略。
+        """
+        view = self.view()
+        fm = QFontMetrics(view.font() if view is not None else self.font())
+        text = max((fm.horizontalAdvance(self.itemText(i)) for i in range(self.count())),
+                   default=0)
+        need = (text + 2 * ITEM_INSET_X + 2 * ITEM_PAD_X + CHECK_W
+                + POPUP_BAR_W + 2 * VIEW_PAD)
+        cap = self.width() + POPUP_MAX_EXTRA
+        screen = (QApplication.screenAt(self.mapToGlobal(QPoint(0, 0)))
+                  or QApplication.primaryScreen())
+        if screen is not None:  # 别长到屏幕外面去
+            cap = min(cap, screen.availableGeometry().width() - 16)
+        return max(self.width(), min(need, cap))
+
+    def _widen_popup(self) -> None:
+        """把 container 和里面的 view 一起撑到 ``_popup_min_width()``。
+
+        改 view 的 ``minimumWidth`` 不管用：container 的宽度是 Qt 在
+        ``showPopup`` 里按 combo 宽度直接 ``setGeometry`` 的，不会回头问 view。
+        而单纯 ``resize`` 也不够——view 的 ``minimumSizeHint`` 是按
+        ``sizeHintForColumn``（最长一项）算的，container 的布局随后会把它顶回
+        原尺寸，超长项时能一直撑到整屏宽。所以两处都用 ``setFixedWidth``
+        **钉死**：宽度只能由这里决定。下次展开会重算一遍，缩回来也没问题。
+        """
+        cont, view = self._popup, self.view()
+        if cont is None or view is None:
+            return
+        want = self._popup_min_width()
+        view.setFixedWidth(want)
+        cont.setFixedWidth(want)
+        if cont.width() > want:  # 布局若仍不让步，至少别溢出
+            cont.resize(want, cont.height())
+        view.setGeometry(0, 0, want, cont.height())
 
     def _place_below(self, cont: QFrame) -> None:
         """把弹出层挪到控件下方、留一条缝，不要盖住控件。
@@ -411,8 +477,11 @@ __all__ = [
     "ITEM_H",
     "ITEM_INSET_X",
     "ITEM_PAD_X",
+    "POPUP_BAR_W",
     "POPUP_GAP",
+    "POPUP_MAX_EXTRA",
     "POPUP_RADIUS",
+    "VIEW_PAD",
     "Combo",
     "PopupDelegate",
     "combo_qss",
