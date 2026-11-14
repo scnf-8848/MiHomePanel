@@ -2459,8 +2459,11 @@ opengl32sw 5.3 MB、translations 7.4 MB（128 个 `.qm`）。加上 go2rtc 的 2
 > 文档重整。
 > 已知限制照实写：耗材与监控仍是占位、单账号、摄像头只做实时画面声音云台、未适配品类
 > 走通用兜底。
-> **程序发版流程本身还没进 `docs/DEVELOPMENT.md`**（那里只有「补丁版 Release」一节，
-> 讲的是组件）。下次发版前要补一节，否则命令行与产物命名得每次现推。
+> **发版流程已写进 `docs/DEVELOPMENT.md`「发布一个版本（GitHub Releases）」**（14:4x 补）：
+> 七步 = 改 `__version__` → `build_exe.py --go2rtc <补丁版>` → 产物 `--probe-camera` →
+> 组包 + `SHA256SUMS` → release notes → `gh release create` → 收尾核对三件事。
+> 坑：`build_exe.py` 开工先 `rmtree(dist)`，notes 与旧 zip 都会没，所以 notes 另存
+> `docs/release-notes/v<版本>.md`（v0.1.0 那份已归档）。
 
 三段式规则（截图 `docs/reference/mihome-app/31_create_automation.jpg`，本地已 gitignore）：
 

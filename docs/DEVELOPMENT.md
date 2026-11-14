@@ -34,6 +34,7 @@
 - [排序与隐藏设备](#排序与隐藏设备)
 - [摄像头画面](#摄像头画面)
 - [打包成 exe 的实现](#打包成-exe-的实现)
+- [发布一个版本（GitHub Releases）](#发布一个版本github-releases)
 - [验证与截图脚本](#验证与截图脚本)
 - [视觉参考](#视觉参考)
 - [踩坑清单](#踩坑清单)
@@ -3140,6 +3141,90 @@ PySide6 的 PyInstaller hook 是"宁多勿少"：整个 QML / Quick / PDF / 虚�
 `go2rtc.exe` 那 21 MB **不要 UPX**。实测：压到 6.1 MB，但冷启动从 80 ms 变成 486 ms
 （每次开播都吃这一下），而且 Go 二进制 + UPX 是杀软的高误报组合；更要紧的是分发包
 几乎没省——原版 20.6 MB zip 后 8.0 MB，UPX 版 6.1 MB 已经压不动，只差 1.9 MB。
+
+## 发布一个版本（GitHub Releases）
+
+程序自身的 Release 打 **`v<版本>`**（`v0.1.0`），和组件的 **`go2rtc-<ref>`** 是两条线，
+同一个仓库各发各的，别混到同一个 tag 上。下面按顺序走，**每一步都拿到证据再进下一步**
+（发出去的 tag 不该删了重发：用户手里的 `SHA256SUMS` 会对不上）。
+
+**1. 只改一处版本号**
+
+`mihome/__init__.py` 的 `__version__`。窗口标题（`MainWindow.setWindowTitle`）与
+「设置 → 关于」都读它，**别在 UI 里另写字面量**。另外两处是**文字**不是代码：
+README「下载与安装」里的 `releases/tag/v0.1.0` 与 `MiHomePanel-v0.1.0.zip`。
+
+`build_exe.py` **不写 exe 版本资源**，所以 `MiHomePanel.exe` 右键「属性 → 详细信息」
+里没有版本号。这是已知缺口（TODO「技术债」），不是"版本号没生效"：程序内是对的。
+
+**2. 打包，显式指补丁版 go2rtc**
+
+```powershell
+.venv\Scripts\python.exe scripts\build_exe.py --go2rtc dist-go2rtc\go2rtc.exe
+```
+
+`--go2rtc` 要写死。不写时 `find_binary()` 会按「程序目录 → 数据目录 → PATH」找，
+本机 `<data>\go2rtc\` 若装的是官方版，打出去的包首帧就是 5 秒（脚本会打一行
+「本地补丁：没有」提醒，别忽略）。打给虚拟机 / 远程桌面用户再加 `--keep-sw-opengl`。
+
+脚本自带两步门禁：产物 `--self-check` + **无控制台窗口冒烟**。`--skip-check` /
+`--skip-smoke` 是排障用的，发版别加。
+
+> **`dist/` 会被整个删掉**：`build_exe.py` 开工先 `rmtree(dist)`，上一版的 zip、
+> `SHA256SUMS`、release notes 都会没。notes 另存一份进 `docs/release-notes/`
+> （`docs/` 入库，`dist/` 在 `.gitignore` 里），要重发时不用现写。
+
+**3. 在产物上真播一次**（自检不碰摄像头）
+
+```powershell
+dist\MiHomePanel\MiHomePanel.exe --probe-camera --rounds 3
+```
+
+报告写 `<data>\logs\probe-camera.txt`。看首帧区间和**分辨率**——有分辨率才证明不是黑屏。
+
+**4. 组包 + 校验和**
+
+```powershell
+Compress-Archive -Path dist\MiHomePanel -DestinationPath dist\MiHomePanel-v0.1.0.zip -Force
+Get-FileHash dist\MiHomePanel-v0.1.0.zip -Algorithm SHA256 |
+    ForEach-Object { "$($_.Hash.ToLower())  MiHomePanel-v0.1.0.zip" } |
+    Set-Content dist\SHA256SUMS -Encoding ascii
+```
+
+- 压缩**目录本身**，不是 `dist\MiHomePanel\*`：要的就是解压后多一层 `MiHomePanel\`
+- `SHA256SUMS` 是「小写哈希 + **两个空格** + 文件名」，ASCII 无 BOM；这样
+  `sha256sum -c SHA256SUMS` 和 GitHub 页面上肉眼核对都能直接用
+- **换工具 / 换顺序就会得到另一个哈希**（v0.1.0 那份是 135 个条目、不带目录条目、
+  正斜杠；`Compress-Archive` 会多出目录条目、体积差约 0.1 MB）。所以每次组包都要
+  **重算**，不能沿用上一版的 `SHA256SUMS`
+- 体积按**三个口径**记：目录 MB、文件数、zip MB。只报一个容易得出"省了 15 MB"
+  这种误导结论（zip 后其实只差 1.9 MB）
+
+**5. 写 release notes**（`docs/release-notes/v<版本>.md`，再拷一份到 `dist/` 上传）
+
+四段就够：
+- 开头一句「谁该下、怎么用」：免安装、自带取流组件、Windows 10 / 11 x64
+- 「本次更新」按**用户能感知的变化**写，内部重构不进这一节
+- 「自带组件」点名 go2rtc 的上游 ref、组件 Release 链接、MIT 许可
+- 「已知限制」照实写（占位入口、单账号、摄像头只做实时画面 / 声音 / 云台…）
+
+**6. 发布**
+
+```powershell
+gh release create v0.1.0 dist\MiHomePanel-v0.1.0.zip dist\SHA256SUMS `
+  --title "MiHomePanel v0.1.0" --notes-file dist\release-notes-v0.1.0.md
+```
+
+发完核对三件事（资产传错了用 `gh release upload v0.1.0 <文件> --clobber` 补）：
+
+- Release 页**匿名**打开能看到两个资产（登录状态看得见不算数，用户不登录）
+- 下载 zip 算一遍 sha256，与 `SHA256SUMS` 一致
+- 解压后 `MiHomePanel\go2rtc\BUILD.txt` 在——补丁版标记，`--self-check` 靠它区分 2 秒 / 5 秒
+
+**7. 收尾**
+
+README 下载链接指到新 tag；`TODO.md` 补一条完成记录（体积 / 哈希 / 实测首帧）；
+这轮动过的调研结论回填 `docs/reference/README.md`。
 
 ## 验证与截图脚本
 
