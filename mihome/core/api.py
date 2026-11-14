@@ -255,13 +255,19 @@ class CapabilityBook:
 
     结构::
 
-        {"entries": {"<did>|<siid>|<piid>": {"code": -704002000, "at": 1793813501}}}
+        {"version": 1,
+         "entries": {"<did>|<siid>|<piid>": {"code": -704002000, "at": 1793813501}},
+         "devices": {"<did>": {"fingerprint": "urn:miot-spec-v2:device:...", "at": ...}}}
+
+    ``devices`` 只记每台设备上次学习时的规格指纹（型号 + 规格版本），启动时
+    指纹变了才 ``forget_device``，没变不动——见 :meth:`sync_devices`。
     """
 
     def __init__(self, path: Path | None = None) -> None:
         self.path = path or (paths.cache_dir() / "capabilities.json")
         self._lock = threading.Lock()
         self._data: dict[str, dict[str, Any]] = {}
+        self._devices: dict[str, dict[str, Any]] = {}
         self._dirty = False
         self._load()
 
@@ -273,13 +279,42 @@ class CapabilityBook:
             return
         entries = raw.get("entries")
         if isinstance(entries, dict):
-            self._data = {k: v for k, v in entries.items() if isinstance(v, dict)}
+            kept: dict[str, dict[str, Any]] = {}
+            dropped = 0
+            for key, value in entries.items():
+                # 常态自愈：按**当前**分类规则校验存量记录。早版本的分类把
+                # "设备离线 / 设备不支持"也算进来了，这些结论现在既不成立、
+                # 又会让对应属性永远被跳过，所以读入时就丢掉并回写。
+                if not isinstance(value, dict):
+                    dropped += 1
+                    continue
+                try:
+                    code = int(value.get("code"))
+                except (TypeError, ValueError):
+                    dropped += 1
+                    continue
+                if classify(code) != "unsupported":
+                    dropped += 1
+                    continue
+                kept[key] = value
+            self._data = kept
+            if dropped:
+                self._dirty = True
+        devices = raw.get("devices")
+        if isinstance(devices, dict):
+            self._devices = {k: v for k, v in devices.items() if isinstance(v, dict)}
+        if self._dirty:
+            self.save()
 
     def save(self) -> None:
         with self._lock:
             if not self._dirty:
                 return
-            payload = {"version": 1, "entries": self._data}
+            payload = {
+                "version": 1,
+                "entries": self._data,
+                "devices": self._devices,
+            }
             self._dirty = False
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -305,8 +340,8 @@ class CapabilityBook:
             self._data[k] = {"code": code, "at": int(time.time())}
             self._dirty = True
 
-    def forget_device(self, did: str) -> None:
-        """设备重新配对 / 换了型号时清掉旧账。"""
+    def forget_device(self, did: str) -> int:
+        """设备重新配对 / 换了型号时清掉旧账。返回清掉的条数。"""
         prefix = f"{did}|"
         with self._lock:
             stale = [k for k in self._data if k.startswith(prefix)]
@@ -314,6 +349,53 @@ class CapabilityBook:
                 del self._data[k]
             if stale:
                 self._dirty = True
+            return len(stale)
+
+    def count_for(self, did: str) -> int:
+        """这台设备记了多少条「已确认不支持」。"""
+        prefix = f"{did}|"
+        with self._lock:
+            return sum(1 for k in self._data if k.startswith(prefix))
+
+    def clear(self) -> int:
+        """清空全部设备的能力账本（含指纹），返回清掉的条数。"""
+        with self._lock:
+            n = len(self._data)
+            if n or self._devices:
+                self._data.clear()
+                self._devices.clear()
+                self._dirty = True
+            return n
+
+    def sync_devices(self, fingerprints: Mapping[str, str]) -> list[str]:
+        """按规格指纹做常态校验：指纹变了的设备才清旧账。
+
+        ``fingerprints`` 只应包含**拿得到规格**的设备；没有规格的调用方根本不传，
+        这里也不猜（缺规格时清账会把机型差异的结论误删）。
+
+        返回被清掉的 did 列表。只读写本地文件，**不发任何请求**。
+        """
+        cleared: list[str] = []
+        now = int(time.time())
+        with self._lock:
+            for did, fingerprint in fingerprints.items():
+                if not did or not fingerprint:
+                    continue
+                old = self._devices.get(did)
+                if old is None:
+                    self._devices[did] = {"fingerprint": fingerprint, "at": now}
+                    self._dirty = True
+                    continue
+                if old.get("fingerprint") == fingerprint:
+                    continue
+                prefix = f"{did}|"
+                stale = [k for k in self._data if k.startswith(prefix)]
+                for k in stale:
+                    del self._data[k]
+                self._devices[did] = {"fingerprint": fingerprint, "at": now}
+                self._dirty = True
+                cleared.append(did)
+        return cleared
 
     def __len__(self) -> int:
         return len(self._data)

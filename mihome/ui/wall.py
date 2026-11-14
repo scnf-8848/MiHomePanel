@@ -496,6 +496,8 @@ class WallView(QScrollArea):
     scene_hide_requested = Signal(str, bool)  # scene_id, 是否隐藏
     card_value_committed = Signal(str, int, int, object)  # did, siid, piid, value
     card_style_requested = Signal(str, str)  # did, 样式 id（宽度由样式自带）
+    capability_refresh_requested = Signal(str)  # did：清能力缓存并立刻重查
+    device_reset_requested = Signal(str)  # did：清掉这台设备的全部本地配置
 
     def __init__(self, store: Store, icons: IconProvider, palette: theme.Palette) -> None:
         super().__init__()
@@ -712,13 +714,12 @@ class WallView(QScrollArea):
         )
 
     def _on_card_menu(self, did: str, pos: QPoint) -> None:
-        """打开详情 / 卡片样式 / 隐藏设备。
+        """打开详情 / 卡片样式 / 强制刷新 / 重置设备配置 / 隐藏设备。
 
-        样式是**每台设备各自**的选择，按 did 落进 ``prefs.card_styles``；宽度
-        由样式自带，菜单里直接标出「小卡 1×1 / 宽卡 2×1」，不再单列「大小」。
-        子菜单只列这台设备能力上真的能用的样式——灯才有亮度 / 色温，传感器
-        只有「标准」，不列一堆点了没反应的灰项。第一项就是默认，所以也不再
-        需要单独的「恢复默认样式」。
+        「强制刷新」只清能力账本里这台设备「已确认不支持」的记录并立刻重查，
+        **不是**刷新读数；「重置设备配置」清的是本机偏好（样式 / 隐藏 / 排序），
+        两项都要二次确认或明确提示，所以只发信号、不在墙面里直接动手。
+        隐藏分组里的卡片走同一个 ``_on_card_menu``，右键一样能到这两项。
         """
         hidden = self._store.prefs.is_hidden(did)
         st = self._store.devices.get(did)
@@ -737,6 +738,9 @@ class WallView(QScrollArea):
                 hint = style_menu.addAction("该品类暂无其它样式")
                 hint.setEnabled(False)
         menu.addSeparator()
+        act_refresh = menu.addAction("强制刷新")
+        act_reset = menu.addAction("重置设备配置")
+        menu.addSeparator()
         act_hide = menu.addAction("取消隐藏" if hidden else "隐藏设备")
 
         chosen = menu.exec(pos)  # 子菜单里被点的 action 也会作为返回值
@@ -744,6 +748,10 @@ class WallView(QScrollArea):
             return
         if chosen is act_open:
             self.card_clicked.emit(did)
+        elif chosen is act_refresh:
+            self.capability_refresh_requested.emit(did)
+        elif chosen is act_reset:
+            self.device_reset_requested.emit(did)
         elif chosen is act_hide:
             self.hide_requested.emit(did, not hidden)
         else:

@@ -358,6 +358,8 @@ class MainWindow(QMainWindow):
         self.wall.card_value_committed.connect(self._on_card_value)
         self.wall.card_style_requested.connect(self._on_card_style)
         self.wall.hide_requested.connect(self._on_hide_requested)
+        self.wall.capability_refresh_requested.connect(self._on_capability_refresh)
+        self.wall.device_reset_requested.connect(self._on_device_reset)
         self.wall.scene_hide_requested.connect(self.store.set_scene_hidden)
         self.search.textChanged.connect(self.wall.set_filter)
         self.wall.scene_run.connect(self._on_scene)
@@ -1082,6 +1084,49 @@ class MainWindow(QMainWindow):
 
     def _on_hide_requested(self, did: str, hidden: bool) -> None:
         self.store.set_hidden(did, hidden)
+
+    def _device_name(self, did: str) -> str:
+        st = self.store.devices.get(did)
+        return st.name if st is not None else did
+
+    def _on_capability_refresh(self, did: str) -> None:
+        """右键「强制刷新」：清掉这台设备的「已确认不支持」记录，并立刻重查。
+
+        不是刷新读数（读数本来就在 3 秒轮询里），也不改任何本地偏好，
+        所以不弹二次确认；结果用顶部指令条那条提示说清楚。
+        """
+        from .device_reset import refresh_result_text
+
+        def done(removed: int, read: int, error: str) -> None:
+            self.speaker_bar.notice(
+                refresh_result_text(self._device_name(did), removed, read, error)
+            )
+
+        self.store.refresh_capabilities(did, done)
+
+    def _on_device_reset(self, did: str) -> None:
+        """右键「重置设备配置」：确认后清掉样式 / 隐藏 / 排序 / 能力缓存。"""
+        from .confirm import confirm
+        from .device_reset import device_reset_text
+
+        name = self._device_name(did)
+        counts = self.store.device_config_counts(did)
+        self._cover_dim(True)
+        try:
+            ok = confirm(
+                self,
+                "重置设备配置",
+                device_reset_text(name, counts),
+                self.palette_ref,
+                ok_text="重置",
+                danger=True,
+            )
+        finally:
+            self._cover_dim(False)
+        if not ok:
+            return
+        self.store.reset_device_config(did)
+        self.speaker_bar.notice(f"「{name}」的本地配置已重置，卡片已回到默认样式")
 
     def _on_scene(self, scene_id: str) -> None:
         self.store.run_scene(scene_id, self.store.active_home)

@@ -382,6 +382,7 @@ class Store:
             ):
                 changed.add(did)
         self.devices = devices
+        self.sync_capability_fingerprints()
         self.client.capabilities.save()
         self._last_topology_change = changed
 
@@ -640,6 +641,65 @@ class Store:
             return
         self._status("场景已隐藏，可在「设置 → 隐藏」里恢复" if hidden else "场景已恢复显示")
         self._layout_changed()
+
+    # -- 设备配置重置 ----------------------------------------------------
+    def sync_capability_fingerprints(self) -> list[str]:
+        """按规格指纹校验能力账本：只清指纹变了的设备，**不发任何请求**。
+
+        没有规格的设备整个跳过——缺规格时清账会把"这台机型认不认"的结论误删。
+        正常启动（指纹全没变）除了内存比对什么都不做。
+        """
+        fingerprints = {
+            did: st.spec.urn
+            for did, st in self.devices.items()
+            if st.spec is not None and st.spec.urn
+        }
+        cleared = self.client.capabilities.sync_devices(fingerprints)
+        self.client.capabilities.save()  # 没脏就是空操作；首次登记要落盘
+        return cleared
+
+    def device_config_counts(self, did: str) -> dict[str, int]:
+        """这台设备当前有哪些本地配置（只统计，不改动），给确认窗报数。"""
+        return {
+            "style": 1 if self.prefs.card_style(did) else 0,
+            "hidden": 1 if self.prefs.is_hidden(did) else 0,
+            "order": self.prefs.device_order_hits(did),
+            "caps": self.client.capabilities.count_for(did),
+        }
+
+    def all_device_config_counts(self) -> dict[str, int]:
+        """所有设备的本地配置统计，口径与 ``device_config_counts`` 相同。"""
+        devices: set[str] = set(self.prefs.card_styles) | set(self.prefs.hidden)
+        for dids in self.prefs.device_order.values():
+            devices.update(dids)
+        return {
+            "devices": len(devices),
+            "style": len(self.prefs.card_styles),
+            "hidden": len(self.prefs.hidden),
+            "order": sum(len(dids) for dids in self.prefs.device_order.values()),
+            "caps": len(self.client.capabilities),
+        }
+
+    def reset_device_config(self, did: str) -> dict[str, int]:
+        """清掉一台设备的全部本地配置：能力缓存 + 样式 + 隐藏 + 房间内排序。
+
+        返回实际清掉的条数。不动凭据、也不向云端写任何东西。
+        """
+        counts = self.prefs.reset_device(did)
+        counts["caps"] = self.client.capabilities.forget_device(did)
+        self.client.capabilities.save()
+        if counts["style"] or counts["hidden"] or counts["order"]:
+            self._layout_changed()
+        return counts
+
+    def reset_all_device_config(self) -> dict[str, int]:
+        """清掉所有设备的本地配置，口径与 :meth:`reset_device_config` 相同。"""
+        counts = self.prefs.reset_all_devices()
+        counts["caps"] = self.client.capabilities.clear()
+        self.client.capabilities.save()
+        if counts["style"] or counts["hidden"] or counts["order"]:
+            self._layout_changed()
+        return counts
 
     def apply_order_snapshot(
         self,
@@ -953,6 +1013,35 @@ class Store:
             priority=PRIORITY_DATA,
             label="detail",
             callback=finish,
+        )
+
+    def refresh_capabilities(
+        self,
+        did: str,
+        done: Callable[[int, int, str], None],
+    ) -> None:
+        """清掉这台设备的「已确认不支持」记录，并立刻重查它全部可读属性。
+
+        ``done(清除条数, 重查条数, 错误文案)`` 在主线程回调。**先清后读**：
+        即使设备离线、这次重查失败，旧结论也已经作废，下次上线会重新学。
+        """
+        st = self.devices.get(did)
+        removed = self.client.capabilities.forget_device(did)
+        self.client.capabilities.save()
+        if st is None:
+            done(removed, 0, "设备不在当前家庭")
+            return
+        if st.spec is None:
+            done(removed, 0, "这台设备缺少规格，无法重查")
+            return
+        props = [p for p in st.spec.properties() if p.readable]
+        if not props:
+            done(removed, 0, "没有可读取的属性")
+            return
+
+        self.read_props(
+            did, props,
+            lambda res, err: done(removed, len(res or {}), err),
         )
 
     # -- 写入 ------------------------------------------------------------

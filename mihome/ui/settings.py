@@ -840,6 +840,21 @@ class SettingsDialog(QDialog):
         card.add_row("凭据文件", self.lbl_path, expand=True)
         col.addWidget(card)
 
+        # 设备配置和账号放在同一页：两者都是"本机数据"，且重置都不动云端。
+        self._section(col, "设备配置")
+        card = SettingsCard()
+        self.btn_reset_all = QPushButton("全部重置")
+        self.btn_reset_all.setObjectName("Ghost")
+        self.btn_reset_all.setCursor(Qt.PointingHandCursor)
+        self.btn_reset_all.clicked.connect(self._reset_all_device_config)
+        card.add_row(
+            "本地配置",
+            self.btn_reset_all,
+            sub="卡片样式、隐藏、排序与能力缓存；不影响米家 App 与登录",
+            expand=True,
+        )
+        col.addWidget(card)
+
         # 米家的退出登录是**页面最底部居中的灰胶囊**，不是红色危险按钮：
         # 这个动作可逆（重新扫码就回来了），用红色反而像不可挽回的操作。
         self.btn_account = QPushButton("退出登录")
@@ -864,6 +879,25 @@ class SettingsDialog(QDialog):
         row.addStretch(1)
         col.addLayout(row)
         return page
+
+    def _reset_all_device_config(self) -> None:
+        """清掉所有设备的本地配置，口径与卡片右键的单设备重置相同。"""
+        from .confirm import confirm
+        from .device_reset import all_reset_text
+
+        counts = self.store.all_device_config_counts()
+        if not confirm(
+            self,
+            "全部重置",
+            all_reset_text(counts),
+            self._p,
+            ok_text="全部重置",
+            danger=True,
+        ):
+            return
+        self.store.reset_all_device_config()
+        self.btn_reset_all.setText("已重置")
+        self.btn_reset_all.setEnabled(False)
 
     # -- 常规 ------------------------------------------------------------
     def _build_general(self) -> QWidget:

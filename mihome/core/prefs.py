@@ -334,6 +334,46 @@ class Prefs:
         self.device_order.pop(self.room_key(home_id, room_id), None)
         self.save()
 
+    # -- 设备配置重置 ----------------------------------------------------
+    def reset_device(self, did: str) -> dict[str, int]:
+        """清掉一台设备的本地配置：卡片样式、隐藏、房间内排序。
+
+        能力缓存不在 ``Prefs`` 里（由 ``CapabilityBook`` 管），调用方自己去清。
+        返回清掉的条数，给确认窗和提示用。
+        """
+        did = str(did)
+        style = 1 if self.card_styles.pop(did, None) is not None else 0
+        hidden = 0
+        if did in self.hidden:
+            self.hidden.remove(did)
+            hidden = 1
+        order = self._forget_device_order(did)
+        if style or hidden or order:
+            self.save()
+        return {"style": style, "hidden": hidden, "order": order}
+
+    def device_order_hits(self, did: str) -> int:
+        """只统计、不改动：这台设备在几张房间顺序表里。"""
+        return sum(1 for dids in self.device_order.values() if did in dids)
+
+    def reset_all_devices(self) -> dict[str, int]:
+        """清掉所有设备的本地配置，口径与 :meth:`reset_device` 相同。"""
+        affected: set[str] = set(self.card_styles) | set(self.hidden)
+        for dids in self.device_order.values():
+            affected.update(dids)
+        counts = {
+            "devices": len(affected),
+            "style": len(self.card_styles),
+            "hidden": len(self.hidden),
+            "order": sum(len(dids) for dids in self.device_order.values()),
+        }
+        if counts["style"] or counts["hidden"] or counts["order"]:
+            self.card_styles.clear()
+            self.hidden = []
+            self.device_order.clear()
+            self.save()
+        return counts
+
     # -- 家庭标签的排列 / 激活样式 ---------------------------------------
     def set_home_placement(self, value: str) -> bool:
         if value not in HOME_PLACEMENTS or value == self.home_placement:
@@ -515,10 +555,14 @@ class Prefs:
         order.append(did)
         self.device_order[key] = order
 
-    def _forget_device_order(self, did: str) -> None:
+    def _forget_device_order(self, did: str) -> int:
+        """把这台设备从各房间的顺序表里删掉，返回命中了几张表。"""
+        hits = 0
         for key, dids in list(self.device_order.items()):
             if did in dids:
                 self.device_order[key] = [d for d in dids if d != did]
+                hits += 1
+        return hits
 
     def append_device_orders(self, slots: Iterable[tuple[str, str, str]]) -> None:
         """批量恢复到所在房间末尾（「全部恢复显示」用），只落一次盘。"""
