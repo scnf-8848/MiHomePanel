@@ -2426,6 +2426,42 @@ opengl32sw 5.3 MB、translations 7.4 MB（128 个 `.qm`）。加上 go2rtc 的 2
 > 验证：rules **211**、ui **427**、hotkeys **37**，prefs / card_style / store / speaker /
 > geek / autostart / float_window 全部零失败。
 
+> **11-13 深夜：设置新增「关于」页，版本号进窗口标题**
+> 设置左栏 5 项 → **6 项**（外观 / 排序 / 隐藏 / 账号 / 常规 / **关于**）：
+> `SettingsDialog.__init__` 的导航项与 `pages` 必须**加在同一位置**，两处顺序错开就会
+> 出现"点关于看到常规"。
+> 页面内容：版本（`米家控制台（MiHomePanel） v0.1.0`）、许可 `GPL-3.0-or-later`
+> （完整条款指向程序目录的 `LICENSE`）、源码与反馈两个 URL、第三方组件
+> go2rtc（**MIT · 本地补丁版** + 组件 Release 链接）与 mijiaAPI（GPL-3.0-or-later）、
+> 致谢（AlexxIT/go2rtc、Do1e/mijia-api、Google Material Icons）。
+> 值文字走 `_about_text()`（`RowValue` / `RowValueSoft`）：**可选中复制**、长 URL 自动
+> 换行——反馈地址要能直接拖走，所以没用普通说明文字。
+> **版本号唯一来源是 `mihome/__init__.py` 的 `__version__`**：关于页与
+> `MainWindow.setWindowTitle("米家控制台 v…")` 都读它，改版本只改这一处，别在 UI 里写字面量。
+> 验证脚本 `verify_tree.py` / `verify_autostart.py` 跟着改（设置页项数 5 → 6）。
+> 遗留（已记进「技术债」）：`build_exe.py` 不写 exe 版本资源，文件属性里看不到版本号。
+
+> **11-13 深夜：v0.1.0 首个面向普通用户的发布版**
+> 产物在 `dist/`（**已 gitignore，不入库**）：`MiHomePanel-v0.1.0.zip`
+> （47,311,774 字节 = 45.1 MiB）、`SHA256SUMS`（`01412d77…b87b97  MiHomePanel-v0.1.0.zip`）、
+> `release-notes-v0.1.0.md`。
+> 压缩包内是 **`MiHomePanel/` 整个目录**（不是只发 exe，旁边的 `_internal/` 不能少），
+> 并**自带补丁版 go2rtc**：`MiHomePanel/go2rtc/` 下 `go2rtc.exe` + `BUILD.txt`
+> （补丁版标记，`find_binary()` 第一顺位）+ `LICENSE` + `NOTICE.txt`。用户解压双击即可，
+> **不需要 Python，也不需要跑 `install_go2rtc.py`**。
+> 打包走 `scripts/build_exe.py --go2rtc <dist-go2rtc 里的补丁版>`，脚本自己带两步门禁：
+> 产物 `--self-check`（找得到 go2rtc、HEVC 解得开）+ **无控制台窗口冒烟**
+> （`DETACHED_PROCESS`，自检过不代表双击能开）；发版前另在产物上 `--probe-camera` 真播一次。
+> `SHA256SUMS` 用 `Get-FileHash -Algorithm SHA256` 生成、ASCII 落盘，和 zip 一起发。
+> README 的「下载与安装」直接指向 Releases `v0.1.0`，写明免安装、自带取流组件、附校验和。
+> release notes 分了六条：摄像头首帧 2.20–3.47 秒（官方构建 4.8–6.3 秒）、在线状态与
+> 写后回读、排序与隐藏改双 tab、电脑自动化（含中枢选择 / 回收站 / 日志筛选）、关于页、
+> 文档重整。
+> 已知限制照实写：耗材与监控仍是占位、单账号、摄像头只做实时画面声音云台、未适配品类
+> 走通用兜底。
+> **程序发版流程本身还没进 `docs/DEVELOPMENT.md`**（那里只有「补丁版 Release」一节，
+> 讲的是组件）。下次发版前要补一节，否则命令行与产物命名得每次现推。
+
 三段式规则（截图 `docs/reference/mihome-app/31_create_automation.jpg`，本地已 gitignore）：
 
 - [x] **① 触发「当以下（任一）情况发生时」**：只支持**键盘快捷键**，单键或 2–3 键组合；
@@ -2730,6 +2766,9 @@ _（「摄像头实时画面」一期归档在本节「本轮完成（2026-11-07
       预留**（动作侧见「核心特性 → 1. 两个方向」）。真接自动化时，设备数多的房间要
       观察是否触发云端限流
 - [ ] 能力账本（`capabilities.json`）只增不减，换设备型号后要提供"重置"入口
+- [ ] `build_exe.py` 不写 exe 版本资源，`MiHomePanel.exe` 右键属性里**没有版本号**
+      （程序内标题与「关于」页是对的，读的是 `mihome.__version__`）。要补就给 PyInstaller
+      传 `--version-file` 的 `VSVersionInfo`，版本值仍从 `__version__` 取，别另写一份
 - [x] `prefs.json` 的顺序键从**家庭名 / 房间名**改成云端 `home_id` / `room_id`（2026-11-13 完成，版本 11）
       - 旧版顺序直接丢弃，不做名字→id 迁移，用户重新排一次
       - `hidden` / `card_styles` / `speaker_command_did` 等按 did 存的数据照常保留
