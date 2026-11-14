@@ -126,6 +126,9 @@ def dialog_qss(p: theme.Palette) -> str:
        QSS 规则会跟着重算，不必逐个控件刷一遍（那样漏一个就留着上个主题的色）。 */
     QLabel#PageTitle {{ color: {p.text}; font-size: 20px; font-weight: 700; }}
     QLabel#PageHint {{ color: {p.text_mute}; font-size: 12px; }}
+    /* 关于页的说明段落：这段是"维护立场"，比一般提示更该看清，
+       所以用 text_soft（浅色下 text_mute 对白底只有 2.54:1，不够正文可读性） */
+    QLabel#AboutNote {{ color: {p.text_soft}; font-size: 12px; }}
     QLabel#SectionTitle {{ color: {p.text}; font-size: 14px; font-weight: 600; }}
     QLabel#RowTitle {{ color: {p.text}; font-size: 13px; }}
     QLabel#RowSub {{ color: {p.text_mute}; font-size: 11px; }}
@@ -916,9 +919,22 @@ class SettingsDialog(QDialog):
         lab.setTextInteractionFlags(Qt.TextSelectableByMouse)
         return lab
 
+    @staticmethod
+    def _about_note(text: str) -> QLabel:
+        """关于页的说明段落：可选中复制、自动换行。
+
+        用 ``AboutNote``（``text_soft``）而不是 ``PageHint``（``text_mute``）：
+        维护立场这段是要让人认真读的，浅色下 mute 对白底只有 2.54:1。
+        """
+        lab = QLabel(text)
+        lab.setObjectName("AboutNote")
+        lab.setWordWrap(True)
+        lab.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        return lab
+
     def _build_about(self) -> QWidget:
         page, col = self._page()
-        self._page_head(col, "关于", "版本、许可与第三方组件；遇到问题欢迎到 GitHub 反馈。")
+        self._page_head(col, "关于", "版本、许可与第三方组件；个人项目，按需维护。")
 
         self._section(col, "程序")
         card = SettingsCard()
@@ -926,10 +942,23 @@ class SettingsDialog(QDialog):
             f"米家控制台（MiHomePanel） v{__version__}", soft=False))
         card.add_row("许可", self._about_text("GPL-3.0-or-later"),
                      sub="完整条款见程序目录的 LICENSE")
-        card.add_row("源码与反馈", self._about_text(
-            "源码：https://github.com/scnf-8848/MiHomePanel\n"
-            "反馈：https://github.com/scnf-8848/MiHomePanel/issues"))
         col.addWidget(card)
+
+        # 维护立场：这里写清楚"不保证持续更新 + 设备适配没法代劳"，
+        # 免得别人把它当成长期有人维护的项目来提需求（用户 11-15 定）。
+        # 源码 / 反馈地址写在说明段里而不是卡片行里：卡片的值列很窄，长 URL 会被
+        # 折成三四行、还右对齐，读起来像乱码；说明段是整行宽度，折一次就够。
+        col.addSpacing(8)
+        self._section(col, "维护与反馈")
+        col.addWidget(self._about_note(
+            "这是个人自用的项目，不承诺持续更新，也可能在满足个人需求之后停止维护。\n"
+            "设备适配是按我手上有的型号逐台做的：你的设备没适配、或适配不正常时，"
+            "我这边没有那台设备，就无法为你调试和验证。需要调整的话，建议下载源码自己改"
+            "（GPL-3.0-or-later 允许修改与再分发，不必事先征求同意），或交给你的 AI 助手"
+            "按你的设备改。\n"
+            "源码：https://github.com/scnf-8848/MiHomePanel\n"
+            "严重问题（凭据泄露、数据丢失、程序无法启动、影响系统安全）欢迎到 "
+            "https://github.com/scnf-8848/MiHomePanel/issues 反馈。"))
 
         col.addSpacing(8)
         self._section(col, "第三方组件")
@@ -945,15 +974,10 @@ class SettingsDialog(QDialog):
 
         col.addSpacing(8)
         self._section(col, "致谢")
-        note = QLabel(
+        col.addWidget(self._about_note(
             "感谢 AlexxIT/go2rtc、Do1e/mijia-api、Google Material Icons"
             "（Apache-2.0），以及 Reign9201/mihome-mac、Songmanual/MijiaDeck"
-            " 等项目的公开资料。"
-        )
-        note.setObjectName("PageHint")
-        note.setWordWrap(True)
-        note.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        col.addWidget(note)
+            " 等项目的公开资料。"))
         col.addStretch(1)
         return page
 
