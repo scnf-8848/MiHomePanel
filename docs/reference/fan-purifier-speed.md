@@ -4,7 +4,7 @@
 > **没发任何写请求、没跑动作**；浴霸（奥普 Smart 浴霸 S2-Air）在另一个共享家庭，
 > 按测试纪律没碰，所以本文关于浴霸只有"未测"两个字。
 >
-> 关联待办：`TODO.md` →「风扇卡片样式（2×1 / 2×2）」。
+> 关联待办：`docs/archive/todo-2026-11-15-full.md` →「风扇卡片样式（2×1 / 2×2）」（已落地）。
 > 起因：`openmexia-notes.md` 第 7 节讨论"他们的风扇卡能不能抄"，当时缺一条真机数据：
 > 风速到底是枚举还是区间。
 
@@ -91,7 +91,7 @@
   但不需要一个新控件分发两种子控件的信号。
 - 型号规则落 `core/adapters/dmaker.py` 的 `speed_by_mode`；没有这条规则的设备
   退"档位优先"，不猜、也不藏。
-- 验证 `scripts/verify_fan_card.py`；开发侧说明见 `docs/DEVELOPMENT.md`
+- 验证 `scripts/verify_fan_card.py`；开发侧说明见 `docs/dev/ui.md`
   「风扇卡片：两列四格」。
 
 ## 5. 所以"能不能在 body 里做"——能，已经做了

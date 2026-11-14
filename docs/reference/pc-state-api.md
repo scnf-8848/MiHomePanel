@@ -6,7 +6,7 @@
 > 探针 `scripts/probe_pc_state.py`（纯标准库 ctypes、只读、不装依赖、不发米家请求）。
 > 索引状态 = **已落地**（2026-11-13 电脑自动化 v1 开工，6 类零依赖条件、
 > 三层防重、冷静期均已实现）。本文仍是能力边界与契约依据；实现取舍见
-> `docs/DEVELOPMENT.md`「电脑自动化：四层窗口（2026-11-13 落地）」。
+> `docs/dev/automation.md`「电脑自动化：四层窗口（2026-11-13 落地）」。
 >
 > **一句话结论**：进程 / 前台窗口 / 空闲 / 锁屏 / 电源这些**纯 Windows API 就能读，不用装
 > 任何东西**；「整机墙上功率」确实拿不到，但 **CPU 封装功率能读**（本机实测 17 W，
@@ -70,21 +70,29 @@ scene_action.actions[]             ↔ ③ 动作，数组顺序即执行顺序
   `siid 4 / aiid 1 / in:["事件名"]`，`code 0` 只代表云端收下。规则里存事件名，
   中枢 did 按 `core/geek.py` 的思路「程序自己问出来」，不写死型号 / iid；
   落地时 `siid/aiid` 也是按 action 名 `emit-virtual-event` 从规格动态查的。
-- 示意结构（**2026-11-13 已落地**；形态即下面三段，v1 契约索引见
+- 当前结构（**schema 3**，以 `core/automation/rules.py` 为准；v1 契约索引见
   `automation-hotkeys-and-ui.md` 6.1，明确不做清单见 6.2）。
-  **下图是拍板时的契约示意，实际 `rules.json` 字段名以 `core/automation/rules.py` 为准**：
-  `keys` / `condition_mode` / `conditions` / `cooldown_ms` 都摊平在顶层，
-  没有 `trigger` / `condition` 这层嵌套，且每条规则多一个 `id`：
+  **2026-11-14 动作重构后，旧的 `virtual_event` / `speaker` 两种动作已删除**：
+  发虚拟事件只是设备动作的一个功能名（`emit-virtual-event`），动作统一是
+  `device_action` / `delay`：
   ```jsonc
   {
-    "name": "示例", "enabled": true,
-    "trigger": {"type": "hotkey", "keys": "Ctrl+Alt+F7"},
-    "cooldown_ms": 1000,                          // 0=关闭；挂在规则上，见 1.4
-    "condition": {"mode": "all", "items": []},   // all=全部 / any=任一；空数组=无条件
-    "actions": [
-      {"type": "virtual_event", "name": "极客版按键自动化执行"},
-      {"type": "delay", "ms": 2000},
-      {"type": "virtual_event", "name": "另一个事件"}
+    "version": 3,
+    "rules": [
+      {
+        "id": "…", "name": "示例", "enabled": true,
+        "triggers": [{"type": "hotkey", "keys": "Ctrl+Alt+F7"}],
+        "cooldown_ms": 1000,                 // 0=关闭；挂在规则上，见 1.4
+        "condition_mode": "all",             // all=全部 / any=任一
+        "conditions": [],                    // 空数组=无条件
+        "actions": [
+          {"type": "device_action", "did": "…", "device": "客厅中枢",
+           "action": "emit-virtual-event", "args": {"virtual-param": "极客版按键自动化执行"}},
+          {"type": "delay", "ms": 2000},
+          {"type": "device_action", "did": "…", "device": "客厅中枢",
+           "action": "emit-virtual-event", "args": {"virtual-param": "另一个事件"}}
+        ]
+      }
     ]
   }
   ```
@@ -267,7 +275,7 @@ Windows 11 内核直接把 RAPL 计数器通过 EMI 暴露出来（Win10 一般�
 
 ### 4.3 与 11-10 旧草案的冲突，以本页为准
 
-`TODO.md`「核心特性：把电脑接进全屋智能」里 2026-11-10 的草案写了很多第一版**不做**的
+`docs/archive/todo-2026-11-15-full.md`「核心特性：把电脑接进全屋智能」里 2026-11-10 的草案写了很多第一版**不做**的
 东西（进程/窗口/系统状态触发、锁屏/静音/启动程序等电脑侧动作、二级表达式）。
 那些是当时的设想，**11-13 用户已把第一版收窄为**：触发只有热键、动作只有
 发虚拟事件 + 延迟（11-13 夜补发音箱指令、11-14 补否则分支）、条件**做电脑条件但不做
@@ -287,7 +295,7 @@ Windows 11 内核直接把 RAPL 计数器通过 EMI 暴露出来（Win10 一般�
 - [ ] 锁屏的**实时事件**通知（`WTSRegisterSessionNotification`）未实测，本页只验了
       主动查询输入桌面；将来做「锁屏时触发」才需要它
 - [ ] 音量 / 静音的 COM 实现（`IAudioEndpointVolume`）与 GPU 占用未测——v1 不需要
-- [x] ~~「否则就执行」v1 已定不做~~ → **11-14 已补做**，见 1.2 与 `TODO.md`「待排期」
+- [x] ~~「否则就执行」v1 已定不做~~ → **11-14 已补做**，见 1.2 与 `docs/dev/automation.md`
 - [ ] 若日后重新启用 CPU 功率条件：瞬时 1 秒抖动大，可能要 5~10 秒滑动平均
 
 ## 6. 资料

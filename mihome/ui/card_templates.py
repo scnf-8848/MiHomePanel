@@ -724,7 +724,7 @@ class CardBody(QWidget):
         选型的全部知识（声明优先、枚举默认分段、放不下退步进器、range 默认步进器）
         都在 ``card_controls.make_control``。这里原先自己写了一遍，``FanBody`` 又写
         一遍，两份已经开始漂（一处改了 MAX_CHIPS，另一处没动）——见
-        ``docs/DEVELOPMENT.md``「卡片控件库」。
+        ``docs/dev/ui.md``「卡片控件库」。
         """
         return make_control(
             ctl, self._palette, self._accent,

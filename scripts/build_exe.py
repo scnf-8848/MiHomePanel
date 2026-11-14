@@ -296,7 +296,7 @@ def stage_go2rtc(app_dir: Path, go2rtc: Path) -> Path:
 #:
 #: 这一节最容易退化成迷信式清理：删错了不会在开发机上暴露，只在别人机器上白屏或
 #: 启动就崩，而且极难远程定位。所以删除依据统一是「读 PE 导入表，确认没有任何别的
-#: .dll / .pyd 引用它」，不是「看起来没用」。核对方法见 docs/DEVELOPMENT.md「体积」。
+#: .dll / .pyd 引用它」，不是「看起来没用」。核对方法见 docs/dev/packaging-release.md「体积」。
 _TRIM: tuple[tuple[tuple[str, ...], str], ...] = (
     (
         (
@@ -604,7 +604,7 @@ def main() -> int:
         log("\n跳过自检（--skip-check）。发布前请手动跑一次 --self-check。")
         return 0
     if not run_self_check(app_dir):
-        log("\n打包完成但自检未通过，先别发。常见原因见 docs/DEVELOPMENT.md「打包成 exe 的实现」。")
+        log("\n打包完成但自检未通过，先别发。常见原因见 docs/dev/packaging-release.md「打包成 exe 的实现」。")
         if not args.no_slim:
             log("如果加裁剪之前是好的，先用 --no-slim 重打一份对比——可能是清单删过头了。")
         return 1

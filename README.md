@@ -81,14 +81,14 @@ python -m venv .venv
 依赖只有 `requirements.txt` 里的四个包（mijiaAPI、PySide6、qrcode、pillow），版本与用途见
 [DEVELOPMENT.md](docs/DEVELOPMENT.md)。源码运行默认不自带取流组件；需要摄像头画面时运行
 `.venv\Scripts\python.exe scripts\install_go2rtc.py --patched`（打包版已自带，可跳过）。
-打包 exe、自检和真机探针见 DEVELOPMENT 的「打包成 exe」与「摄像头」章节。
+打包 exe、自检和真机探针见[打包与发布](docs/dev/packaging-release.md)与[摄像头画面](docs/dev/camera.md)。
 
 ## 数据与隐私
 
 程序数据都在 `%LOCALAPPDATA%\MiHomePanel\`（设置、设备缓存、日志、可选取流组件），
 登录凭据单独放在 `C:\Users\<用户名>\.config\mijia-api\auth.json`。两者都只在本机，
 不上传；删除 `prefs.json` 只会恢复界面默认，不影响登录和设备缓存。
-具体目录结构与各文件用途见 [DEVELOPMENT.md](docs/DEVELOPMENT.md)。
+具体目录结构与各文件用途见 [架构与基础](docs/dev/architecture.md#目录结构)。
 
 ## 摄像头
 
@@ -96,7 +96,8 @@ python -m venv .venv
 首帧约 **2–3 秒**（官方构建约 5 秒），云台方向盘可用。支持实时画面、声音开关和独立窗口。
 
 画质切换、SD 卡回放、云存储录像不在计划内；多路同屏暂未验证。源码运行需要单独安装取流组件，
-中继/通道策略、并发与暂停行为、解码与诊断日志等细节见 DEVELOPMENT 的摄像头章节。
+中继/通道策略、并发与暂停行为、解码与诊断日志等细节见
+[摄像头画面](docs/dev/camera.md)。
 
 ## 已知限制
 
@@ -108,7 +109,9 @@ python -m venv .venv
 - 局域网直连明确不做。
 - 摄像头只做实时画面、声音和云台方向；画质切换、回放、云存储不做，多路同屏暂未验证。
 
-完整的待办、理由和边界见 [TODO.md](TODO.md)；实现细节见 [DEVELOPMENT.md](docs/DEVELOPMENT.md)。
+完整的待办、理由和边界见 [TODO.md](TODO.md)，完成记录见
+[历史快照](docs/archive/todo-2026-11-15-full.md)；实现细节从
+[DEVELOPMENT.md](docs/DEVELOPMENT.md) 进。
 
 ## 开发文档
 
@@ -125,8 +128,9 @@ docs            UI 规范与开发文档
 直接 import PySide6，属于 **Qt 适配层**；其余 core 模块仍保持无 Qt 依赖。
 
 架构、数据来源、适配层与枚举文案的设计、UI 约束、摄像头实现细节、打包裁剪依据，
-以及一长串实测踩过的坑，都在 **[docs/DEVELOPMENT.md](docs/DEVELOPMENT.md)**。
-改代码前建议先看那份文档的「交互约定」与「踩坑清单」两节。
+以及一长串实测踩过的坑，都从 **[docs/DEVELOPMENT.md](docs/DEVELOPMENT.md)** 进。
+改代码前建议先看[交互约定：滚轮只滚页面](docs/dev/ui.md#交互约定滚轮只滚页面)
+与[踩坑清单](docs/dev/architecture.md#踩坑清单)。
 
 想知道"某个功能技术上到底能不能做"（云端有没有这条接口、要不要抓包、局域网行不行），
 先看 **[docs/reference/README.md](docs/reference/README.md)**——那是已经调研过的结论索引，
@@ -149,7 +153,7 @@ docs            UI 规范与开发文档
 | 项目 | 许可证 | 具体贡献 | 状态 |
 |---|---|---|---|
 | [Do1e/mijia-api](https://github.com/Do1e/mijia-api)（PyPI `mijiaAPI`） | GPL-3.0-or-later | 云端传输层：扫码登录、`gen_nonce` / RC4 签名与加解密、`serviceToken` 刷新、`/miotspec/*` 封装；`core/api.py` 和 `scripts/probe_geek_passcode.py` 直接调用。**它决定了本项目也必须是 GPL-3.0** | `已依赖` |
-| [huanyuejue/MiHome-Windows](https://github.com/huanyuejue/MiHome-Windows) | GPL-3.0 | 起点参考项目：沿用单线程串行队列、子线程不直接回调 UI、乐观 UI + 版本号这三个判断，以及 16ms / 3s / 5min 定时器的分工。界面层完全重写，差异见[开发文档](docs/DEVELOPMENT.md#与参考项目的关系)。TODO 里的小爱文字指令、定时开关、托盘、桌面挂件也以它的功能清单为参照 | `已沿用` |
+| [huanyuejue/MiHome-Windows](https://github.com/huanyuejue/MiHome-Windows) | GPL-3.0 | 起点参考项目：沿用单线程串行队列、子线程不直接回调 UI、乐观 UI + 版本号这三个判断，以及 16ms / 3s / 5min 定时器的分工。界面层完全重写，差异见[开发文档](docs/dev/architecture.md#与参考项目的关系)。TODO 里的小爱文字指令、定时开关、托盘、桌面挂件也以它的功能清单为参照 | `已沿用` |
 | PySide6 / Qt for Python | LGPL-3.0 / GPL-2.0 / GPL-3.0 三选一 | 整个 UI 框架 | `已依赖` |
 | [Material Icons](https://github.com/google/material-design-icons) | Apache-2.0 | 顶栏「刷新」按钮的图标形状：`ui/main_window.py::_refresh_path` 按它的 `refresh` 字形（24×24 视口）逐段抄写坐标后缩放，形状未改 | `已沿用` |
 | `qrcode`（BSD）、`Pillow`（MIT-CMU）、`pycryptodome`（BSD-2-Clause / Unlicense / MIT） | 见 `requirements.txt` 与各发行包 | 二维码渲染、图片处理、X25519（探测 `miss_get_vendor` 时用过，正式引入要显式声明）。经 pip 安装，不随本项目分发 | `已依赖`；X25519 那条是 `仅参考` |
@@ -229,7 +233,7 @@ docs            UI 规范与开发文档
 问题通常只能由你自己解决。更实际的路径是**下载源码自己改**：项目是 GPL-3.0-or-later，
 允许修改与再分发，**不必事先征求同意**；把源码交给你的 AI 助手、按你手上的设备去调，
 通常比等我有设备快得多。适配入口集中在 `mihome/core/adapters/` 与
-`mihome/core/automation/action_catalog.py`，取舍与踩过的坑记在 `docs/DEVELOPMENT.md`。
+`mihome/core/automation/action_catalog.py`，取舍与踩过的坑记在 `docs/dev/automation.md`。
 
 例外是**严重问题**——凭据泄露、数据丢失、程序起不来、影响系统安全这一类，欢迎到
 [Issues](https://github.com/scnf-8848/MiHomePanel/issues) 反馈。

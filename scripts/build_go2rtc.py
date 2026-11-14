@@ -296,7 +296,7 @@ def main() -> int:
     log("\n许可证：go2rtc 为 MIT，源码 https://github.com/AlexxIT/go2rtc")
     log(
         f"本版本附带 {len(PATCHES)} 个改动（{', '.join(p.name for p in PATCHES)}），"
-        "说明见 docs/DEVELOPMENT.md「摄像头画面」。"
+        "说明见 docs/dev/camera.md「摄像头画面」。"
     )
     return 0
 

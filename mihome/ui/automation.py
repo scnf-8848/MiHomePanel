@@ -24,7 +24,7 @@
 * 按键录制态下按 Esc / 点遮罩 **只取消录制**，不能把整个页面关掉、丢未保存编辑；
 * 关窗后主窗口**不补** ``_apply_theme()``（11-12 关窗闪烁的根因）。
 
-实现取舍与踩坑见 ``docs/DEVELOPMENT.md``「电脑自动化：四层窗口」。
+实现取舍与踩坑见 ``docs/dev/automation.md``「电脑自动化：四层窗口」。
 """
 
 from __future__ import annotations

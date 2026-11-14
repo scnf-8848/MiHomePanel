@@ -11,7 +11,7 @@
 统一提到 ``text_soft``(#6B7280, 4.83:1)。**不改 ``dialog_qss`` 本身**，避免
 波及设置页。
 
-实现取舍见 ``docs/DEVELOPMENT.md``「电脑自动化：四层窗口」。
+实现取舍见 ``docs/dev/automation.md``「电脑自动化：四层窗口」。
 """
 
 from __future__ import annotations

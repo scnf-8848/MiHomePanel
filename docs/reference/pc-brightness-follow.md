@@ -62,10 +62,11 @@
 `Rule.keys` 是触发键，`validate_rule()` 里写死 `快捷键无效` 就报错；`HotkeyRegistry`
 的发信号直接接 `engine.trigger(keys)`。要加"屏幕亮度变化"这种触发源，得：
 
-- `rules.json` 加 `trigger: {type: "hotkey" | "screen_brightness"}`（**schema v2**，
-  旧规则没有这个键就按 `hotkey` 读，和 `Action.unit` 一样的宽容策略）；
-- `keys` 在非热键触发时允许为空 → `validate_rule` 的两条硬要求都要按类型放宽
-  （另一条是"动作里至少要有一条发虚拟事件"，跟随亮度场景里根本没有虚拟事件）；
+- `rules.json` 的 `triggers` 在 schema 3 里已经是数组，加一种
+  `{type: "hotkey" | "screen_brightness"}` 即可；但 `Trigger.from_dict` 会**丢弃未知类型**
+  （只认 `TRIGGER_TYPES`），要同时扩这个集合；
+- `keys` 在非热键触发时允许为空 → `validate_rule` 的硬要求要按类型放宽
+  （现在至少要求一条动作，跟随亮度场景里也可以只有设备动作）；
 - ①触发块 UI 重排：现在是「键盘快捷键」一行 + 折叠的手动选键，要变成"触发方式"下拉；
 - `EnabledKeys` / `rules_for(keys)` 这套按 `keys` 索引的路径要能跳过非热键规则，
   否则同一组合会被非热键规则"占"一份。
@@ -164,8 +165,9 @@ Windows 没有可靠的"屏幕亮度变了"通知（`WM_SETTINGCHANGE`、`GUID_M
 
 1. **先测**：目标机跑 `probe_screen_brightness.py --watch`，三条路至少一条 `[OK]` 且会变；
    或者改做方案 A，跳过这一步。
-2. **schema v2**：`Rule.trigger`（默认 `hotkey`），`validate_rule` 按类型放宽；旧
-   `rules.json` 零变化。这一步单独提交、单独验证（`verify_automation_rules.py`）。
+2. **schema 3 的 `Rule.triggers`**：加 `screen_brightness` 类型并扩 `TRIGGER_TYPES`，
+   `validate_rule` 按类型放宽；旧 `rules.json` 零变化。这一步单独提交、单独验证
+   （`verify_automation_rules.py`）。
 3. **触发源**：`BrightnessWatcher`（QTimer 轮询 + 防抖 + 阈值 + 最小间隔），产出
    `engine.fire(rule, source="屏幕亮度")`；日志写"亮度 82% → 78%"。
 4. **动作**：`follow_brightness`（目标设备 + 偏移 + 上下限），内部读 → 映射 → clamp → 写；

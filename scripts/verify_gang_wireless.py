@@ -2,7 +2,7 @@
 
     .venv/Scripts/python.exe -X utf8 scripts/verify_gang_wireless.py
 
-背景（`docs/DEVELOPMENT.md`「多键面板：转无线」）：米家设置里可以把某一路设成
+背景（`docs/dev/ui.md`「多键面板：转无线」）：米家设置里可以把某一路设成
 "转无线"——继电器常通（给智能灯一直供电），物理按键不再切换。规格里表现为
 ``switch`` 服务的 ``mode`` 属性（0 有线 / 1 仅无线），**逐路独立**：实测一块
 三开单控只有左键是 1。这一路如果还能在面板上点，轻则点了没反应，重则把给灯

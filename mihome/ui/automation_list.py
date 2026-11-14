@@ -20,7 +20,7 @@
 刷新时机有个坑：``RuleSet.set_enabled()`` 会同步触发 ``rules_changed``，而它是从
 ``ToggleSwitch.toggled`` 的信号栈里发出来的。若当场销毁重建卡片，等于在发信号的对象
 还活着时把它删掉。所以开关只改自己那张卡的描边，整表重建一律用成员 ``QTimer``
-排到下一轮事件循环（``docs/DEVELOPMENT.md``「电脑自动化：四层窗口」）。
+排到下一轮事件循环（``docs/dev/automation.md``「电脑自动化：四层窗口」）。
 """
 
 from __future__ import annotations

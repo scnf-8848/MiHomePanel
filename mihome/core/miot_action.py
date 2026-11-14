@@ -8,10 +8,10 @@
 同样 1 vs 3；``execute-text-directive`` 是 5 vs 4。所以一条 iid 都不许写死，只能按
 action 的**名字**在 ``DeviceSpec`` 里查。
 
-``core/speaker.py``（音箱三条动作）、``core/automation/sender.py``（中枢虚拟事件）
-和自动化编辑页的「设备动作」都需要这件事，从前各写一份，现在收敛到这里。
+``core/speaker.py``（音箱三条动作）、中枢虚拟事件发送和自动化编辑页的「设备动作」
+都需要这件事，从前各写一份，现在收敛到这里。
 
-三条踩过的细节（前两条在 ``docs/DEVELOPMENT.md``「小爱音箱的文字指令」一节）：
+三条踩过的细节（前两条在 ``docs/dev/architecture.md``「小爱音箱的文字指令」一节）：
 
 1. ``text-content`` / ``silent-execution`` / ``virtual-param`` 这些入参**只作为 action
    的 ``in`` 存在**，``access`` 是空数组，不是可读可写属性 → 能力探测不能走

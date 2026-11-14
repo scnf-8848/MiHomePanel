@@ -116,7 +116,7 @@ def _fetch_release() -> dict:
         if exc.code == 404:
             raise InstallError(
                 f"补丁版 Release {PATCHED_TAG} 不存在（404）。"
-                "需要先在能发布的机器上按 docs/DEVELOPMENT.md「补丁版 Release」建这个 tag。"
+                "需要先在能发布的机器上按 docs/dev/camera.md「开播补丁」建这个 tag。"
             ) from exc
         if exc.code == 403:
             raise InstallError(

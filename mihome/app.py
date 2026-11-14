@@ -85,7 +85,7 @@ def self_check() -> int:
             )
             say(f"       本地补丁：{line.split('=', 1)[1] if line else '（BUILD.txt 里没写）'}")
         else:
-            say("       本地补丁：没有 → 首帧会是 4.8–6.3 秒、云台不可用（见 docs/DEVELOPMENT.md「开播补丁」）")
+            say("       本地补丁：没有 → 首帧会是 4.8–6.3 秒、云台不可用（见 docs/dev/camera.md「开播补丁」）")
 
     app = QCoreApplication.instance() or QCoreApplication([])
     try:

@@ -223,7 +223,7 @@ class FanBody(QWidget):
         # 于是风扇卡上**每一个**控件都只改自己的视觉、一个写请求也没发出去：
         # 点模式 UI 切过去了、设备不动，拖风速同理（2026-11-12 用户报）。
         # 详情页没事，因为那边是 ``ControlRow`` 自己接信号再写 store，另一条路。
-        # 教训写进 ``docs/DEVELOPMENT.md``「卡片控件库」：**零件能单测不等于
+        # 教训写进 ``docs/dev/ui.md``「卡片控件库」：**零件能单测不等于
         # 接好了**，验证脚本必须从 body 的 ``value_committed`` 这头断言。
         if isinstance(widget, CardSlider):
             widget.previewed.connect(self.previewed)

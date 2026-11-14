@@ -6,7 +6,7 @@
 > **2026-11-13 01:37 补**：用户拍板「规则编辑器用三段式」「不做宏、不做键鼠录制」，
 > 至此 **v1 全部拍板完成**，见第 5 节；第 6 节是动手前的唯一契约索引。
 > 索引状态 = **已落地**（2026-11-13 用户「开工」，v1 已实现）。本文仍作为契约与
-> 「明确不做清单」保留；实现取舍与踩坑见 `docs/DEVELOPMENT.md`
+> 「明确不做清单」保留；实现取舍与踩坑见 `docs/dev/automation.md`
 > 「电脑自动化：四层窗口（2026-11-13 落地）」。
 >
 > **一句话结论**：`RegisterHotKey` 是**会话内排他、先到先得**，不是优先级排队，也不会
@@ -103,13 +103,13 @@ WM_HOTKEY(id) → 查表分发给该组合下所有规则
 | `SettingsCard` / `SettingsRow` / `section_header` | `ui/settings_rows.py` | 「分区标题 + 圆角卡 + 卡内行」，行高 52 |
 
 **入口还没接**：`ui/side_nav.py` 目前只有 `settings_requested`（`:71`），功能区点击在
-`mouseReleaseEvent:311` 直接 `return`。`docs/DEVELOPMENT.md:1193` 明确要求**接页面时
+`mouseReleaseEvent:311` 直接 `return`。`docs/dev/ui.md`「左侧导航底部的功能区」明确要求**接页面时
 在这里发 `zone_requested`，不要先悄悄跳一个空页面**——所以届时要给 `SideNav` 加一个
 带索引 / key 的信号，主窗口接它弹对话框。
 
 ### 3.1 那条「浮窗重绘」待办的影响
 
-`TODO.md` P3 材质的「详情页 / 设置页改为浮窗形态」（圆角 18dp + 大阴影 + 主窗口降暗，
+`docs/archive/todo-2026-11-15-full.md` P3 材质的「详情页 / 设置页改为浮窗形态」（圆角 18dp + 大阴影 + 主窗口降暗，
 透明窗口 + 12px 外边距手绘阴影）改的是**外观**，不是弹窗机制；而且所有弹窗共用
 `WindowFrame` / `DimOverlay`。结论：
 
@@ -179,12 +179,12 @@ B 留到将来真出现「条件分支 / 并行 / 多触发组合」时再评估
 
 | 读什么 | 拿什么 |
 | --- | --- |
-| `TODO.md`「核心特性」**0-A 节** | v1 三段式范围、6 类条件、防重与实现约束 |
+| `docs/archive/todo-2026-11-15-full.md`「核心特性」**0-A 节** | v1 三段式范围、6 类条件、防重与实现约束 |
 | `pc-state-api.md` **§1 / §1.4 / §4.1** | 三段式契约与示意 JSON、三层防重与时间线、条件清单与退化 |
 | `automation-hotkeys-and-ui.md` **§1.2 / §2 / §3.1 / §4** | 注册失败处理、键位存储与内存分发、弹窗 5 条回归、UI 形态 |
 | `mijia-automation-events.md` **§4.2.1** | 发虚拟事件的链路（已端到端验证） |
 
-`TODO.md` 11-10 草案的 **0 / 1 / 3 / 4 / 5 节是二期及以后的设想**。其中仍适用的只有
+历史快照 11-10 草案的 **0 / 1 / 3 / 4 / 5 节是二期及以后的设想**。其中仍适用的只有
 「轮询纪律」（不另起 timer、往 `poll_demand` 登记、**不做频控压测**）和「虚拟事件接口」；
 `when` / `then` 模型、`cooldown_sec: 60`、`hotkeys.json`、本地 HTTP、脚本动作、节点画布
 一律**不要带进 v1**。
@@ -210,7 +210,7 @@ B 留到将来真出现「条件分支 / 并行 / 多触发组合」时再评估
 > 功能白名单四档在 `core/automation/action_catalog.py`（`emit-virtual-event` /
 > `wake-up` / `play-text` / `execute-text-directive`），要放开就往 `FEATURES` 里加一行。
 > 旧的 `virtual_event` / `speaker` 两种动作**不留兼容**，一次性平移脚本
-> `scripts/migrate_actions_v4.py`（不进程序）。细节见 `docs/DEVELOPMENT.md`
+> `scripts/migrate_actions_v4.py`（不进程序）。细节见 `docs/dev/automation.md`
 > 「电脑自动化：四层窗口」的动作段。
 
 ### 6.3 开工顺序（**2026-11-13 已按此顺序执行**）
@@ -221,8 +221,8 @@ B 留到将来真出现「条件分支 / 并行 / 多触发组合」时再评估
 2. `scripts/verify_automation_rules.py`：离线假数据验 schema 与引擎边界
 3. `ui/automation_list.py` 规则列表窗 + `ui/automation.py` 三段式编辑窗
    （**02:49 用户追加要求**：列表窗只列规则 + 启停/编辑/删除，点编辑才叠三段式；
-   用 `exec_with_dim_click` 嵌套，见 `docs/DEVELOPMENT.md`「电脑自动化：四层窗口」），
-   并给 `SideNav` 补 `zone_requested` 接入口（`DEVELOPMENT.md:1193`）。
+   用 `exec_with_dim_click` 嵌套，见 `docs/dev/automation.md`「电脑自动化：四层窗口」），
+   并给 `SideNav` 补 `zone_requested` 接入口（`docs/dev/ui.md`「左侧导航底部的功能区」）。
    **03:17 用户按截图再加两层**：`ui/automation_trash.py` 回收站（软删除还原 /
    彻底删除）、`ui/automation_log.py` 独立触发日志（跨全部规则 + 四类筛选）；
    编辑窗冷静期移入①触发块、去启停、保存即关闭、只留一行结果回显；
@@ -237,7 +237,7 @@ B 留到将来真出现「条件分支 / 并行 / 多触发组合」时再评估
    明确不做 toast 确认提示 / 复制 / 导出 / 跟随最新；冷静期单位仍为毫秒
 6. 真机端到端验一次（随机事件名、不命中任何自动化，**需用户单独授权**）
    —— **第 1–5 步已落地**，发送层只用假 API / 假 `user32` 验过；**第 6 步未做**。
-   落点与验证数字见 `docs/DEVELOPMENT.md`「电脑自动化：四层窗口（2026-11-13 落地）」。
+   落点与验证数字见 `docs/dev/automation.md`「电脑自动化：四层窗口（2026-11-13 落地）」。
    `core/automation/logbook.py` 是筛选的纯逻辑层，`rules.py` 的 `deleted` 标记落盘，
    两者都进了 `verify_automation_rules.py`（**132 项**；UI `verify_automation_ui.py`
    **161 项**、热键 `verify_automation_hotkeys.py` **34 项**，全套 47 脚本零失败）。
@@ -269,7 +269,7 @@ B 留到将来真出现「条件分支 / 并行 / 多触发组合」时再评估
 **落点**：`mihome/core/channel.py`（1 条发送线程 + 4 条读线程 + 结果队列 + 主线程
 16 ms drain）；`engine._step` 改成"提交即下一步、失败不拦后续"；`Feature.refreshes`
 决定要不要跑 1/2.5/4 秒全量回读（只有 `execute-text-directive` 是）。细节见
-`docs/DEVELOPMENT.md`「发送链路」。
+`docs/dev/automation.md`「发送链路：设备动作怎么发」。
 
 ### 7.1 真机第一跳就踩到的坑：请求体必须包 `params`（2026-11-14 21:xx）
 
@@ -335,7 +335,7 @@ B 留到将来真出现「条件分支 / 并行 / 多触发组合」时再评估
 
 **落点**：`core/automation/logstore.py`（`LogStore`）、`engine.restore_log()` /
 `_new_run()`、`AutomationService.logstore` / `log_path` / `clear_log()`、
-`ui/automation_log.py`（状态条 + 「日志文件」按钮）。细节见 `docs/DEVELOPMENT.md`
+`ui/automation_log.py`（状态条 + 「日志文件」按钮）。细节见 `docs/dev/automation.md`
 「独立日志窗」。
 
 ## 9. 待验证 / 资料
@@ -355,4 +355,4 @@ B 留到将来真出现「条件分支 / 并行 / 多触发组合」时再评估
 | Win11 build 26300 热键实测（`F13`–`F24` 单键可用、保留组合清单、钩子先于热键） | https://github.com/Ray-lea/Argus/blob/main/docs/design/hotkey.md |
 | 极客版「拖卡片 + 连线」画布形态与串行 / 并行语义 | https://blog.csdn.net/weixin_28285943/article/details/164416772 |
 | 极客版左侧卡片面板 / 右侧画布的界面描述 | http://mp.weixin.qq.com/s?__biz=MzkzNTU3MTE5OQ==&mid=2247487322&idx=1&sn=12f6c78de4ef2e061ae26ce30e1f587f |
-| 本项目弹窗机制与压暗收尾 | `docs/DEVELOPMENT.md`「左侧导航底部的功能区」「电脑自动化：四层窗口」、`ui/chrome.py`、`ui/main_window.py` |
+| 本项目弹窗机制与压暗收尾 | `docs/dev/ui.md`「左侧导航底部的功能区」「电脑自动化：四层窗口」、`ui/chrome.py`、`ui/main_window.py` |

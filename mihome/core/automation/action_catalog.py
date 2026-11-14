@@ -94,7 +94,7 @@ class ActionDevice:
         return self.name or self.model or self.did
 
 
-#: 白名单。加功能就在这里加一行，并在 ``docs/DEVELOPMENT.md``「设备动作」一节补说明。
+#: 白名单。加功能就在这里加一行，并在 ``docs/dev/automation.md``「设备动作」一节补说明。
 FEATURES: tuple[Feature, ...] = (
     Feature(
         "emit-virtual-event", "发送虚拟事件", "virtual-service",

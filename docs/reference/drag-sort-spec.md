@@ -5,7 +5,7 @@
 >
 > 索引：`docs/reference/README.md`（状态 = **已落地**）。本程序里的落点是
 > `mihome/ui/dnd.py`（拖拽骨架：阈值 / 长按 / 幽灵 / 帧合并）与 `mihome/ui/wall.py`
-> （分区与卡片的落位、`set_drag_placeholder`），见 `docs/DEVELOPMENT.md`「排序与隐藏设备」。
+> （分区与卡片的落位、`set_drag_placeholder`），见 `docs/dev/ui.md`「排序与隐藏设备」。
 
 ---
 
@@ -386,8 +386,8 @@ resolveGrid(x, y, container, source, placeholder, n, perCol):
 
 | 内容 | 位置 |
 |---|---|
-| 通用拖拽骨架（阈值 / 长按 / 幽灵 / 清理 / 帧合并） | [drag.js](../js/drag.js) |
-| 单列用户行排序（中线规则、吞 click） | [app.js](../js/app.js#L87-L172) |
-| 队伍网格排序（最近列 + 最近行、列容量、居中偏移） | [page-team.js](../js/page-team.js#L134-L248) |
-| 槽位拖放 / 交换校验 | [page-team.js](../js/page-team.js#L28-L132) |
-| 幽灵 / 占位块 / 高亮样式 | [styles.css](../styles.css#L570-L608)、[styles.css](../styles.css#L396-L408)、[styles.css](../styles.css#L711-L732) |
+| 通用拖拽骨架（阈值 / 长按 / 幽灵 / 清理 / 帧合并） | `js/drag.js` |
+| 单列用户行排序（中线规则、吞 click） | `js/app.js:87-172` |
+| 队伍网格排序（最近列 + 最近行、列容量、居中偏移） | `js/page-team.js:134-248` |
+| 槽位拖放 / 交换校验 | `js/page-team.js:28-132` |
+| 幽灵 / 占位块 / 高亮样式 | `styles.css:570-608`、`styles.css:396-408`、`styles.css:711-732` |
