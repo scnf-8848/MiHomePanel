@@ -22,6 +22,7 @@ import ctypes
 import os
 import sys
 import tempfile
+import time
 from ctypes import wintypes
 from pathlib import Path
 from types import SimpleNamespace
@@ -35,7 +36,7 @@ os.environ["MIHOME_DATA_DIR"] = str(_TMP / "data")
 from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import QApplication, QWidget  # noqa: E402
 
-from mihome.core.automation import Action, action_catalog  # noqa: E402
+from mihome.core.automation import FIRED, Action, LogEntry, action_catalog  # noqa: E402
 from mihome.core.automation import hotkeys_win as HK  # noqa: E402
 from mihome.core.automation.service import AutomationService  # noqa: E402
 from mihome.core.channel import FAILED, UNCONFIRMED  # noqa: E402
@@ -510,6 +511,47 @@ serial._run(act, done.append)
 check("没注入 worker 时明确报，不静默", done and "没有配置执行通道" in done[0], str(done))
 check("没 worker 就不入队", not worker.jobs)
 serial.close()
+
+print("\n--- 日志落盘：服务重启后还能翻回上次那一串 ---", flush=True)
+log_file = _TMP / "svc-log" / "automation_log.jsonl"
+
+
+def new_service(path: Path) -> AutomationService:
+    svc = AutomationService(store=store_with(hub), client=SerialClient(), worker=FakeWorker(),
+                            window=None, path=path, log_path=log_file, transport="serial")
+    svc.channel.close()      # 用例不走收发器，别留 5 条空转线程
+    return svc
+
+
+svc_a = new_service(_TMP / "svc-log-a.json")
+check("文件还没有时启动，日志是空的", svc_a.engine.log == [] and not log_file.exists())
+check("服务把日志路径暴露给界面", svc_a.log_path == log_file)
+first = LogEntry(time.time(), "r1", "进门播报", "Ctrl+Alt+F7", FIRED, "热键触发",
+                 run="r1@1763000000000-1")
+svc_a._on_log(first)
+check("每条日志当场追进文件", log_file.exists() and "热键触发" in
+      log_file.read_text(encoding="utf-8"))
+svc_a.close()
+
+svc_b = new_service(_TMP / "svc-log-b.json")
+check("重启后把上次的日志读回内存",
+      len(svc_b.engine.log) == 1 and svc_b.engine.log[0].detail == "热键触发",
+      str(svc_b.engine.log))
+check("读回的批次号没变（折叠分组靠它）",
+      svc_b.engine.log[0].run == "r1@1763000000000-1", svc_b.engine.log[0].run)
+
+svc_b.clear_log()
+check("清空日志时内存和文件一起清",
+      svc_b.engine.log == [] and not log_file.exists())
+svc_b.close()
+svc_c = new_service(_TMP / "svc-log-c.json")
+check("清空后再重启不会翻回来", svc_c.engine.log == [], str(svc_c.engine.log))
+svc_c._on_log(LogEntry(time.time(), "r1", "进门播报", "Ctrl+Alt+F7", FIRED, "清空后新的一条",
+                       run="r1@1763000009000-1"))
+check("清空后照常继续记新日志",
+      log_file.exists() and "清空后新的一条" in log_file.read_text(encoding="utf-8"),
+      log_file.read_text(encoding="utf-8") if log_file.exists() else "没写文件")
+svc_c.close()
 
 print(f"\n合计 {N} 项，失败 {len(FAILS)} 项")
 for line in FAILS:

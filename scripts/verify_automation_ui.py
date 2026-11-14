@@ -37,11 +37,11 @@ _TMP = Path(tempfile.mkdtemp(prefix="mihome-auto-ui-"))
 os.environ["MIHOME_DATA_DIR"] = str(_TMP / "data")
 
 from PySide6.QtCore import QObject, QPoint, Qt, Signal  # noqa: E402
-from PySide6.QtGui import QColor  # noqa: E402
+from PySide6.QtGui import QColor, QFontMetrics  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import (  # noqa: E402
-    QApplication, QDialog, QFrame, QLabel, QLineEdit, QListWidget, QPushButton, QStyle,
-    QStyleOptionButton, QTableWidget, QWidget,
+    QApplication, QDialog, QFrame, QHeaderView, QLabel, QLineEdit, QListWidget, QPushButton,
+    QStyle, QStyleOptionButton, QTreeWidget, QWidget,
 )
 
 from mihome.core import speaker as SPK  # noqa: E402
@@ -96,6 +96,7 @@ def sample_devices() -> list[AC.ActionDevice]:
 
 class FakeService(QObject):
     log_added = Signal(object)
+    log_cleared = Signal()
     status_changed = Signal()
     rules_changed = Signal()
 
@@ -104,6 +105,8 @@ class FakeService(QObject):
         self.rules = RuleSet(path)
         self.rules.on_changed = self._on_rules_changed
         self.engine = SimpleNamespace(log=list(entries or []))
+        # 真实服务上是 property，指向 <data>/automation_log.jsonl；日志窗用它显示文件名
+        self.log_path = Path(path).with_name("automation_log.jsonl")
         self.syncs = 0
         # 真实服务上是 property（家庭 id）；这里做成普通属性，方便切家庭
         self.current_home = home
@@ -135,6 +138,11 @@ class FakeService(QObject):
 
     def sync(self) -> None:
         self.syncs += 1
+
+    def clear_log(self) -> None:
+        """真实服务会把文件一起删；这里清内存 + 发 ``log_cleared``（窗口据此重载）。"""
+        self.engine.log.clear()
+        self.log_cleared.emit()
 
 
 def button_with(box, name: str) -> QPushButton | None:
@@ -567,14 +575,35 @@ finally:
 # ---------------------------------------------------------------------------
 print("\n--- 独立日志窗：默认跨全部规则 / 筛选 / 三档色 ---", flush=True)
 logdlg = AG.AutomationLogDialog(service, theme.LIGHT, listing)
+
+
+def lrows(dlg) -> int:
+    """顶层行数（= 触发的次数 + 独立记录条数）。"""
+    return dlg.table.topLevelItemCount()
+
+
+def lcell(dlg, row: int, col: int) -> str:
+    return dlg.table.topLevelItem(row).text(col)
+
+
 check("日志窗是独立窗口", isinstance(logdlg, QDialog))
-check("默认显示所有规则", logdlg.table.rowCount() == 4,
-      str(logdlg.table.rowCount()))
-check("默认最新的在最上面", "冷静期拦截" in logdlg.table.item(0, 4).text())
-check("五列表头", [logdlg.table.horizontalHeaderItem(i).text()
-                 for i in range(5)] == ["时刻", "规则", "快捷键", "结果", "说明"])
+check("默认显示所有规则", lrows(logdlg) == 4, str(lrows(logdlg)))
+check("默认最新的在最上面", "冷静期拦截" in lcell(logdlg, 0, 4))
+check("五列表头", [logdlg.table.headerItem().text(i) for i in range(5)]
+      == ["时刻", "规则", "快捷键", "结果", "说明"])
 check("规则下拉首项是全部规则", logdlg.rule_combo.itemData(0) == "")
-check("状态条说明日志只在内存", "只保存在内存" in logdlg.status.text())
+check("状态条报条数与本页行数",
+      "共" in logdlg.status.text() and "本页" in logdlg.status.text(),
+      logdlg.status.text())
+check("落盘信息在状态条 tooltip 里（文案留给数字，不为它挤掉按钮）",
+      "automation_log.jsonl" in logdlg.status.toolTip()
+      and "重启后" in logdlg.status.toolTip(), logdlg.status.toolTip())
+check("只有一页时翻页控件整组隐藏（不占位置）",
+      logdlg.prev_page.isHidden() and logdlg.page_label.isHidden()
+      and logdlg.next_page.isHidden())
+check("有「日志文件」按钮且提示里带完整路径",
+      not logdlg.reveal.isHidden()
+      and "automation_log.jsonl" in logdlg.reveal.toolTip(), logdlg.reveal.toolTip())
 check("日志窗不画三段式", not any(
     "①" in w.text() or "②" in w.text() or "③" in w.text()
     for w in logdlg.findChildren(QLabel)))
@@ -585,13 +614,17 @@ check("日志表格竖向滚动条常驻占位（列宽不随条的出现而跳�
       logdlg.table.verticalScrollBarPolicy() == Qt.ScrollBarAlwaysOn)
 check("日志表格横向条仍保留（列多时要能滚）",
       logdlg.table.horizontalScrollBarPolicy() == Qt.ScrollBarAsNeeded)
-check("表格滚动条也带 idle 属性（能滚时不隐藏滑块）",
-      logdlg.table.verticalScrollBar().property("idle") is False,
-      repr(logdlg.table.verticalScrollBar().property("idle")))
+# idle 是"现在能不能滚"，由 rangeChanged 维护；这里断言它**跟着实际范围变**，
+# 而不是写死某个值——窗口还没 show 时高度是 0，能滚与否取决于布局是否已跑过
+# （11-14 加 ensurePolished 后这条从"能滚"翻成了"不用滚"）。
+_lbar = logdlg.table.verticalScrollBar()
+check("表格滚动条也带 idle 属性（且与能否滚动一致）",
+      _lbar.property("idle") is (_lbar.maximum() <= _lbar.minimum()),
+      f"idle={_lbar.property('idle')} range={_lbar.minimum()}..{_lbar.maximum()}")
 
-tone_colors = {logdlg.table.item(i, 3).text():
-               logdlg.table.item(i, 3).foreground().color().name()
-               for i in range(logdlg.table.rowCount())}
+tone_colors = {lcell(logdlg, i, 3):
+               logdlg.table.topLevelItem(i).foreground(3).color().name()
+               for i in range(lrows(logdlg))}
 check("结果列三档颜色互不相同", len(set(tone_colors.values())) == 3,
       str(tone_colors))
 check("冷静期拦截不是「失败」那个红",
@@ -599,28 +632,27 @@ check("冷静期拦截不是「失败」那个红",
 check("成功与失败颜色不同", tone_colors["触发"] != tone_colors["失败"])
 
 logdlg.search.setText("失败")
-check("关键字搜索命中说明", logdlg.table.rowCount() == 1
-      and "云端超时" in logdlg.table.item(0, 4).text())
+check("关键字搜索命中说明", lrows(logdlg) == 1
+      and "云端超时" in lcell(logdlg, 0, 4))
 check("筛选后 chip 出现", not logdlg.filter_chip.isHidden())
 logdlg._reset()
-check("重置回到全部", logdlg.table.rowCount() == 4)
+check("重置回到全部", lrows(logdlg) == 4)
 check("重置后 chip 隐藏", logdlg.filter_chip.isHidden())
 i_r2 = combo_index(logdlg.rule_combo, "r2")
 logdlg.rule_combo.setCurrentIndex(i_r2)
-check("按规则筛选", logdlg.table.rowCount() == 1
-      and "离开时关灯" in logdlg.table.item(0, 1).text())
+check("按规则筛选", lrows(logdlg) == 1
+      and "离开时关灯" in lcell(logdlg, 0, 1))
 check("非默认值下拉加了 accent 描边", theme.LIGHT.accent in logdlg.rule_combo.styleSheet())
 logdlg.rule_combo.setCurrentIndex(0)
 check("回到默认后描边撤掉", theme.LIGHT.accent not in logdlg.rule_combo.styleSheet())
 i_failed = combo_index(logdlg.outcome_combo, "failed")
 logdlg.outcome_combo.setCurrentIndex(i_failed)
-check("按结果筛选", logdlg.table.rowCount() == 1
-      and "失败" in logdlg.table.item(0, 3).text())
+check("按结果筛选", lrows(logdlg) == 1
+      and "失败" in lcell(logdlg, 0, 3))
 logdlg.outcome_combo.setCurrentIndex(0)
 i_5m = combo_index(logdlg.range_combo, 300)
 logdlg.range_combo.setCurrentIndex(i_5m)
-check("按时间范围筛选（最近 5 分钟）", logdlg.table.rowCount() == 3,
-      str(logdlg.table.rowCount()))
+check("按时间范围筛选（最近 5 分钟）", lrows(logdlg) == 3, str(lrows(logdlg)))
 check("时间范围也算筛选", not logdlg.filter_chip.isHidden())
 logdlg.range_combo.setCurrentIndex(0)
 logdlg.search.setText("不存在的词")
@@ -630,14 +662,302 @@ check("空态恢复后表格回来", not logdlg.table.isHidden() and logdlg.empt
 
 new_entry = LogEntry(time.time(), "r1", "进门播报", "Ctrl+Alt+F7", "fired", "实时新增一条")
 service.engine.log.append(new_entry)
-logdlg.table.selectRow(1)
-selected_before = logdlg.table.item(1, 4).text()
+logdlg.table.setCurrentItem(logdlg.table.topLevelItem(1))
+selected_before = lcell(logdlg, 1, 4)
 service.log_added.emit(new_entry)
-check("新日志走增量插入", logdlg.table.rowCount() == 5
-      and "实时新增一条" in logdlg.table.item(0, 4).text())
-check("增量插入保留选中内容", logdlg.table.item(2, 4).text() == selected_before)
-check("单元格 tooltip 有全文", "进门播报" in logdlg.table.item(0, 0).toolTip())
-check("日志窗里有 QTableWidget", bool(logdlg.findChildren(QTableWidget)))
+check("新日志走增量插入", lrows(logdlg) == 5
+      and "实时新增一条" in lcell(logdlg, 0, 4))
+check("增量插入保留选中内容", lcell(logdlg, 2, 4) == selected_before)
+check("单元格 tooltip 有全文", "进门播报" in logdlg.table.topLevelItem(0).toolTip(0))
+check("日志窗里有 QTreeWidget（要能折叠）", bool(logdlg.findChildren(QTreeWidget)))
+
+print("\n--- 清空日志：要确认，内存与文件一起清 ---", flush=True)
+check("状态行有「清空」按钮", button_text(logdlg, "清空") is not None)
+_orig_confirm_log = AG.confirm
+try:
+    AG.confirm = lambda *a, **k: False
+    logdlg.clear_btn.click()
+    check("取消时一条都不删", len(service.engine.log) > 0, str(len(service.engine.log)))
+    AG.confirm = lambda *a, **k: True
+    logdlg.clear_btn.click()
+    QApplication.processEvents()
+    check("确认后内存清空", service.engine.log == [], str(service.engine.log))
+    check("清空后表格进空态",
+          logdlg.table.isHidden() and not logdlg.empty.isHidden())
+    check("清空后翻页控件隐藏", logdlg.page_label.isHidden())
+finally:
+    AG.confirm = _orig_confirm_log
+
+# ---------------------------------------------------------------------------
+print("\n--- 日志折叠：一次触发只占一行，动作记录缩进挂在下面 ---", flush=True)
+_t0 = time.time()
+#: 批次号是「规则 id@触发毫秒-序号」，不是从 1 数起的内存计数器（日志要落盘，
+#: 整数计数器重启就归零，昨天的第 3 次会和今天的第 3 次折进同一行）
+_RUN_A = "r1@1763000000000-1"
+grouped = FakeService(_TMP / "log-group.json", [
+    LogEntry(_t0 - 30, "r1", "进门播报", "Ctrl+Alt+F7", "fired", "热键触发", run=_RUN_A),
+    LogEntry(_t0 - 30, "r1", "进门播报", "Ctrl+Alt+F7", "sent", "唤醒 → 「小爱音箱」", run=_RUN_A),
+    LogEntry(_t0 - 30, "r1", "进门播报", "Ctrl+Alt+F7", "failed",
+             "播报文字未成功（「小爱音箱」）：云端超时（回执报错）", run=_RUN_A),
+    LogEntry(_t0 - 30, "r1", "进门播报", "Ctrl+Alt+F7", "done", "动作已发出（共 2 步）", run=_RUN_A),
+    LogEntry(_t0 - 20, "r1", "进门播报", "Ctrl+Alt+F7", "cooldown", "冷静期拦截，剩余 0.6 秒"),
+])
+gdlg = AG.AutomationLogDialog(grouped, theme.LIGHT, listing)
+# 点击 / 悬停要走真事件，窗口必须真的在（离屏平台也算），否则 QTest 的鼠标事件
+# 到不了 viewport，测出来永远是"没展开"
+gdlg.show()
+QApplication.processEvents()
+check("同一次触发的 4 条日志合成一行", lrows(gdlg) == 2, str(lrows(gdlg)))
+check("没有批次号的拦截记录仍是独立一行", "冷静期" in lcell(gdlg, 0, 3))
+top = gdlg.table.topLevelItem(1)
+check("父行是触发那条", "触发" in top.text(3), top.text(3))
+check("父行默认收起", not top.isExpanded())
+check("父行结果列只数动作，不数「执行完毕」", "2 步" in top.text(3), top.text(3))
+check("父行结果列写明几步失败", "1 步失败" in top.text(3), top.text(3))
+check("折叠时也把父行染成失败色",
+      top.foreground(3).color().name() == QColor(theme.DANGER).name(),
+      top.foreground(3).color().name())
+check("子行全挂在父行下（收起也数得到）", top.childCount() == 3, str(top.childCount()))
+
+sub = top.child(0)
+check("子行只留时刻 / 结果 / 说明，不重复规则与快捷键",
+      sub.text(1) == "" and sub.text(2) == "" and sub.text(4), str([sub.text(i) for i in range(5)]))
+check("子行结果列有中文名", sub.text(3) == "发送 / 延迟", sub.text(3))
+
+print("\n--- 展开按钮：自己画的圆角方块，不是系统那枚小三角 ---", flush=True)
+check("表格是自绘分支的 _LogTree", isinstance(gdlg.table, AG._LogTree),
+      type(gdlg.table).__name__)
+check("drawBranches 被接管（不再由 style 画三角）",
+      AG._LogTree.drawBranches is not QTreeWidget.drawBranches)
+check("分支区够宽，按钮点得着", gdlg.table.indentation() >= 20,
+      str(gdlg.table.indentation()))
+chip = gdlg.table.chip_rect(top)
+check("按钮完整落在分支区里（不和时刻列抢位置）",
+      chip.left() >= 0 and chip.right() < AG.INDENT, str(chip))
+check("按钮比默认三角大一圈", chip.width() >= 16 and chip.height() >= 16, str(chip))
+QTest.mouseClick(gdlg.table.viewport(), Qt.LeftButton, Qt.NoModifier, chip.center())
+QApplication.processEvents()
+check("点按钮能展开（点一下只展开一次，不会又被收回去）", top.isExpanded())
+QTest.mouseMove(gdlg.table.viewport(), chip.center())
+QApplication.processEvents()
+check("鼠标在按钮上是手型", gdlg.table.viewport().cursor().shape() == Qt.PointingHandCursor)
+QTest.mouseMove(gdlg.table.viewport(), QPoint(chip.right() + 120, chip.center().y()))
+QApplication.processEvents()
+check("移出按钮恢复箭头", gdlg.table.viewport().cursor().shape() == Qt.ArrowCursor)
+check("展开后能看到动作记录", top.isExpanded() and top.childCount() == 3)
+check("展开状态不记忆（_expanded 那套已删掉）", not hasattr(gdlg, "_expanded"))
+
+print("\n--- 列宽全托管：展开 / 收起 / 换筛选都不挪位 ---", flush=True)
+check("五列全部固定宽度（宽度由代码给，不交给 ResizeToContents / Stretch）",
+      [gdlg.table.header().sectionResizeMode(i) for i in range(5)]
+      == [QHeaderView.Fixed] * 5,
+      str([gdlg.table.header().sectionResizeMode(i) for i in range(5)]))
+# 收起时的列宽（此前刚展开过，先收起来量）
+top.setExpanded(False)
+QApplication.processEvents()
+widths_closed = [gdlg.table.columnWidth(i) for i in range(5)]
+top.setExpanded(True)
+QApplication.processEvents()
+widths_open = [gdlg.table.columnWidth(i) for i in range(5)]
+check("展开前后五列宽度逐列相同", widths_closed == widths_open,
+      f"{widths_closed} / {widths_open}")
+# 子行的「结果」列也有内容（"发送 / 延迟"），父行是"触发 · 1 步"——谁长就按谁算，
+# 否则展开时这列一变宽、右边的「说明」就往右偏（用户 11-14 实测）
+check("「结果」列按父行 / 子行里更宽的那个算",
+      widths_open[3] >= QFontMetrics(gdlg.table.font()).horizontalAdvance("发送 / 延迟") + 2 * 8,
+      str(widths_open[3]))
+# 拿 Qt 自己算的"这一列需要多宽"对一遍（它就是 ResizeToContents 的依据）：
+# 我们钉的宽度必须不小于它，否则展开后一定出现省略号
+_short = [gdlg.table.sizeHintForColumn(i) - gdlg.table.columnWidth(i) for i in range(4)]
+check("四列都不小于 Qt 算出的展开所需宽度",
+      all(d <= 0 for d in _short), f"列宽减所需={_short}")
+# 需求从**子行真实几何**推，别拿公式自己算一遍——第一版就是按"一级缩进"算的，
+# 列宽少了 22px，父行完整、子行被显示成 "11-14 23:0…"（用户 11-14 23:4x 实测发现）
+_child = top.child(0)
+_child_left = gdlg.table.visualItemRect(_child).left()
+_child_text = _child.text(0)
+_fm = QFontMetrics(gdlg.table.font())
+_avail = widths_open[0] - _child_left - 2 * 8      # 减去 QSS ::item 左右各 8px
+check("子行时刻整段放得下（展开后不会被 … 截断）",
+      _avail >= _fm.horizontalAdvance(_child_text),
+      f"列宽{widths_open[0]} 左偏移{_child_left} 可用{_avail} "
+      f"需要{_fm.horizontalAdvance(_child_text)}")
+check("子行比父行多缩进一级（父行自己也占一级，子行是两级）",
+      _child_left == 2 * gdlg.table.indentation(),
+      f"{_child_left} vs {2 * gdlg.table.indentation()}")
+top.setExpanded(False)
+QApplication.processEvents()
+
+# 列宽按**全部历史**算，所以筛掉一半内容也不该让列变窄（否则清筛选时又弹回来）
+gdlg.search.setText("热键触发")
+QApplication.processEvents()
+check("换筛选不改列宽（按全部历史算，不按当前可见行）",
+      [gdlg.table.columnWidth(i) for i in range(5)] == widths_closed,
+      str([gdlg.table.columnWidth(i) for i in range(5)]))
+gdlg._reset()
+QApplication.processEvents()
+check("清筛选后列宽仍然不变",
+      [gdlg.table.columnWidth(i) for i in range(5)] == widths_closed,
+      str([gdlg.table.columnWidth(i) for i in range(5)]))
+
+gdlg.search.setText("播报文字未成功")
+check("筛到某一步时整组还在（父行是定位线索）", lrows(gdlg) == 1, str(lrows(gdlg)))
+check("筛出时子行没被裁掉（展开才知道完整过程）",
+      gdlg.table.topLevelItem(0).childCount() == 3)
+gdlg._reset()
+check("换筛选重载后一律收起（记住的展开态会挂到别的行上）",
+      not gdlg.table.topLevelItem(1).isExpanded())
+
+# 新的子行动态挂到已有父行上，不整表重建（收起状态也照样挂，展开后才看得见）
+service_extra = LogEntry(_t0 - 29, "r1", "进门播报", "Ctrl+Alt+F7", "sent", "延迟 500 ms",
+                         run=_RUN_A)
+grouped.engine.log.append(service_extra)
+grouped.log_added.emit(service_extra)
+check("新到的子行挂进已存在的父行", lrows(gdlg) == 2
+      and gdlg.table.topLevelItem(1).childCount() == 4,
+      f"{lrows(gdlg)} / {(gdlg.table.topLevelItem(1) or top).childCount()}")
+check("父行的步数跟着更新", "3 步" in gdlg.table.topLevelItem(1).text(3),
+      gdlg.table.topLevelItem(1).text(3))
+gdlg.close()
+
+# 增量来了一条**更长**的内容（长规则名 / 长失败原因）：列宽只该长大，不该裁字
+gsvc = FakeService(_TMP / "log-grow.json", [
+    LogEntry(_t0 - 5, "r9", "短名", "F9", "fired", "触发", run="r9@1-1"),
+])
+grow = AG.AutomationLogDialog(gsvc, theme.LIGHT)
+grow.show()
+QApplication.processEvents()
+wide_before = grow.table.columnWidth(1)
+before_all = [grow.table.columnWidth(i) for i in range(5)]
+long_name = "这是一条名字特别特别长的自动化规则，用来把规则列撑开看看会不会裁字"
+long_entry = LogEntry(_t0, "r9", long_name, "F9", "fired", "新触发", run="r9@2-1")
+gsvc.engine.log.append(long_entry)
+gsvc.log_added.emit(long_entry)
+QApplication.processEvents()
+check("新日志更长时规则列跟着变宽",
+      grow.table.columnWidth(1) > wide_before
+      and grow.table.columnWidth(1)
+      >= QFontMetrics(grow.table.font()).horizontalAdvance(long_name) + 2 * 8,
+      f"{wide_before} → {grow.table.columnWidth(1)}")
+check("变宽时其它列不变窄",
+      all(grow.table.columnWidth(i) >= before_all[i] for i in (0, 2, 3)),
+      f"{before_all} → {[grow.table.columnWidth(i) for i in range(5)]}")
+grow.close()
+
+# ---------------------------------------------------------------------------
+print("\n--- 分页：每页独立算列宽，翻页重建 ---", flush=True)
+LONG_RULE = "这条规则的名字特别长，用来验证列宽是【按页】算的而不是全量算的"
+page_entries = [
+    # 时刻**递增**（与 engine.log 同序），最新的是 i=119；表格倒序显示，所以第一页是 119..70
+    LogEntry(_t0 - 300 + i, "r1", LONG_RULE if i == 60 else "规则A", "F3", "cooldown",
+             f"第 {i} 条拦截")
+    for i in range(120)
+]
+psvc = FakeService(_TMP / "log-pages.json", page_entries)
+pdlg = AG.AutomationLogDialog(psvc, theme.LIGHT)
+pdlg.show()
+QApplication.processEvents()
+check("一页 50 行", pdlg.table.topLevelItemCount() == AG.PAGE_ROWS,
+      str(pdlg.table.topLevelItemCount()))
+check("120 行分 3 页", pdlg._pages == 3 and pdlg._page == 0, str(pdlg._pages))
+check("页码文案", pdlg.page_label.text() == "第 1 / 3 页", pdlg.page_label.text())
+check("第一页不能再往前翻，能往后翻",
+      not pdlg.prev_page.isEnabled() and pdlg.next_page.isEnabled())
+check("第一页是最新的 50 条", "第 119 条拦截" in pdlg.table.topLevelItem(0).text(4),
+      pdlg.table.topLevelItem(0).text(4))
+# 表头也算内容：快捷键列内容只有 "F3"，但表头「快捷键」不能被裁
+_fm_page = QFontMetrics(pdlg.table.font())
+check("快捷键列宽够放表头（不是只按 F3 算）",
+      pdlg.table.columnWidth(2) >= _fm_page.horizontalAdvance("快捷键") + 16,
+      f"{pdlg.table.columnWidth(2)} vs {_fm_page.horizontalAdvance('快捷键') + 16}")
+width_page1 = pdlg.table.columnWidth(1)
+
+pdlg.next_page.click()
+QApplication.processEvents()
+check("翻到第二页", pdlg._page == 1 and pdlg.page_label.text() == "第 2 / 3 页",
+      pdlg.page_label.text())
+check("第二页从第 51 条开始", "第 69 条拦截" in pdlg.table.topLevelItem(0).text(4),
+      pdlg.table.topLevelItem(0).text(4))
+check("第二页有了长规则名，规则列变宽",
+      pdlg.table.columnWidth(1) > width_page1, f"{width_page1} → {pdlg.table.columnWidth(1)}")
+check("长规则名在这一页不被裁",
+      pdlg.table.columnWidth(1) >= _fm_page.horizontalAdvance(LONG_RULE) + 2 * 8)
+# 「说明」列以前是 Stretch：前面几列一宽就被压成省略号（用户 11-15 00:2x 报）。
+# 现在按内容给宽度，放不下就横向滚。
+_widest_detail = 0
+for _i in range(pdlg.table.topLevelItemCount()):
+    _it = pdlg.table.topLevelItem(_i)
+    _widest_detail = max(_widest_detail, _fm_page.horizontalAdvance(_it.text(4)))
+    for _j in range(_it.childCount()):
+        _widest_detail = max(_widest_detail, _fm_page.horizontalAdvance(_it.child(_j).text(4)))
+check("说明列按内容给宽度（前面列再宽也不把它截成省略号）",
+      pdlg.table.columnWidth(4) >= _widest_detail + 2 * 8,
+      f"列宽{pdlg.table.columnWidth(4)} 需要{_widest_detail + 16}")
+check("这一页总宽放不下时出现横向滚动条（说明列不再无限被压）",
+      pdlg.table.horizontalScrollBar().maximum() > 0,
+      str(pdlg.table.horizontalScrollBar().maximum()))
+pdlg.prev_page.click()
+QApplication.processEvents()
+check("翻回第一页，列宽跟着这一页收回去",
+      pdlg.table.columnWidth(1) == width_page1,
+      f"{pdlg.table.columnWidth(1)} vs {width_page1}")
+
+pdlg._goto_page(2)
+QApplication.processEvents()
+check("最后一页只有余数 20 行",
+      pdlg.table.topLevelItemCount() == 20 and not pdlg.next_page.isEnabled()
+      and pdlg.prev_page.isEnabled(), str(pdlg.table.topLevelItemCount()))
+
+# 换筛选回到第一页（新结果集从头看起）
+pdlg.search.setText("第 1")
+QApplication.processEvents()
+check("换筛选回到第一页", pdlg._page == 0, str(pdlg._page))
+pdlg._reset()
+
+# 第一页满了以后：新日志进第一页、最后一行被挤到后面（行数不涨）
+header_before = pdlg.table.topLevelItemCount()
+fresh = LogEntry(_t0 + 1, "r1", "规则A", "F3", "cooldown", "刚触发的一条")
+psvc.engine.log.append(fresh)
+psvc.log_added.emit(fresh)
+QApplication.processEvents()
+check("第一页满了：新日志进第一页，本页仍是 50 行",
+      pdlg.table.topLevelItemCount() == header_before == AG.PAGE_ROWS
+      and "刚触发的一条" in pdlg.table.topLevelItem(0).text(4),
+      f"{pdlg.table.topLevelItemCount()} / {pdlg.table.topLevelItem(0).text(4)}")
+check("总行数涨到 121，页数跟着变",
+      pdlg._row_count == 121 and pdlg._pages == 3, f"{pdlg._row_count} / {pdlg._pages}")
+
+# 人在翻旧页时新日志不打断（否则正在看的那页整体挤走一行）
+pdlg._goto_page(1)
+QApplication.processEvents()
+first_on_page2 = pdlg.table.topLevelItem(0).text(4)
+later = LogEntry(_t0 + 2, "r1", "规则A", "F3", "cooldown", "又一条")
+psvc.engine.log.append(later)
+psvc.log_added.emit(later)
+QApplication.processEvents()
+check("翻着旧页时新日志不打断（首行不变）",
+      pdlg.table.topLevelItem(0).text(4) == first_on_page2,
+      f"{first_on_page2} → {pdlg.table.topLevelItem(0).text(4)}")
+pdlg.close()
+
+# 内容不长时「说明」列要撑满窗口（右边不留空白），窗口变宽它跟着长
+fillsvc = FakeService(_TMP / "log-fill.json", [
+    LogEntry(_t0 - 10, "r1", "短名", "F7", "cooldown", "冷静期拦截，剩余 0.6 秒"),
+])
+fdlg = AG.AutomationLogDialog(fillsvc, theme.LIGHT)
+fdlg.resize(1200, 400)
+fdlg.show()
+QApplication.processEvents()
+_narrow_last = fdlg.table.columnWidth(4)
+fdlg.resize(1500, 400)
+QApplication.processEvents()
+check("窗口变宽时说明列撑满（右边不留空白）",
+      fdlg.table.columnWidth(4) > _narrow_last,
+      f"{_narrow_last} → {fdlg.table.columnWidth(4)}")
+check("这种「撑满」不会冒出横向滚动条",
+      fdlg.table.horizontalScrollBar().maximum() == 0,
+      str(fdlg.table.horizontalScrollBar().maximum()))
+fdlg.close()
 
 # 历史为空时不能滚：常驻的那条空轨道要看不见（idle → 滑块透明）
 empty_log = AG.AutomationLogDialog(
@@ -1330,8 +1650,15 @@ check("四窗都拼了 common_qss", all(
                  "automation_trash.py", "automation_log.py")))
 check("日志不做复制 / 导出 / 跟随最新",
       all(word not in log_src for word in ("复制选中", "导出 CSV", "跟随最新")))
-check("日志新条目增量插入", "insertRow(0)" in log_src
-      and "setRowCount" in log_src)
+check("日志新条目走增量插入（不是整表重建）",
+      "insertTopLevelItem(0" in log_src and "addChild(" in log_src
+      and "setRowCount" not in log_src)
+check("日志用树而不是平铺表格（一次触发才占一行）",
+      "class _LogTree(QTreeWidget)" in log_src and "QTableWidget(" not in log_src)
+check("展开按钮由 drawBranches 自绘（不是 style 那枚小三角）",
+      "def drawBranches(" in log_src and "_paint_chip(" in log_src)
+check("展开状态不再按批次记忆（_expanded 整套删掉）",
+      "_expanded" not in log_src and "itemExpanded.connect" not in log_src)
 # 设置页「退出登录」的灰胶囊也要收成圆角矩形（用户 11-13 第二轮）：
 # 20px 圆角在 40px 高的按钮上就是胶囊，和四窗主按钮的 10px 对不上。
 # 同一位置的「扫码登录」（Primary）必须跟着改，否则登录 / 未登录切换时按钮会变形。

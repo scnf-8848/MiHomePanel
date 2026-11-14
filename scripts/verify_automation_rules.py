@@ -33,6 +33,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 _TMP = Path(tempfile.mkdtemp(prefix="mihome-automation-"))
 os.environ["MIHOME_DATA_DIR"] = str(_TMP / "data")
 
+from mihome.core import paths  # noqa: E402
 from mihome.core.automation import (  # noqa: E402
     ACTION_TYPES,
     CONDITION,
@@ -41,6 +42,7 @@ from mihome.core.automation import (  # noqa: E402
     FAILED,
     FAIL_OUTCOMES,
     FIRED,
+    LOG_FILE,
     MAX_SPEAK_CHARS,
     MOD_NOREPEAT,
     NEUTRAL_OUTCOMES,
@@ -55,16 +57,19 @@ from mihome.core.automation import (  # noqa: E402
     AutomationEngine,
     Condition,
     LogEntry,
+    LogStore,
     PcState,
     Rule,
     RuleSet,
     Snapshot,
     Trigger,
     availability,
+    child_columns,
     date_text,
     evaluate_conditions,
     filter_entries,
     full_text,
+    group_entries,
     log_columns,
     matches,
     normalize,
@@ -72,6 +77,8 @@ from mihome.core.automation import (  # noqa: E402
     outcome_tone,
     parse_native,
     reserved_reason,
+    row_columns,
+    row_tone,
     to_native,
     validate_rule,
 )
@@ -888,6 +895,124 @@ check("表格五列且含规则名", len(log_columns(e2)) == 5
 check("全文含时刻 / 规则 / 结果 / 说明",
       all(part in full_text(e3) for part in ("离开关灯", "失败", "云端超时")))
 check("date_text 比 time_text 多日期", len(date_text(e1)) > len(e1.time_text))
+
+# ---------------------------------------------------------------------------
+section("日志折叠：一次触发只占一行，动作记录挂在它下面")
+# ---------------------------------------------------------------------------
+
+#: 批次号是「规则 id@触发毫秒-序号」（日志要落盘，从 1 数起的内存计数器重启就归零，
+#: 昨天的第 3 次会和今天的第 3 次折进同一行）
+_RUN_A = "a@1763000000000-1"
+_RUN_EARLY = "a@1762999900000-1"
+_RUN_LATE = "a@1763000000000-2"
+
+g1 = LogEntry(wall - 30, "a", "进门播报", "Ctrl+K", FIRED, "热键触发", run=_RUN_A)
+g2 = LogEntry(wall - 30, "a", "进门播报", "Ctrl+K", SENT, "唤醒 → 「小爱音箱」", run=_RUN_A)
+g3 = LogEntry(wall - 30, "a", "进门播报", "Ctrl+K", FAILED, "播报文字未成功", run=_RUN_A)
+g4 = LogEntry(wall - 30, "a", "进门播报", "Ctrl+K", DONE, "动作已发出（共 2 步）", run=_RUN_A)
+group = [g1, g2, g3, g4]
+rows = group_entries(group)
+check("同一次触发折成一行", len(rows) == 1 and rows[0].run == _RUN_A, str(len(rows)))
+check("父行是触发那条", rows[0].head is g1)
+check("子项保持执行顺序", [c.outcome for c in rows[0].children] == [SENT, FAILED, DONE])
+check("父行结果列写明几步、几步失败",
+      "2 步" in row_columns(rows[0])[3] and "1 步失败" in row_columns(rows[0])[3],
+      row_columns(rows[0])[3])
+check("步数不含「执行完毕」那条总结", rows[0].steps == 2 and len(rows[0].children) == 3)
+check("有失败时父行按失败色（收起也看得出来）", row_tone(rows[0]) == "bad")
+check("子行不重复规则与快捷键", child_columns(g2)[1:3] == ("", ""))
+check("没有批次号的记录各自成行", len(group_entries([e1, e4])) == 2)
+check("批次号为空的行没有子项", group_entries([e4])[0].steps == 0)
+check("筛某一步时整组都在（父行是定位线索）",
+      len(group_entries(group, outcome=FAILED)) == 1)
+check("筛选不裁掉同组其它步（否则以为那些步没跑）",
+      len(group_entries(group, outcome=FAILED)[0].children) == 3)
+check("关键字命中子行也保留整组", len(group_entries(group, keyword="播报文字未成功")) == 1)
+check("关键字命中父行同样保留", len(group_entries(group, keyword="热键触发")) == 1)
+check("按规则筛不匹配就整组消失", group_entries(group, rule_id="zz") == [])
+check("时间范围按父行算（一串动作不会跨到别的窗口里）",
+      group_entries(group, since=wall - 10) == [])
+check("组之间按父行时间倒序",
+      [r.run for r in group_entries([
+          LogEntry(wall - 100, "a", "A", "F7", FIRED, "早", run=_RUN_EARLY),
+          LogEntry(wall - 100, "a", "A", "F7", SENT, "早-动作", run=_RUN_EARLY),
+          LogEntry(wall - 10, "a", "A", "F7", FIRED, "晚", run=_RUN_LATE),
+      ])] == [_RUN_LATE, _RUN_EARLY])
+check("缺父行时用组内第一条顶上（日志被裁过也不丢后几步）",
+      group_entries([g2, g3])[0].steps == 1)
+
+# 引擎真跑一遍：同一次触发的每条日志都要带同一个批次号
+eng_run, clock_run, sched_run, _ = make_engine(
+    base_rule(actions=[evt("事件A"), evt("事件B")]))
+eng_run.trigger("Ctrl+Alt+F7")
+runs = {e.run for e in eng_run.log}
+first_run = next(iter(runs)) if len(runs) == 1 else ""
+check("引擎给一次触发的每条日志都打上批次号",
+      len(runs) == 1 and "" not in runs, str(runs))
+check("批次号是「规则id@毫秒-序号」，不是内存计数器",
+      first_run.startswith("r1@") and first_run.endswith("-1"), first_run)
+check("批次号里的毫秒与触发那条日志的时刻一致",
+      first_run == f"r1@{int(eng_run.log[0].at * 1000)}-1", first_run)
+check("动作日志和触发行同一批", len(eng_run.log) >= 3
+      and all(e.run == first_run for e in eng_run.log))
+clock_run.advance(2)
+eng_run.trigger("Ctrl+Alt+F7")
+check("下一次触发换新批次号",
+      eng_run.log[-1].run != first_run and eng_run.log[0].run == first_run,
+      str([e.run for e in eng_run.log]))
+eng_run.trigger("Ctrl+Alt+F7")     # 冷静期还没过
+check("冷静期拦截那条不属于任何批次", eng_run.log[-1].outcome == COOLDOWN
+      and eng_run.log[-1].run == "")
+
+# ---------------------------------------------------------------------------
+section("日志落盘：JSONL 追加 / 读回 / 裁剪 / 坏行不拖垮整份")
+# ---------------------------------------------------------------------------
+_store = LogStore(_TMP / "logs" / "automation_log.jsonl", max_entries=4)
+check("日志默认落在 <data>/automation_log.jsonl",
+      LogStore().path.name == LOG_FILE and LogStore().path.parent == paths.data_dir())
+check("文件不存在时读回空表", _store.load() == [])
+
+_w0 = time.time()
+_made = [
+    LogEntry(_w0 + i, "r1", "进门播报", "Ctrl+Alt+F7", FIRED if i == 0 else SENT,
+             f"第 {i} 条", run=f"r1@{int((_w0 + i) * 1000)}-{i}")
+    for i in range(3)
+]
+_made.append(LogEntry(_w0 + 9, "r1", "进门播报", "Ctrl+Alt+F7", COOLDOWN, "冷静期拦截"))
+check("逐条追加都成功", all(_store.append(e) for e in _made))
+check("文件是逐行 JSONL（一行一条）",
+      len([ln for ln in _store.path.read_text(encoding="utf-8").splitlines() if ln]) == 4)
+_back = _store.load()
+check("读回条数一致", len(_back) == 4, str(len(_back)))
+check("读回后字段一个不少",
+      _back[0].rule_id == _made[0].rule_id and _back[0].detail == _made[0].detail
+      and _back[0].run == _made[0].run and _back[0].outcome == _made[0].outcome
+      and abs(_back[0].at - _made[0].at) < 0.001,
+      f"{_back[0]} vs {_made[0]}")
+check("没有批次号的那条读回来仍是空串", _back[-1].run == "" and _back[-1].outcome == COOLDOWN)
+check("时刻保留到毫秒（不会因为序列化丢成整数）",
+      abs(_back[1].at - _made[1].at) < 0.001, str(_back[1].at))
+
+# 坏行：崩溃留下的半行 / 手改坏的 JSON，不能把整份历史报废
+with open(_store.path, "a", encoding="utf-8") as fh:
+    fh.write('{"at": 1.5, "rule_id": "r2"\n')
+    fh.write("这不是 JSON\n")
+    fh.write('{"rule_name": "没有时刻的行"}\n')
+check("坏行被跳过，好行照常读回", len(_store.load()) == 4, str(len(_store.load())))
+
+# 裁剪：攒到 max_entries*2 才重写一次，留住最近的 max_entries 条
+for i in range(6):
+    _store.append(LogEntry(_w0 + 100 + i, "r1", "进门播报", "F7", FIRED, f"新的 {i}"))
+_trimmed = _store.load()
+check("超过两倍上限后裁到 max_entries 条", len(_trimmed) == 4, str(len(_trimmed)))
+check("裁掉的是最早的，留下的是最新的",
+      _trimmed[-1].detail == "新的 5" and all("新的" in e.detail or e.detail == "冷静期拦截"
+                                            for e in _trimmed),
+      str([e.detail for e in _trimmed]))
+
+check("clear 之后文件没了、读回空表", _store.clear() and _store.load() == []
+      and not _store.path.exists())
+check("clear 幂等（文件本来就不存在也算成功）", _store.clear())
 
 print(f"\n合计 {N} 项，失败 {len(FAILS)} 项")
 for line in FAILS:

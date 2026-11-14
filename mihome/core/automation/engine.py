@@ -19,6 +19,10 @@
 
 条件只在触发瞬间求值一次，不另起 timer、不加轮询、不加云端请求。
 
+**日志**：本层只往 ``self.log`` 里追加（上限 ``max_log``），**不碰文件系统**；
+要落盘由外部通过 ``on_log`` 接 :class:`logstore.LogStore`（生产里是
+``AutomationService._on_log``），启动时用 :meth:`AutomationEngine.restore_log` 读回来。
+
 **④ 否则分支**：条件不成立且规则有 ``else_actions`` 时，跑那一串动作并**照常占住**
 冷静期与重入锁——冷静期针对的是"触发动作"，不区分走哪条分支，否则连按会反复执行
 否则队列。没有 ``else_actions`` 时保持原样：记一条"条件不成立"，不算触发被接受。
@@ -29,7 +33,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 
 from .pc_state import PcState, evaluate_conditions
 from .rules import Action, Rule, RuleSet
@@ -58,6 +62,13 @@ class LogEntry:
     keys: str
     outcome: str
     detail: str
+    #: **同一次触发**产生的日志共用一个批次号，形如 ``规则id@触发毫秒-序号``；空串表示
+    #: "不属于任何一次动作执行"——冷静期拦截 / 重入丢弃 / 条件不成立这三类本身就是一条
+    #: 独立记录，没有"内部动作"可展开。日志窗靠它把一串动作折叠到触发那行下面。
+    #:
+    #: **是字符串不是内存计数器**：日志要落盘（见 ``logstore``），整数计数器重启即归零，
+    #: 昨天的第 3 次和今天的第 3 次会折进同一行；带时间戳则跨重启唯一。
+    run: str = ""
 
     @property
     def time_text(self) -> str:
@@ -100,6 +111,7 @@ class AutomationEngine:
         self._last_fired: dict[str, float] = {}
         self._running: set[str] = set()
         self._closed = False
+        self._run_seq = 0
 
     # -- 对外 ------------------------------------------------------------
     @property
@@ -140,7 +152,20 @@ class AutomationEngine:
         self._running.clear()
 
     def clear_log(self) -> None:
+        """清空内存日志。
+
+        **只清内存**：日志已经落盘，单清这一半等于下次启动又全翻回来。要彻底清走
+        ``AutomationService.clear_log()``（它会把 ``logstore`` 的文件一起删）。
+        """
         self.log.clear()
+
+    def restore_log(self, entries: Iterable[LogEntry]) -> None:
+        """启动时把上次落盘的日志读回来（``logstore.load()`` 的结果）。
+
+        **不触发 ``on_log``**：界面还没建，重放一遍回调没有意义；日志窗打开时本来
+        就会读 ``engine.log`` 整表铺一遍。
+        """
+        self.log = list(entries)[-self.max_log:]
 
     # -- 触发 ------------------------------------------------------------
     def _fire(self, rule: Rule, source: str, *, keys: str = "",
@@ -171,25 +196,43 @@ class AutomationEngine:
             # 有 ④：这一趟同样算"触发被接受"。冷静期是**针对触发动作**的，不分走的是
             # 哪条分支——否则连按会反复跑否则队列（一句"还没到点"能刷十遍）。
             self._last_fired[rule.id] = self._now()
-            self._add_log(rule, ELSE, note + "；改走否则动作", keys=keys)
+            at = self._wall_now()
+            run = self._new_run(rule, at)
+            self._add_log(rule, ELSE, note + "；改走否则动作", keys=keys, run=run, at=at)
             self._running.add(rule.id)
-            self._step(rule, else_actions, 0, branch="否则")
+            self._step(rule, else_actions, 0, branch="否则", run=run)
             return True
 
         # **从触发被接受起算**，不是等动作跑完；否则「发事件 → 延迟 5s → 再发」
         # 会在延迟期间被反复重入
         self._last_fired[rule.id] = self._now()
+        at = self._wall_now()
+        run = self._new_run(rule, at)
         self._add_log(rule, FIRED,
                       f"{source}触发" + ("（测试，绕过冷静期）" if bypass_cooldown else ""),
-                      keys=keys)
+                      keys=keys, run=run, at=at)
         actions = tuple(rule.actions)  # 快照：队列跑的时候改规则不影响这一串
         self._running.add(rule.id)
-        self._step(rule, actions, 0)
+        self._step(rule, actions, 0, run=run)
         return True
+
+    def _new_run(self, rule: Rule, at: float) -> str:
+        """领一个批次号：``规则id@触发毫秒-序号``。
+
+        以前是内存里从 1 递增的整数。日志**落盘之后那样就不行了**：重启后新的一轮又
+        从 1 开始，昨天的第 3 次和今天的第 3 次会在文件里折进同一行。改用「规则 + 触发
+        毫秒」——同一条规则不可能在同一毫秒触发两次（冷静期最短 1 秒），跨重启也唯一；
+        而且对着 ``automation_log.jsonl`` 排查时，光看这个号就知道是哪条规则哪一刻。
+
+        末尾的 ``-序号`` 只是给"同一毫秒真的来了两次"（离线验证的假时钟会这样）和
+        跨规则撞键兜底的，不参与任何展示。
+        """
+        self._run_seq += 1
+        return f"{rule.id}@{int(at * 1000)}-{self._run_seq}"
 
     # -- 动作队列 --------------------------------------------------------
     def _step(self, rule: Rule, actions: tuple[Action, ...], index: int,
-              *, branch: str = "") -> None:
+              *, branch: str = "", run: str = "") -> None:
         """**提交即下一步，不等回执**。
 
         动作之间没有依赖关系——米家的自动化也是按顺序执行，不是"前一条成功了才做
@@ -207,24 +250,24 @@ class AutomationEngine:
             return
         if index >= len(actions):
             self._running.discard(rule.id)
-            self._add_log(rule, DONE, f"{branch}动作已发出（共 {len(actions)} 步）")
+            self._add_log(rule, DONE, f"{branch}动作已发出（共 {len(actions)} 步）", run=run)
             return
         act = actions[index]
         if act.type == "delay":
             # 按用户填的那把尺子记：设「30 秒」的人不该在日志里读到 30000 ms。
             # ``unit`` 只影响这行文案，调度永远用 ``ms``。
             self._add_log(rule, SENT, f"延迟 {act.ms / 1000:g} 秒" if act.unit == "s"
-                          else f"延迟 {act.ms} ms")
+                          else f"延迟 {act.ms} ms", run=run)
             self.call_later(act.ms, lambda: self._step(rule, actions, index + 1,
-                                                      branch=branch))
+                                                      branch=branch, run=run))
             return
         feat = act.feature
         if act.type != "device_action" or feat is None:
             # 功能不在白名单里（规则文件被手改 / 以后删了某个功能）：说清楚，别静默
             # 跳过，但**不停队列**——后面那几步是完整的，凭什么不跑。
             self._add_log(rule, FAILED,
-                          f"未知动作「{act.action or act.type or '-'}」，已跳过")
-            self._step(rule, actions, index + 1, branch=branch)
+                          f"未知动作「{act.action or act.type or '-'}」，已跳过", run=run)
+            self._step(rule, actions, index + 1, branch=branch, run=run)
             return
 
         label = act.device or act.did
@@ -243,7 +286,8 @@ class AutomationEngine:
             if not error:
                 return
             where = "回执报错" if sent else "没发出去"
-            self._add_log(rule, FAILED, f"{feat.label}未成功（「{label}」）：{error}（{where}）")
+            self._add_log(rule, FAILED, f"{feat.label}未成功（「{label}」）：{error}（{where}）",
+                          run=run)
 
         try:
             self.run(act, done)
@@ -251,8 +295,8 @@ class AutomationEngine:
         except Exception as exc:  # noqa: BLE001  通道抛异常也只记日志，不拦后续
             done(f"{exc}")
         if sent:
-            self._add_log(rule, SENT, f"{feat.label} → 「{label}」{brief}")
-        self._step(rule, actions, index + 1, branch=branch)
+            self._add_log(rule, SENT, f"{feat.label} → 「{label}」{brief}", run=run)
+        self._step(rule, actions, index + 1, branch=branch, run=run)
 
     @staticmethod
     def _brief(feat: Any, act: Action) -> str:
@@ -271,19 +315,22 @@ class AutomationEngine:
 
     # -- 日志 ------------------------------------------------------------
     def _add_log(self, rule: Rule, outcome: str, detail: str,
-                 *, keys: str = "") -> None:
+                 *, keys: str = "", run: str = "", at: float | None = None) -> None:
+        """记一条日志。``at`` 由 :meth:`_fire` 传进来——批次号里的毫秒要和这行
+        的时刻**完全一致**，各取一次 ``time.time()`` 就可能差 1 ms 对不上。"""
         entry = LogEntry(
-            at=self._wall_now(), rule_id=rule.id, rule_name=rule.name,
+            at=self._wall_now() if at is None else at, rule_id=rule.id, rule_name=rule.name,
             # 多触发时记**本次按下的那个键**；测试 / 无键位时退回第一条
-            keys=keys or rule.keys, outcome=outcome, detail=detail,
+            keys=keys or rule.keys, outcome=outcome, detail=detail, run=run,
         )
         self.log.append(entry)
         if len(self.log) > self.max_log:
             del self.log[: len(self.log) - self.max_log]
         if self.on_log:
+            # 落盘在 ``AutomationService._on_log`` 里做（这一层不碰文件系统）
             try:
                 self.on_log(entry)
-            except Exception:  # noqa: BLE001  界面回调出错不能拖垮规则执行
+            except Exception:  # noqa: BLE001  界面 / 落盘出错不能拖垮规则执行
                 pass
 
 

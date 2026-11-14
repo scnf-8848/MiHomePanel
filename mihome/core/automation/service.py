@@ -26,6 +26,7 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 from typing import Any, Callable
 
 from PySide6.QtCore import QObject, QTimer, Signal
@@ -38,6 +39,7 @@ from ..tree import parse_virtual_did
 from . import action_catalog
 from .engine import AutomationEngine, LogEntry
 from .hotkeys_win import HotkeyRegistry
+from .logstore import MAX_ENTRIES, LogStore
 from .pc_state import PcState
 from .rules import Action, RuleSet
 
@@ -68,9 +70,14 @@ def _pick_transport(override: str | None = None) -> str:
 
 
 class AutomationService(QObject):
-    """一条规则集 + 一台引擎 + 一张热键表 + 一条动作收发通道。窗口只是它的视图。"""
+    """一条规则集 + 一台引擎 + 一张热键表 + 一条动作收发通道。窗口只是它的视图。
+
+    日志除了留在引擎内存里，每条都追加到 ``<data>/automation_log.jsonl``
+    （:class:`logstore.LogStore`），启动时读回来——关掉程序再打开还能翻到上次那一串。
+    """
 
     log_added = Signal(object)        # LogEntry
+    log_cleared = Signal()           # 日志被整体清空（内存 + 文件）
     status_changed = Signal()        # 热键注册状态变了
     rules_changed = Signal()         # 规则增删改（页面刷新列表）
 
@@ -83,6 +90,7 @@ class AutomationService(QObject):
         window: Any = None,
         path=None,
         transport: str | None = None,
+        log_path: Path | str | None = None,
         parent: QObject | None = None,
     ) -> None:
         super().__init__(parent)
@@ -103,15 +111,19 @@ class AutomationService(QObject):
             self._drain_timer.start()
         self.rules = RuleSet(path)
         self.rules.on_changed = self._on_rules_changed
+        #: 日志落盘：``_on_log`` 里每条追一次，启动时 ``restore_log`` 读回来。
+        #: 上限和引擎内存同一个数（``MAX_ENTRIES``），三处各写一个 500 迟早对不上。
+        self.logstore = LogStore(log_path, max_entries=MAX_ENTRIES)
         self.engine = AutomationEngine(
             self.rules,
             state=PcState(),
             run=self._run,
             call_later=self._call_later,
             on_log=self._on_log,
-            # 独立日志窗要能翻到「昨天那一串」；日志只在内存，放宽上限几乎不花内存
-            max_log=500,
+            # 独立日志窗要能翻到「昨天那一串」：内存留最近 500 条（与落盘文件同口径）
+            max_log=MAX_ENTRIES,
         )
+        self.engine.restore_log(self.logstore.load())
         self.registry = HotkeyRegistry(window, self)
         self.registry.fired.connect(self._on_hotkey)
         self.registry.status_changed.connect(self.status_changed)
@@ -172,6 +184,20 @@ class AutomationService(QObject):
         """
         return self.engine.test(rule_id)
 
+    @property
+    def log_path(self) -> Path:
+        """日志文件路径（界面里显示 / 打开文件夹用）。"""
+        return self.logstore.path
+
+    def clear_log(self) -> None:
+        """清空触发日志：**内存和文件一起清**。
+
+        单清内存的话下次启动 ``restore_log`` 又把文件读回来，用户会觉得"清了个寂寞"。
+        """
+        self.engine.clear_log()
+        self.logstore.clear()
+        self.log_cleared.emit()
+
     # -- 内部 ------------------------------------------------------------
     def sync(self) -> None:
         self.registry.sync(self.rules.enabled_keys())
@@ -185,6 +211,13 @@ class AutomationService(QObject):
         self.engine.trigger(keys)
 
     def _on_log(self, entry: LogEntry) -> None:
+        """每条日志：先落盘，再通知界面。
+
+        落盘失败（磁盘满 / 没权限）**不抛**——日志写不进去不该让规则执行中断；
+        ``logstore.append`` 自己吞掉 ``OSError`` 并返回 ``False``，这里也不提示：
+        界面上一条日志照常出现，只是重启后翻不到，比弹窗打断动作好。
+        """
+        self.logstore.append(entry)
         self.log_added.emit(entry)
 
     def _call_later(self, ms: int, fn: Callable[[], None]) -> None:

@@ -10,6 +10,7 @@
     pc_state.py   Windows 系统级 API 只读快照（ctypes，非 Windows 安全退化）
     engine.py     条件求值、AND/OR、三层防重、动作队列、触发日志
     logbook.py    触发日志的中文结果名、筛选 / 查找、表格列（独立日志窗共用）
+    logstore.py   触发日志落盘：``automation_log.jsonl`` 追加 / 读回 / 裁剪
 
 适配层（**按需单独 import**，本文件不导入，免得纯逻辑验证被 Qt 拖住）：
 
@@ -42,19 +43,26 @@ from .engine import (
 )
 from .logbook import (
     FAIL_OUTCOMES,
+    HEAD_OUTCOMES,
     NEUTRAL_OUTCOMES,
     OUTCOME_LABELS,
     OUTCOME_ORDER,
     TIME_RANGES,
     WARN_OUTCOMES,
+    LogRow,
+    child_columns,
     date_text,
     filter_entries,
     full_text,
+    group_entries,
     log_columns,
     matches,
     outcome_label,
     outcome_tone,
+    row_columns,
+    row_tone,
 )
+from .logstore import LOG_FILE, MAX_ENTRIES, LogStore
 from .hotkeys import (
     MOD_CONTROL,
     MOD_NOREPEAT,
@@ -99,6 +107,7 @@ __all__ = [
     "FIRED",
     "MAX_COOLDOWN_MS",
     "MAX_DELAY_MS",
+    "MAX_ENTRIES",
     "MAX_SPEAK_CHARS",
     "MOD_CONTROL",
     "MOD_NOREPEAT",
@@ -121,12 +130,20 @@ __all__ = [
     "Rule",
     "RuleSet",
     "Snapshot",
+    "FAIL_OUTCOMES",
+    "HEAD_OUTCOMES",
+    "LOG_FILE",
+    "LogEntry",
+    "LogRow",
+    "LogStore",
     "Trigger",
     "availability",
+    "child_columns",
     "date_text",
     "evaluate_conditions",
     "filter_entries",
     "full_text",
+    "group_entries",
     "log_columns",
     "matches",
     "normalize",
@@ -134,6 +151,8 @@ __all__ = [
     "outcome_tone",
     "parse_native",
     "reserved_reason",
+    "row_columns",
+    "row_tone",
     "to_native",
     "validate_rule",
 ]
