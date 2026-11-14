@@ -118,7 +118,7 @@ PySide6 的 PyInstaller hook 是"宁多勿少"：整个 QML / Quick / PDF / 虚�
 
 ## 发布一个版本（GitHub Releases）
 
-程序自身的 Release 打 **`v<版本>`**（`v0.1.0`），和组件的 **`go2rtc-<ref>`** 是两条线，
+程序自身的 Release 打 **`v<版本>`**（如 `v0.1.1`），和组件的 **`go2rtc-<ref>`** 是两条线，
 同一个仓库各发各的，别混到同一个 tag 上。下面按顺序走，**每一步都拿到证据再进下一步**
 （发出去的 tag 不该删了重发：用户手里的 `SHA256SUMS` 会对不上）。
 
@@ -126,7 +126,8 @@ PySide6 的 PyInstaller hook 是"宁多勿少"：整个 QML / Quick / PDF / 虚�
 
 `mihome/__init__.py` 的 `__version__`。窗口标题（`MainWindow.setWindowTitle`）与
 「设置 → 关于」都读它，**别在 UI 里另写字面量**。另外两处是**文字**不是代码：
-README「下载与安装」里的 `releases/tag/v0.1.0` 与 `MiHomePanel-v0.1.0.zip`。
+README「下载与安装」里的 `releases/tag/v<版本>` 与 `MiHomePanel-v<版本>.zip`
+（这是**指向已发布资产**的链接，发版当天再改，别提前指向还没发出去的版本）。
 
 `build_exe.py` **不写 exe 版本资源**，所以 `MiHomePanel.exe` 右键「属性 → 详细信息」
 里没有版本号。这是已知缺口（TODO「技术债」），不是"版本号没生效"：程序内是对的。
@@ -159,9 +160,9 @@ dist\MiHomePanel\MiHomePanel.exe --probe-camera --rounds 3
 **4. 组包 + 校验和**
 
 ```powershell
-Compress-Archive -Path dist\MiHomePanel -DestinationPath dist\MiHomePanel-v0.1.0.zip -Force
-Get-FileHash dist\MiHomePanel-v0.1.0.zip -Algorithm SHA256 |
-    ForEach-Object { "$($_.Hash.ToLower())  MiHomePanel-v0.1.0.zip" } |
+Compress-Archive -Path dist\MiHomePanel -DestinationPath dist\MiHomePanel-v0.1.1.zip -Force
+Get-FileHash dist\MiHomePanel-v0.1.1.zip -Algorithm SHA256 |
+    ForEach-Object { "$($_.Hash.ToLower())  MiHomePanel-v0.1.1.zip" } |
     Set-Content dist\SHA256SUMS -Encoding ascii
 ```
 
@@ -185,11 +186,11 @@ Get-FileHash dist\MiHomePanel-v0.1.0.zip -Algorithm SHA256 |
 **6. 发布**
 
 ```powershell
-gh release create v0.1.0 dist\MiHomePanel-v0.1.0.zip dist\SHA256SUMS `
-  --title "MiHomePanel v0.1.0" --notes-file dist\release-notes-v0.1.0.md
+gh release create v0.1.1 dist\MiHomePanel-v0.1.1.zip dist\SHA256SUMS `
+  --title "MiHomePanel v0.1.1" --notes-file dist\release-notes-v0.1.1.md
 ```
 
-发完核对三件事（资产传错了用 `gh release upload v0.1.0 <文件> --clobber` 补）：
+发完核对三件事（资产传错了用 `gh release upload v0.1.1 <文件> --clobber` 补）：
 
 - Release 页**匿名**打开能看到两个资产（登录状态看得见不算数，用户不登录）
 - 下载 zip 算一遍 sha256，与 `SHA256SUMS` 一致

@@ -972,8 +972,8 @@ class SettingsDialog(QDialog):
 
         self._section(col, "程序")
         card = SettingsCard()
-        # 版本值只放 "v0.1.0"，产品名挪到左侧小字：设置行的值列只拿 sizeHint 宽，
-        # "米家控制台（MiHomePanel） v0.1.0" 塞不进一行会被折成三行、行高又固定，
+        # 版本值只放 "v0.1.1"，产品名挪到左侧小字：设置行的值列只拿 sizeHint 宽，
+        # "米家控制台（MiHomePanel） v0.1.1" 塞不进一行会被折成三行、行高又固定，
         # 最下面的版本号就被裁掉了（用户 11-15 01:0x 报）
         card.add_row("版本", self._about_text(f"v{__version__}", soft=False),
                      sub="米家控制台（MiHomePanel）")

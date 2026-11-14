@@ -11,8 +11,8 @@
 
 ## 下载与安装
 
-到 [**Releases**](https://github.com/scnf-8848/MiHomePanel/releases/tag/v0.1.0) 下载
-**`MiHomePanel-v0.1.0.zip`**（Windows 10 / 11 x64），解压后双击 `MiHomePanel.exe` 即可。
+到 [**Releases**](https://github.com/scnf-8848/MiHomePanel/releases/tag/v0.1.1) 下载
+**`MiHomePanel-v0.1.1.zip`**（Windows 10 / 11 x64），解压后双击 `MiHomePanel.exe` 即可。
 **不需要安装 Python，也不需要编译**；压缩包已自带打过补丁的 go2rtc，摄像头开箱即用。
 下载页同时提供 `SHA256SUMS`，可用于核对压缩包完整性。
 
