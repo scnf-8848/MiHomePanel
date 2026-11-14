@@ -938,8 +938,11 @@ class SettingsDialog(QDialog):
 
         self._section(col, "程序")
         card = SettingsCard()
-        card.add_row("版本", self._about_text(
-            f"米家控制台（MiHomePanel） v{__version__}", soft=False))
+        # 版本值只放 "v0.1.0"，产品名挪到左侧小字：设置行的值列只拿 sizeHint 宽，
+        # "米家控制台（MiHomePanel） v0.1.0" 塞不进一行会被折成三行、行高又固定，
+        # 最下面的版本号就被裁掉了（用户 11-15 01:0x 报）
+        card.add_row("版本", self._about_text(f"v{__version__}", soft=False),
+                     sub="米家控制台（MiHomePanel）")
         card.add_row("许可", self._about_text("GPL-3.0-or-later"),
                      sub="完整条款见程序目录的 LICENSE")
         col.addWidget(card)
