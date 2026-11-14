@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""电脑自动化 v1：热键 → 条件 → 按序动作（发虚拟事件 / 延迟 / 发音箱指令）。
+"""电脑自动化 v1：热键 → 条件 → 按序动作（对某台设备做一件事 / 延迟）。
 
 纯逻辑层（**不 import Qt、不碰网络**，验证脚本能纯离线跑）：
 
     rules.py      规则的 schema、校验、``rules.json`` 原子读写（唯一真相）
+    action_catalog.py  设备动作目录：白名单功能（唤醒 / 播报文字 / 执行文本指令 /
+                  发送虚拟事件）与每项的入参元数据、可用性判据、参数清洗
     hotkeys.py    组合键文本 ↔ Win32 修饰符 / 虚拟键码，兼做保留键拦截
     pc_state.py   Windows 系统级 API 只读快照（ctypes，非 Windows 安全退化）
     engine.py     条件求值、AND/OR、三层防重、动作队列、触发日志
@@ -11,9 +13,11 @@
 
 适配层（**按需单独 import**，本文件不导入，免得纯逻辑验证被 Qt 拖住）：
 
-    sender.py     按规格动态找中枢虚拟事件坐标 + 同步云端调用（跑在 worker 线程）
     hotkeys_win.py ``RegisterHotKey`` + 原生 ``WM_HOTKEY`` 过滤 + 冲突标红
     service.py    Qt 常驻对象：把上面这些接成一台 ``AutomationService``
+
+设备坐标不在本包里：action 名字 → ``siid/aiid`` 与入参顺序由
+``mihome/core/miot_action.py`` 现查（顶栏指令条、中枢发送、动作目录三处共用）。
 
 ``__init__.py`` 只导出纯逻辑层；界面 / 主窗口请用
 ``from ..core.automation.service import AutomationService``。
@@ -23,10 +27,12 @@
 契约见 ``docs/reference/automation-hotkeys-and-ui.md`` 第 6 节，明确不做清单见 6.2。
 """
 
+from . import action_catalog
 from .engine import (
     CONDITION,
     COOLDOWN,
     DONE,
+    ELSE,
     FAILED,
     FIRED,
     REENTRY,
@@ -80,12 +86,14 @@ from .rules import (
 
 __all__ = [
     "ACTION_TYPES",
+    "action_catalog",
     "CONDITION",
     "CONDITION_MODES",
     "CONDITION_TYPES",
     "COOLDOWN",
     "DEFAULT_COOLDOWN_MS",
     "DONE",
+    "ELSE",
     "FAILED",
     "FAIL_OUTCOMES",
     "FIRED",

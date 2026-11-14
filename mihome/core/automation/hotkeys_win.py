@@ -8,6 +8,7 @@
 
 * **一个组合只注册一次**；多条规则共用同一个 id，由 ``RuleSet.rules_for`` 分发。
 * 恒带 ``MOD_NOREPEAT``（在 ``hotkeys.to_native`` 里），抑制按住不放的自动重复。
+* **同一条 ``WM_HOTKEY`` 会被 Qt 分发两次**，必须自己去重（见 :data:`_DEDUP_SECONDS`）。
 * 停用 / 改键 = 先 ``UnregisterHotKey`` 再重注册；启动后**只重试一次**，不无限刷。
 * 注册表挂在常驻对象（``AutomationService``）上，绝不挂在会被 ``deleteLater()``
   销毁的对话框上。
@@ -20,6 +21,7 @@ from __future__ import annotations
 
 import ctypes
 import sys
+import time
 from ctypes import wintypes
 from functools import lru_cache
 
@@ -33,6 +35,15 @@ _WM_HOTKEY = 0x0312
 _ID_FIRST = 0x0100          # 官方要求 0x0000–0xBFFF；0xC000+ 留给 DLL
 _ID_LAST = 0xBFFF
 _OCCUPIED = "被其它程序占用，请换一个（Windows 不告诉是谁占的）"
+
+#: 同一条热键消息的去重窗口（秒）。**实测**：PySide6 6.12 / Win11 上一次按键，
+#: ``nativeEventFilter`` 会被调 **两** 次（``wParam`` 相同、``eventType`` 都是
+#: ``windows_generic_MSG``），两次间隔 < 1 ms。不去重的话一次按键触发两遍自动化，
+#: 第二遍正好撞进 1 s 冷静期——日志里就是那条莫名其妙的「冷静期阻止，剩余 1 秒」。
+#:
+#: 取 50 ms 而不是 1 ms：两次分发之间可能夹着 Qt 的其它处理，留余量；而人连按同一个
+#: 组合键不可能快过 50 ms（一次完整按下 + 抬起就要 60~80 ms），所以不会误丢。
+_DEDUP_SECONDS = 0.05
 
 
 @lru_cache(maxsize=1)
@@ -66,6 +77,7 @@ class _HotkeyFilter(QAbstractNativeEventFilter):
     def __init__(self, fire) -> None:
         super().__init__()
         self._fire = fire
+        self._last: dict[int, float] = {}
 
     def nativeEventFilter(self, event_type, message):  # noqa: N802 - Qt 命名
         try:
@@ -75,6 +87,13 @@ class _HotkeyFilter(QAbstractNativeEventFilter):
         if msg.message != _WM_HOTKEY:
             return False
         hotkey_id = int(msg.wParam)
+        # 同一条消息会被 Qt 分发两次（原因见 ``_DEDUP_SECONDS``），这里只认第一次。
+        # **不能**改成"只看某个 eventType"——实测两次都是 ``windows_generic_MSG``。
+        # 时间戳按 id 各记各的：不同热键紧挨着触发时互不影响。
+        now = time.monotonic()
+        if now - self._last.get(hotkey_id, 0.0) < _DEDUP_SECONDS:
+            return True  # 已经处理过，照样吞掉这条消息
+        self._last[hotkey_id] = now
         # 消息分发中途别动 UI / 别发云请求，等这一轮结束
         QTimer.singleShot(0, lambda: self._fire(hotkey_id))
         return True

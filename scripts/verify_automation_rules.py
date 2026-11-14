@@ -6,11 +6,13 @@
 覆盖范围：
 
 * ``hotkeys.py`` —— 规范串、Win32 参数（含 ``MOD_NOREPEAT``）、反查、保留键；
-* ``rules.py``   —— schema 校验、三类动作的落盘形状（含音箱的 ``did/text/silent``）、
+* ``rules.py``   —— schema 校验、v4 动作（``device_action`` / ``delay``）的落盘形状
+  （无参不写 ``args``、bool 保持 bool、旧 ``virtual_event`` / ``speaker`` 读不回来）、
   坏数据字段级修复、原子落盘、启用键位去重与分发；
 * ``pc_state.py``—— 6 类电脑条件、AND / OR、空条件、条件不可用（台式机无电池）；
 * ``engine.py``  —— 冷静期（默认 1s / 0=关 / 剩余秒数）、动作队列重入、条件不成立、
-  动作按序 + 延迟、发送失败停止、音箱通道（``say``）的成功 / 静默 / 失败 / 未注入、
+  **提交即下一步**（不等回执、各步耗时只有延迟本身）、失败不拦后续动作、
+  未知动作跳过、回执晚到只补一条 ``FAILED`` 日志（不动已发出的那条）、
   测试绕过冷静期、日志、close；
 * ``logbook.py``—— 独立日志窗的筛选 / 查找（关键字、规则、结果、时间范围）与表格列；
 * ``rules.py``   —— 软删除回收站：trash / restore / purge 与「删除后不注册热键」。
@@ -142,32 +144,51 @@ class FakeState:
         return self.elapsed.get(name.lower())
 
 
-class Emitter:
-    def __init__(self, fail_on: str = "") -> None:
-        self.calls: list[str] = []
-        self.fail_on = fail_on
-        self.hubs: list[str] = []
+class Runner:
+    """假的执行通道（引擎唯一的出口 ``run``）：记录跑了哪台设备的哪个功能。
 
-    def __call__(self, act, done) -> None:
-        self.calls.append(act.name)
-        self.hubs.append(act.hub)
-        done(f"模拟失败：{act.name}" if act.name == self.fail_on else "")
+    真实现要解析设备、按名字查坐标、清洗参数、拼 miot 入参
+    （``action_catalog`` + ``AutomationService._run``），这里一概不管——引擎本来就不该
+    认设备、也不该认功能名。
 
-
-class Speaker:
-    """假的音箱通道（引擎的第三个出口 ``say``）：记录说给谁、说了什么、静不静默。
-
-    真实现要解析设备、清洗文本、拼 miot 入参（``core/speaker.py`` +
-    ``AutomationService._say``），这里一概不管——引擎本来就不该认设备。
+    ``calls`` 记的是"标签"（事件名 / 文本），沿用从前按事件名断言的那套写法；
+    要看完整入参用 ``raw``。
     """
 
     def __init__(self, fail_on: str = "") -> None:
-        self.calls: list[tuple[str, str, bool]] = []
+        self.calls: list[str] = []
+        self.raw: list[Action] = []
+        self.devices: list[str] = []
         self.fail_on = fail_on
 
+    @staticmethod
+    def label(act: Action) -> str:
+        return str(act.args.get("text-content") or act.args.get("virtual-param") or "")
+
     def __call__(self, act: Action, done) -> None:
-        self.calls.append((act.did, act.text, bool(act.silent)))
-        done(f"模拟失败：{act.text}" if act.text == self.fail_on else "")
+        label = self.label(act)
+        self.raw.append(act)
+        self.devices.append(act.did)
+        self.calls.append(label)
+        # 无参功能（唤醒）的标签是空串，别让「没设 fail_on」被当成命中
+        failed = bool(self.fail_on) and label == self.fail_on
+        done(f"模拟失败：{label}" if failed else "")
+
+
+def evt(name: str, hub: str = "hub1", device: str = "客厅中枢") -> Action:
+    """一条「发送虚拟事件」动作。"""
+    return Action("device_action", did=hub, device=device,
+                  action="emit-virtual-event", args={"virtual-param": name})
+
+
+def speak(text: str, did: str = "d1", device: str = "客厅音箱",
+          silent: bool = False) -> Action:
+    """一条「执行文本指令」动作（静默时才带那个入参）。"""
+    args: dict[str, object] = {"text-content": text}
+    if silent:
+        args["silent-execution"] = True
+    return Action("device_action", did=did, device=device,
+                  action="execute-text-directive", args=args)
 
 
 def base_rule(**kw) -> Rule:
@@ -178,7 +199,7 @@ def base_rule(**kw) -> Rule:
         id="r1", name="测试规则", enabled=True,
         triggers=[Trigger("keyboard", keys)] if keys else [],
         condition_mode="all", conditions=[], cooldown_ms=1000,
-        actions=[Action("virtual_event", name="事件A")],
+        actions=[evt("事件A")],
         # 归属家庭是云端 id；空归属的规则不会运行，引擎用例必须有归属
         home="1001",
     )
@@ -186,18 +207,18 @@ def base_rule(**kw) -> Rule:
     return Rule(**data)
 
 
-def make_engine(rule: Rule, *, state=None, emitter=None, clock=None, sched=None,
-                say=None, fail_on: str = ""):
+def make_engine(rule: Rule, *, state=None, runner=None, clock=None, sched=None,
+                fail_on: str = ""):
     clock = clock or Clock()
     sched = sched or Scheduler(clock)
-    emitter = emitter or Emitter(fail_on)
+    runner = runner or Runner(fail_on)
     rules = RuleSet(_TMP / "engine-rules.json")
     rules.rules = [rule]
     engine = AutomationEngine(
         rules, state=state or FakeState(Snapshot(available=True)),
-        emit=emitter, say=say, call_later=sched, now=clock.now, wall_now=clock.wall,
+        run=runner, call_later=sched, now=clock.now, wall_now=clock.wall,
     )
-    return engine, clock, sched, emitter
+    return engine, clock, sched, runner
 
 
 # ---------------------------------------------------------------------------
@@ -231,7 +252,7 @@ bad = base_rule(name="", keys="F12", actions=[Action("delay", ms=20)])
 errs = validate_rule(bad)
 check("空名/保留键/没有发事件动作全被抓到", len(errs) >= 3, str(errs))
 check("延迟越界被抓", bool(validate_rule(base_rule(actions=[
-    Action("virtual_event", name="A"), Action("delay", ms=10**9)]))))
+    evt("A"), Action("delay", ms=10**9)]))))
 check("条件模式非法被抓", bool(validate_rule(base_rule(condition_mode="xor"))))
 check("数值条件填中文被抓", bool(validate_rule(base_rule(conditions=[
     Condition("idle_minutes", "ge", "十分钟")]))))
@@ -255,68 +276,65 @@ check("坏 unit 退回毫秒档而不是丢动作",
       Action.from_dict({"type": "delay", "ms": 1000, "unit": "秒"}).unit == "ms")
 check("延迟越界提示写明两个刻度",
       any("600 秒" in e for e in validate_rule(base_rule(actions=[
-          Action("virtual_event", name="A"), Action("delay", ms=10**9)]))))
+          evt("A"), Action("delay", ms=10**9)]))))
 
-# 「发音箱指令」动作：did 是执行用的，name 只是显示名快照（日志 / 回显），
-# silent 默认 false 时不写键——旧版本读新文件、新版本读旧文件都不受影响。
-check("动作类型只有三档，没有 delay_s 之类的伪类型",
-      ACTION_TYPES == ("virtual_event", "delay", "speaker"), str(ACTION_TYPES))
-spk_dict = Action("speaker", name="客厅音箱", did="123456", text="打开台灯").to_dict()
-check("音箱动作落盘 = did/name/text 三字段",
-      spk_dict == {"type": "speaker", "did": "123456", "name": "客厅音箱",
-                   "text": "打开台灯"}, str(spk_dict))
-check("不静默是默认值，不写 silent 键", "silent" not in spk_dict)
-check("静默才写 silent: true",
-      Action("speaker", did="d1", text="开灯", silent=True).to_dict().get("silent") is True)
-back = Action.from_dict({"type": "speaker", "did": "123456", "name": "客厅音箱",
-                         "text": "开灯", "silent": True})
-check("音箱动作能原样读回", (back.did, back.name, back.text, back.silent)
-      == ("123456", "客厅音箱", "开灯", True), str(back))
-check("silent 只认 true（写「是」/1 都算不静默）",
-      Action.from_dict({"type": "speaker", "did": "d", "text": "x",
-                        "silent": "是"}).silent is False)
-check("音箱动作不残留 delay 的 ms/unit",
-      (lambda a: a.ms == 0 and a.unit == "ms")(
-          Action.from_dict({"type": "speaker", "did": "d", "text": "x"})))
-
-# 「发虚拟事件」显式绑定中枢：did 执行用，hub_name 只做显示快照
-evt = Action("virtual_event", "事件A", hub="hub1", hub_name="客厅中枢")
-evt_dict = evt.to_dict()
-check("虚拟事件落盘带上中枢 did 与名字",
-      evt_dict == {"type": "virtual_event", "name": "事件A",
-                   "hub": "hub1", "hub_name": "客厅中枢"}, str(evt_dict))
-check("没选中枢的旧动作不写 hub 键",
-      Action("virtual_event", "事件A").to_dict()
-      == {"type": "virtual_event", "name": "事件A"})
+# 一条动作 = **设备 + 功能 + 该功能的参数**（11-14 重构）。**绝不存 siid/aiid**：
+# 同一能力跨型号方法号完全不同（wake-up 在 lx06 是 aiid 3、在 oh2p 是 1），
+# 执行时按 action 名字现查（core/miot_action.py）。
+check("动作类型只有两档（device_action / delay）",
+      ACTION_TYPES == ("device_action", "delay"), str(ACTION_TYPES))
+evt_dict = evt("事件A").to_dict()
+check("设备动作落盘 = did/device/action/args",
+      evt_dict == {"type": "device_action", "did": "hub1", "device": "客厅中枢",
+                   "action": "emit-virtual-event", "args": {"virtual-param": "事件A"}},
+      str(evt_dict))
+wake = Action("device_action", did="d3", device="书房音箱", action="wake-up")
+check("无参功能不写 args 键", "args" not in wake.to_dict(), str(wake.to_dict()))
+check("args 里的 bool 写盘再读回来还是 bool",
+      Action.from_dict(speak("开灯", silent=True).to_dict()).args.get("silent-execution") is True,
+      str(speak("开灯", silent=True).to_dict()))
+check("静默不选就不写那个键",
+      "silent-execution" not in speak("开灯").to_dict().get("args", {}),
+      str(speak("开灯").to_dict()))
 evt_back = Action.from_dict(evt_dict)
-check("中枢设置能原样读回",
-      (evt_back.hub, evt_back.hub_name) == ("hub1", "客厅中枢"), str(evt_back))
-check("没选音箱被抓", any("没选音箱" in e for e in validate_rule(base_rule(actions=[
-    Action("speaker", name="客厅", did="", text="开灯")]))))
-check("没填指令被抓", any("没填要说的话" in e for e in validate_rule(base_rule(actions=[
-    Action("speaker", name="客厅", did="d1", text="   ")]))))
-check(f"指令超过 {MAX_SPEAK_CHARS} 字被抓",
+check("设备动作能原样读回",
+      (evt_back.did, evt_back.device, evt_back.action, evt_back.args)
+      == ("hub1", "客厅中枢", "emit-virtual-event", {"virtual-param": "事件A"}),
+      str(evt_back))
+check("旧 virtual_event 动作读不回来",
+      Action.from_dict({"type": "virtual_event", "name": "A"}) is None)
+check("旧 speaker 动作读不回来",
+      Action.from_dict({"type": "speaker", "did": "d", "text": "x"}) is None)
+check("认不出的类型也读不回来", Action.from_dict({"type": "play-music"}) is None)
+check("没选设备被抓", any("没选设备" in e for e in validate_rule(base_rule(actions=[
+    Action("device_action", did="", action="wake-up")]))))
+check("功能未知被抓", any("功能未知" in e for e in validate_rule(base_rule(actions=[
+    Action("device_action", did="d1", action="play-music")]))))
+check("文字为空被抓", any("不能为空" in e for e in validate_rule(base_rule(actions=[
+    speak("   ")]))))
+check(f"文字超过 {MAX_SPEAK_CHARS} 字被抓",
       any(str(MAX_SPEAK_CHARS) in e for e in validate_rule(base_rule(actions=[
-          Action("speaker", name="客厅", did="d1", text="灯" * (MAX_SPEAK_CHARS + 1))]))))
-check("只有一条音箱动作也能过校验（按键 → 说句话是完整规则）",
-      validate_rule(base_rule(actions=[
-          Action("speaker", name="客厅", did="d1", text="我回来了")])) == [])
+          speak("灯" * (MAX_SPEAK_CHARS + 1))]))))
+check("事件名不走音箱的字符白名单（下划线括号能存）",
+      validate_rule(base_rule(actions=[evt("my_event(1)")])) == [],
+      str(validate_rule(base_rule(actions=[evt("my_event(1)")]))))
+check("只有一条设备动作也能过校验（按键 → 让音箱说句话是完整规则）",
+      validate_rule(base_rule(actions=[speak("我回来了")])) == [])
 check("只有延迟仍然过不了（得有一条真会干事的）",
-      any("发音箱指令" in e for e in validate_rule(base_rule(actions=[
-          Action("delay", ms=1000)]))))
+      any("至少要有一条设备动作" in e for e in validate_rule(base_rule(actions=[
+          Action("delay", ms=1000)]))),
+      str(validate_rule(base_rule(actions=[Action("delay", ms=1000)]))))
 check("发虚拟事件 + 延迟照旧合法",
-      validate_rule(base_rule(actions=[Action("virtual_event", name="A"),
-                                       Action("delay", ms=1000)])) == [])
+      validate_rule(base_rule(actions=[evt("A"), Action("delay", ms=1000)])) == [])
 
-# 空档「-」（用户 11-13 第八条）：② 和 ③ 加出来的一行默认没选类型，type 是空串。
-# 这一层必须拦——`Action.to_dict` 会把空类型和未知类型都写成 virtual_event，
-# 而 `from_dict` 又读不回它，放过去就等于悄悄把动作换成了另一种。
+# 空档（用户 11-13 第八条）：③ 加出来的一行默认没选类型，type 是空串。
+# 这一层必须拦——`Action.to_dict` 会把空类型写成 device_action 落盘，
+# 而 `from_dict` 读回来又是一条完整的空动作，等于悄悄换了语义。
 check("动作没选类型（空串）被抓，且说「还没选」而不是「未知」",
       any("还没选动作类型" in e for e in validate_rule(base_rule(actions=[
-          Action("virtual_event", name="A"), Action("")]))),
-      str(validate_rule(base_rule(actions=[Action("virtual_event", name="A"),
-                                           Action("")]))))
-check("空类型动作不会被顺手写成 virtual_event 混过校验",
+          evt("A"), Action("")]))),
+      str(validate_rule(base_rule(actions=[evt("A"), Action("")]))))
+check("空类型动作不会被顺手写成 device_action 混过校验",
       bool(validate_rule(base_rule(actions=[Action("")]))))
 check("条件没选类型（空串）被抓，且和「类型未知」分开说",
       any("还没选条件类型" in e for e in validate_rule(base_rule(conditions=[
@@ -327,7 +345,7 @@ check("真正写错的条件类型仍然是「类型未知」",
           Condition("no_such_type", "is", "x")]))))
 check("选了类型的规则不受影响（空档只在没选时算错）",
       validate_rule(base_rule(conditions=[Condition("idle_minutes", "ge", "10")],
-                              actions=[Action("virtual_event", name="A")])) == [])
+                              actions=[evt("A")])) == [])
 
 # 家庭归属（用户 11-13 第三轮）：归属存**家庭 id**，空归属 = 未指定家庭。
 check("home 非空才落盘", base_rule(home="1001").to_dict().get("home") == "1001")
@@ -464,13 +482,40 @@ check("PcState 可实例化（不读系统）", isinstance(PcState(), PcState))
 section("引擎：冷静期 / 重入 / 条件 / 动作队列 / 日志")
 # ---------------------------------------------------------------------------
 
-engine, clock, sched, emitter = make_engine(base_rule())
+class LateRunner(Runner):
+    """回执照样收，但**晚一步**：先让队列跑完，再报失败（真实通道就是这样）。
+
+    这是 11-14 改动的核心语义——引擎提交完就走下一步，回执是异步的。
+    """
+
+    def __init__(self, fail_on: str = "") -> None:
+        super().__init__(fail_on)
+        self.late: list[tuple[str, object]] = []
+
+    def __call__(self, act, done) -> None:
+        label = self.label(act)
+        self.raw.append(act)
+        self.devices.append(act.did)
+        self.calls.append(label)
+        self.late.append((label, done))
+
+    def flush(self) -> None:
+        items, self.late = self.late, []
+        for label, done in items:
+            failed = bool(self.fail_on) and label == self.fail_on
+            done(f"回执说没成功：{label}" if failed else "")
+
+
+engine, clock, sched, runner = make_engine(base_rule())
 check("触发被接受", engine.trigger("Ctrl+Alt+F7") == 1)
-check("动作已发送", emitter.calls == ["事件A"])
+check("动作已交给通道", runner.calls == ["事件A"], str(runner.calls))
+check("did 与功能名原样带进通道",
+      runner.devices == ["hub1"] and runner.raw[0].action == "emit-virtual-event",
+      f"{runner.devices} {runner.raw[0].action if runner.raw else ''}")
 check("冷静期立刻拦截第二次", engine.trigger("Ctrl+Alt+F7") == 0)
 check("拦截有日志且不静默", engine.log[-1].outcome == COOLDOWN
       and "剩余" in engine.log[-1].detail)
-engine2, clock2, _, emitter2 = make_engine(base_rule())
+engine2, clock2, _, _ = make_engine(base_rule())
 engine2.trigger("Ctrl+Alt+F7")
 check("剩余秒数正确（0.4s）", (clock2.advance(0.6),
       abs(engine2.cooldown_remaining(base_rule()) - 0.4) < 1e-6)[1])
@@ -482,43 +527,47 @@ check("cooldown=0 完全不拦", (lambda e: (e.trigger("Ctrl+Alt+F7"),
 engine_t, _, _, _ = make_engine(base_rule())
 engine_t.trigger("Ctrl+Alt+F7")
 check("测试绕过冷静期", engine_t.test("r1") is True)
-check("测试日志标明绕过", any("绕过冷静期" in x.detail for x in engine_t.log))
+check("测试日志标明绕过", any("绕过冷却期" in x.detail or "绕过冷静期" in x.detail
+                              for x in engine_t.log))
 
 # 多触发：按哪个键都会执行，日志要记下实际按下的那个
-eng_m, _, _, em_m = make_engine(base_rule(
+eng_m, _, _, rn_m = make_engine(base_rule(
     triggers=[Trigger("keyboard", "F7"), Trigger("keyboard", "F8")]))
-check("第二个触发也能执行", eng_m.trigger("F8") == 1 and em_m.calls == ["事件A"])
+check("第二个触发也能执行", eng_m.trigger("F8") == 1 and rn_m.calls == ["事件A"])
 check("日志记下实际按下的键", eng_m.log[0].keys == "F8", eng_m.log[0].keys)
 check("冷静期按规则算：换另一个触发也被同一条规则挡住", eng_m.trigger("F7") == 0)
 
-# 虚拟事件按动作里选中的中枢发，日志写明是哪台
-eng_h, _, _, em_h = make_engine(base_rule(actions=[
-    Action("virtual_event", "事件A", hub="hub1", hub_name="客厅中枢")]))
-check("动作把选中的中枢带进发送通道",
-      eng_h.trigger("Ctrl+Alt+F7") == 1 and em_h.hubs == ["hub1"], str(em_h.hubs))
-check("发送日志写明中枢", any("客厅中枢" in e.detail for e in eng_h.log),
+# 设备动作按动作里存的那台设备发，日志写明是哪台
+eng_h, _, _, rn_h = make_engine(base_rule(actions=[
+    evt("事件A", hub="hub9", device="书房中枢")]))
+check("动作把设备 did 带进通道", eng_h.trigger("Ctrl+Alt+F7") == 1
+      and rn_h.devices == ["hub9"], str(rn_h.devices))
+check("发送日志写明设备名", any("「书房中枢」" in e.detail for e in eng_h.log),
+      str([e.detail for e in eng_h.log]))
+check("成功日志写明功能与参数",
+      any(e.detail == "发送虚拟事件 → 「书房中枢」（事件A）" for e in eng_h.log),
       str([e.detail for e in eng_h.log]))
 
 # 动作顺序 + 延迟
 seq_rule = base_rule(actions=[
-    Action("virtual_event", name="A"),
+    evt("A"),
     Action("delay", ms=2000),
-    Action("virtual_event", name="B"),
+    evt("B"),
 ])
-engine3, clock3, sched3, emitter3 = make_engine(seq_rule)
+engine3, clock3, sched3, rn3 = make_engine(seq_rule)
 engine3.trigger("Ctrl+Alt+F7")
-check("延迟前只发了第一个", emitter3.calls == ["A"])
+check("延迟前只发了第一个", rn3.calls == ["A"], str(rn3.calls))
 check("延迟回调挂起", len(sched3.pending) == 1)
 check("冷却从触发被接受起算（延迟期间已在走）",
       0 < engine3.cooldown_remaining(seq_rule) <= 1.0)
 sched3.pump()
-check("延迟后按序发第二个", emitter3.calls == ["A", "B"])
+check("延迟后按序发第二个", rn3.calls == ["A", "B"], str(rn3.calls))
 check("队列结束有 done 日志", engine3.log[-1].outcome == DONE)
 check("延迟 2s 跑完后冷却也已到点", engine3.cooldown_remaining(seq_rule) == 0.0
       and clock3.t >= 102)
 
 # 日志按用户填的那把尺子写：设「30 秒」的人不该在日志里读到 30000 ms
-sec_rule = base_rule(actions=[Action("virtual_event", name="A"),
+sec_rule = base_rule(actions=[evt("A"),
                               Action("delay", ms=30000, unit="s")])
 engine_s, _, _, _ = make_engine(sec_rule)
 engine_s.trigger("Ctrl+Alt+F7")
@@ -528,102 +577,152 @@ check("毫秒档日志保持毫秒写法",
       any("延迟 2000 ms" in x.detail for x in engine3.log))
 
 # 重入：延迟未跑完时再来一次
-engine4, clock4, sched4, emitter4 = make_engine(base_rule(cooldown_ms=0, actions=[
-    Action("virtual_event", name="A"),
+engine4, clock4, sched4, rn4 = make_engine(base_rule(cooldown_ms=0, actions=[
+    evt("A"),
     Action("delay", ms=5000),
-    Action("virtual_event", name="B"),
+    evt("B"),
 ]))
 engine4.trigger("Ctrl+Alt+F7")
 check("队列运行中", "r1" in engine4.running)
 engine4.trigger("Ctrl+Alt+F7")
-check("重入被丢弃且不排队", emitter4.calls == ["A"])
+check("重入被丢弃且不排队", rn4.calls == ["A"], str(rn4.calls))
 check("重入有日志", engine4.log[-1].outcome == REENTRY)
 sched4.pump()
-check("只跑完一串", emitter4.calls == ["A", "B"])
+check("只跑完一串", rn4.calls == ["A", "B"], str(rn4.calls))
 
 # 条件不成立
 state = FakeState(snap)
-engine5, _, _, emitter5 = make_engine(base_rule(conditions=[
+engine5, _, _, rn5 = make_engine(base_rule(conditions=[
     Condition("process_running", "is", "chrome.exe")]), state=state)
 engine5.trigger("Ctrl+Alt+F7")
-check("条件不成立不发事件", emitter5.calls == [])
+check("条件不成立不发事件", rn5.calls == [])
 check("条件不成立有日志", engine5.log[-1].outcome == CONDITION)
 check("条件求值恰好一次", state.reads == 1)
 check("条件不成立不写冷静期", engine5.cooldown_remaining(base_rule()) == 0.0)
 
-# 发送失败
-engine6, _, _, emitter6 = make_engine(base_rule(actions=[
-    Action("virtual_event", name="A"),
-    Action("virtual_event", name="坏事件"),
-    Action("virtual_event", name="C"),
+# 发送失败：**不拦后续动作**。动作之间是顺序关系、不是条件链（米家也一样）——
+# 第 2 步失败，第 3 步照样做；失败只落一条日志 + 系统通知。
+engine6, _, _, rn6 = make_engine(base_rule(actions=[
+    evt("A"),
+    evt("坏事件"),
+    evt("C"),
 ]), fail_on="坏事件")
 engine6.trigger("Ctrl+Alt+F7")
-check("失败即停止后续动作", emitter6.calls == ["A", "坏事件"])
-check("失败有日志且释放队列", engine6.log[-1].outcome == FAILED and "r1" not in engine6.running)
+check("失败不拦后续动作", rn6.calls == ["A", "坏事件", "C"], str(rn6.calls))
+check("失败有日志、队列照常跑完",
+      any(x.outcome == FAILED for x in engine6.log) and engine6.log[-1].outcome == DONE,
+      str([x.outcome for x in engine6.log]))
+check("发送前失败文案写「没发出去」",
+      any("（没发出去）" in x.detail for x in engine6.log),
+      str([x.detail for x in engine6.log]))
 
-# 音箱指令：引擎的第三个出口 say（解析设备 / 清洗文本都不在引擎里）
+# 回执晚一步才报错：队列早已跑完，失败只补一条日志，不改变已经发出去的东西
+engine_r, _, _, late = make_engine(
+    base_rule(actions=[evt("A"), evt("坏事件")]), runner=LateRunner("坏事件"))
+engine_r.trigger("Ctrl+Alt+F7")
+check("提交完队列就收尾（不等回执）", engine_r.log[-1].outcome == DONE,
+      str([x.outcome for x in engine_r.log]))
+count_sent = len([x for x in engine_r.log if x.outcome == SENT])
+late.flush()
+check("回执失败补一条 FAILED、写明「回执报错」",
+      any(x.outcome == FAILED and "（回执报错）" in x.detail for x in engine_r.log),
+      str([x.detail for x in engine_r.log]))
+check("回执失败不动已经发出的日志", count_sent == 2,
+      str([x.outcome for x in engine_r.log]))
+
+# 文本指令：解析设备 / 清洗文本都不在引擎里，引擎只看功能名与参数摘要
 spk_rule = base_rule(actions=[
-    Action("speaker", name="客厅音箱", did="d1", text="打开台灯"),
-    Action("virtual_event", name="B"),
+    speak("打开台灯"),
+    evt("B"),
 ])
-spk = Speaker()
-engine_k, _, _, emitter_k = make_engine(spk_rule, say=spk)
+spk = Runner()
+engine_k, _, _, rn_k = make_engine(spk_rule, runner=spk)
 engine_k.trigger("Ctrl+Alt+F7")
-check("音箱动作走 say 通道（did / 文本 / 静默）",
-      spk.calls == [("d1", "打开台灯", False)], str(spk.calls))
-check("音箱成功日志带音箱名与指令",
-      any("已让「客厅音箱」执行「打开台灯」" in x.detail for x in engine_k.log),
+check("文本指令的 did / 参数原样进通道",
+      rn_k.devices == ["d1", "hub1"] and rn_k.raw[0].args.get("text-content") == "打开台灯",
+      str(rn_k.devices))
+check("成功日志带设备名与指令",
+      any("执行文本指令 → 「客厅音箱」（打开台灯）" in x.detail for x in engine_k.log),
       str([x.detail for x in engine_k.log]))
-check("音箱之后接着跑下一步", emitter_k.calls == ["B"] and engine_k.log[-1].outcome == DONE)
+check("文本指令之后接着跑下一步",
+      rn_k.calls == ["打开台灯", "B"] and engine_k.log[-1].outcome == DONE)
 
-spk_si = Speaker()
+spk_si = Runner()
 engine_si, _, _, _ = make_engine(base_rule(actions=[
-    Action("speaker", name="卧室音箱", did="d2", text="小点声", silent=True)]), say=spk_si)
+    speak("小点声", did="d2", device="卧室音箱", silent=True)]), runner=spk_si)
 engine_si.trigger("Ctrl+Alt+F7")
-check("静默一路传到通道", spk_si.calls == [("d2", "小点声", True)], str(spk_si.calls))
-check("静默在日志里写明", any("已静默让" in x.detail for x in engine_si.log),
+check("静默一路传到通道",
+      spk_si.raw[0].args.get("silent-execution") is True, str(spk_si.raw[0].args))
+check("静默在日志里写明",
+      any("「卧室音箱」（小点声，静默）" in x.detail for x in engine_si.log),
       str([x.detail for x in engine_si.log]))
 
-engine_f, _, _, emitter_f = make_engine(base_rule(actions=[
-    Action("speaker", name="客厅", did="d1", text="说点错的"),
-    Action("virtual_event", name="C"),
-]), say=Speaker(fail_on="说点错的"))
+engine_f, _, _, rn_f = make_engine(base_rule(actions=[
+    speak("说点错的"),
+    evt("C"),
+]), fail_on="说点错的")
 engine_f.trigger("Ctrl+Alt+F7")
-check("音箱失败即停后续动作", emitter_f.calls == [])
-check("音箱失败有日志且释放队列", engine_f.log[-1].outcome == FAILED
-      and "模拟失败" in engine_f.log[-1].detail and "r1" not in engine_f.running,
+check("文本指令失败也不拦后续", rn_f.calls == ["说点错的", "C"], str(rn_f.calls))
+check("失败日志写明功能、设备名与原因",
+      any(x.outcome == FAILED and "执行文本指令未成功（「客厅音箱」）" in x.detail
+          for x in engine_f.log),
       str([x.detail for x in engine_f.log]))
 
+# 无参功能：摘要为空，日志里不该冒出空括号
+engine_w, _, _, rn_w = make_engine(base_rule(actions=[
+    Action("device_action", did="d3", device="书房音箱", action="wake-up")]))
+engine_w.trigger("Ctrl+Alt+F7")
+check("唤醒动作没有参数也照常执行",
+      rn_w.devices == ["d3"] and engine_w.log[-1].outcome == DONE, str(rn_w.devices))
+check("无参功能日志不写空括号",
+      any(x.detail == "唤醒 → 「书房音箱」" for x in engine_w.log),
+      str([x.detail for x in engine_w.log]))
+
 long_text = "把客厅的灯关掉" * 5
-spk_l = Speaker()
-engine_l, _, _, _ = make_engine(base_rule(actions=[
-    Action("speaker", name="客厅", did="d1", text=long_text)]), say=spk_l)
+engine_l, _, _, rn_l = make_engine(base_rule(actions=[speak(long_text)]))
 engine_l.trigger("Ctrl+Alt+F7")
 check("日志里的长指令打省略号", any("…" in x.detail for x in engine_l.log),
       str([x.detail for x in engine_l.log]))
-check("发给音箱的仍是全文", spk_l.calls == [("d1", long_text, False)], str(spk_l.calls))
+check("交给通道的仍是全文",
+      rn_l.raw[0].args.get("text-content") == long_text, str(rn_l.raw[0].args))
 
 
 def _boom(_act, _done) -> None:
     raise RuntimeError("通道炸了")
 
 
-engine_b, _, _, _ = make_engine(base_rule(actions=[
-    Action("speaker", name="客厅", did="d1", text="开灯")]), say=_boom)
+engine_b, _, _, _ = make_engine(base_rule(actions=[speak("开灯")]), runner=_boom)
 engine_b.trigger("Ctrl+Alt+F7")
-check("音箱通道抛异常也记失败并释放队列",
-      engine_b.log[-1].outcome == FAILED and "r1" not in engine_b.running,
+check("通道抛异常也记失败，队列照常收尾",
+      any(x.outcome == FAILED and "通道炸了" in x.detail for x in engine_b.log)
+      and engine_b.log[-1].outcome == DONE,
       str([x.detail for x in engine_b.log]))
 
-# 没注入 say：明确失败，**不许静默跳过**（否则界面上看着"成功"其实没出声）
-rules_nb = RuleSet(_TMP / "no-speaker.json")
-rules_nb.rules = [base_rule(actions=[
-    Action("speaker", name="客厅", did="d1", text="开灯")])]
+# 没注入 run：明确失败，**不许静默跳过**（否则界面上看着"成功"其实什么都没做）
+rules_nb = RuleSet(_TMP / "no-channel.json")
+rules_nb.rules = [base_rule(actions=[speak("开灯")])]
 engine_nb = AutomationEngine(rules_nb, state=FakeState(Snapshot(available=True)))
 engine_nb.trigger("Ctrl+Alt+F7")
-check("没接音箱通道时明确报失败", engine_nb.log[-1].outcome == FAILED
-      and "没有配置音箱通道" in engine_nb.log[-1].detail,
+check("没接执行通道时明确报失败（不静默跳过）",
+      any(x.outcome == FAILED and "没有配置执行通道" in x.detail for x in engine_nb.log),
       str([x.detail for x in engine_nb.log]))
+
+# 规则文件被手改、或以后删了某个功能：功能不在白名单 → 报出来，但**不停队列**
+engine_u, _, _, rn_u = make_engine(base_rule(actions=[
+    Action("device_action", did="d1", device="音箱", action="play-music"),
+    evt("B"),
+]))
+engine_u.trigger("Ctrl+Alt+F7")
+check("不在白名单的功能报出来（不停队列）",
+      any(x.outcome == FAILED and "未知动作「play-music」，已跳过" in x.detail
+          for x in engine_u.log),
+      str([x.detail for x in engine_u.log]))
+check("未知功能不交给通道", rn_u.calls == ["B"], str(rn_u.calls))
+engine_e, _, _, _ = make_engine(base_rule(actions=[Action("")]))
+engine_e.trigger("Ctrl+Alt+F7")
+check("空类型动作也当未知处理",
+      any(x.outcome == FAILED and "未知动作「-」" in x.detail for x in engine_e.log),
+      str([x.detail for x in engine_e.log]))
 
 # 日志
 engine7, _, _, _ = make_engine(base_rule())

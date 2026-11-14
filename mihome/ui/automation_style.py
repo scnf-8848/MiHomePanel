@@ -207,6 +207,8 @@ def common_qss(p: theme.Palette) -> str:
     QFrame#SectionCard[step="1"] {{ border-left: 3px solid {p.accent}; }}
     QFrame#SectionCard[step="2"] {{ border-left: 3px solid {warm}; }}
     QFrame#SectionCard[step="3"] {{ border-left: 3px solid {green}; }}
+    /* ④ 否则分支：中性色。它不是主流程，别用第四种彩色去和前三段抢注意力 */
+    QFrame#SectionCard[step="4"] {{ border-left: 3px solid {p.text_soft}; }}
     QLabel#StepBadge {{
         background: {p.accent_soft}; color: {p.accent};
         border-radius: 11px; font-size: 12px; font-weight: 700;
@@ -216,6 +218,15 @@ def common_qss(p: theme.Palette) -> str:
     }}
     QLabel#StepBadge[step="3"] {{
         background: {theme.blend(p.bg, green, 0.24)}; color: {p.text};
+    }}
+    QLabel#StepBadge[step="4"] {{
+        background: {theme.blend(p.bg, p.text_soft, 0.20)}; color: {p.text};
+    }}
+    /* 禁用态必须自己写：外观全由 QSS 接管后，Qt 不会再把按钮自动画灰。
+       用在 ② 没有条件时的 ④「＋ 选择设备 / ＋ 延迟」。颜色用 text_soft 而不是 mute：
+       深色下 mute 和卡片底几乎同色，按钮会"消失"，看不出这里有个入口。 */
+    QPushButton#Tool:disabled {{
+        color: {p.text_soft}; border-color: {p.border}; background: transparent;
     }}
     """ + ghost_qss(p)
 

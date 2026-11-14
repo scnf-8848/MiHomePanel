@@ -1,27 +1,43 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""三段式规则的 schema、校验与 ``rules.json`` 原子读写。
+"""规则的结构、校验与 ``rules.json`` 原子读写。
 
 **这是规则的唯一真相。** 键位、条件、动作、冷静期全在每条规则里，不存在单独的
 ``hotkeys.json`` 或 ``prefs.json`` 副本（Windows 注册热键不需要任何文件，见
 ``docs/reference/automation-hotkeys-and-ui.md`` 第 2 节）。
 
-形状（v3，对应米家 App「创建自动化」页）：
+形状（v4，对应米家 App「创建自动化」页）：
 
-    {id, name, enabled, triggers[], condition_mode, conditions[], actions[], cooldown_ms[, home]}
+    {id, name, enabled, triggers[], condition_mode, conditions[], actions[], cooldown_ms[, else_actions][, home]}
     triggers[]   = {type:"keyboard", keys}   至少一条；**任一触发命中即执行**
     conditions[] = {type, op, arg}        空数组 = 无条件
-    actions[]    = {type:"virtual_event", name[, hub, hub_name]}
+    actions[]    = {type:"device_action", did, device, action, args{入参名: 值}}
                  | {type:"delay", ms[, unit:"s"]}
-                 | {type:"speaker", did, name, text[, silent:true]}
+    else_actions[] = 同 actions[]，**只在条件不成立时执行**；空数组不写键
+
+**设备动作**（2026-11-14 重构）：一条动作 = 一台设备 + 一个功能 + 该功能的参数。
+``action`` 存的是 spec 里的 action 名（``wake-up`` / ``play-text`` /
+``execute-text-directive`` / ``emit-virtual-event``），``args`` 按**入参名**存
+（``text-content`` / ``silent-execution`` / ``virtual-param``）。白名单与每项的
+参数元数据在 ``action_catalog``。
+
+**绝不存 siid/aiid**：同一份能力在型号之间方法号完全不同（``wake-up`` 在 lx06 是
+aiid 3、在 oh2p 是 1），固件升级也可能变；存名字、执行时按名字查坐标才是稳的
+（见 ``core/miot_action``）。
+
+**④ 否则分支**（用户 11-14）：条件不成立时执行 ``else_actions``，动作执行失败**不**走
+这里（失败是故障，走系统通知 + 日志，见 ``ui/main_window`` 的失败提醒）。没有条件时
+``else_actions`` 必须为空——"条件不成立"这个前提不存在，存了也永远不会触发，
+``validate_rule`` 会挡住那种状态。
 
 **多触发**（用户 11-13 第十条）：一条规则可以挂多个触发，语义是 **OR**——任何一条
 命中都执行这条规则，条件 / 冷静期 / 动作队列与单触发完全一样。目前只实现
 ``keyboard`` 一种触发类型，``triggers[]`` 的 ``type`` 先占住位置，以后加别的
 触发源（进程启动、网络变化）不用再改 schema。
 
-**只认当前结构**：本机 ``rules.json`` 已由一次性脚本规范成 v3（``triggers[]`` +
-家庭 id），旧文件里的单个 ``keys`` / 家庭名归属 / ``mode`` 字段的兼容分支已删除；
-再读到那些键会按默认值处理（等价于"没有触发"、“没有归属”），不会再做转换。
+**只认当前结构**：本机 ``rules.json`` 已规范成 v4。**旧的 ``virtual_event`` /
+``speaker`` 动作读不回来**（``Action.from_dict`` 遇到不认识的 type 返回 ``None``，
+那一条动作被丢弃，规则本身还在），不再做转换——用户 11-14 确认本机只有一条测试
+规则，不值得为它养一套兼容分支。迁移工具见 ``scripts/migrate_actions_v4.py``。
 
 **规则按家庭隔离**（用户 11-13）：``home`` 记规则归属的云端**家庭 id**，列表窗 /
 回收站 / 日志的规则筛选只显示**当前家庭**的那几条，免得在 1103 家庭里看到共享家庭
@@ -57,7 +73,10 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .. import paths
+#: 文本类参数的上限现在由 ``action_catalog`` 的 ``Param.max_chars`` 决定；这里只重导出
+#: 给界面文案用（"最多 200 个字符"），别在 UI 里再写死一个 200。
 from ..speaker import MAX_CHARS as MAX_SPEAK_CHARS
+from . import action_catalog
 from .hotkeys import normalize, reserved_reason
 
 SCHEMA_VERSION = 3
@@ -94,7 +113,9 @@ OPS: dict[str, str] = {
 
 #: 落盘的动作类型。**延迟只有一种**，界面上的「毫秒 / 秒」是 ``Action.unit``
 #: 那把尺子（两种规格存的是同一个 ``ms``），所以这里不该出现 ``delay_s``。
-ACTION_TYPES = ("virtual_event", "delay", "speaker")
+#: ``device_action`` 的"功能"不在这里列举——那是 ``action_catalog.FEATURES``
+#: 的白名单，加一个功能不该改这个常量。
+ACTION_TYPES = ("device_action", "delay")
 
 
 def _text(value: Any, limit: int = MAX_NAME_LEN) -> str:
@@ -180,32 +201,35 @@ class Condition:
 
 @dataclass(slots=True)
 class Action:
-    """一个动作。三种类型各用各的字段：
+    """一个动作：**对某台设备做一件事**，或者等一会。
 
-    * ``virtual_event`` —— 用 ``name``（事件名，要和米家自动化里监听的完全一致）
-      + ``hub``（中枢设备 did）/ ``hub_name``（显示名快照）。**中枢是显式选中的**：
-      同一个家庭有多台中枢时按这一行选的发，不再隐式取"上次那台"。``hub`` 为空
-      表示早先没存中枢的规则，执行时回落 ``VirtualEventSender.resolve()``
-      （见 ``service._emit``；本机旧数据无法离线补出中枢 did，所以这一段保留）。
-    * ``delay`` —— 用 ``ms``；
-    * ``speaker`` —— 用 ``did``（音箱设备 id）+ ``text``（要说的话）+ ``silent``
-      （静默执行）。**``name`` 在这里存的是音箱显示名快照**，只给日志和界面回显用；
-      设备被移除 / 改名时执行仍按 ``did`` 走（见 ``service._say``）。
+    * ``device_action`` —— ``did``（设备 id）+ ``device``（显示名快照，只给日志和
+      界面回显；设备改名 / 移除后执行仍按 ``did`` 走）+ ``action``（spec 里的 action
+      名）+ ``args``（入参名 → 值）。
+    * ``delay`` —— ``ms``。
+
+    **不存 siid/aiid**（见模块 docstring）：执行时按 ``action`` 名字现查。
 
     ``unit`` 只是 ``delay`` 的**输入刻度**，语义永远由 ``ms`` 决定：校验、存盘、引擎
     执行全按毫秒算。留着它是为了重开编辑页时「秒」那一档仍显示 ``30`` 而不是
     ``30000``——用户 11-13 要的是两种录入规格，不是两套数据。
+
+    ``args`` 的值只有 ``str`` 与 ``bool`` 两种（``action_catalog`` 的 ``Param.kind``
+    就这两档）。不在白名单里的键在存盘前已被 ``from_dict`` 过滤掉，不会带进文件。
     """
 
-    type: str = "virtual_event"
-    name: str = ""
+    type: str = "device_action"
+    did: str = ""
+    device: str = ""
+    action: str = ""
+    args: dict[str, Any] = field(default_factory=dict)
     ms: int = 0
     unit: str = "ms"
-    did: str = ""
-    text: str = ""
-    silent: bool = False
-    hub: str = ""
-    hub_name: str = ""
+
+    @property
+    def feature(self) -> action_catalog.Feature | None:
+        """这个动作的功能元数据；未知功能返回 ``None``。"""
+        return action_catalog.feature(self.action)
 
     def to_dict(self) -> dict[str, Any]:
         if self.type == "delay":
@@ -214,18 +238,15 @@ class Action:
             if self.unit == "s":
                 out["unit"] = "s"
             return out
-        if self.type == "speaker":
-            out = {"type": "speaker", "did": self.did, "name": self.name, "text": self.text}
-            # 不静默是默认值，不写键
-            if self.silent:
-                out["silent"] = True
-            return out
-        out = {"type": "virtual_event", "name": self.name}
-        # 没选中枢（旧规则）不写键，保留"未指定"的语义
-        if self.hub:
-            out["hub"] = self.hub
-        if self.hub_name:
-            out["hub_name"] = self.hub_name
+        out = {
+            "type": "device_action",
+            "did": self.did,
+            "device": self.device,
+            "action": self.action,
+        }
+        # 无参功能（唤醒）不写空字典，保持文件干净
+        if self.args:
+            out["args"] = dict(self.args)
         return out
 
     @classmethod
@@ -235,22 +256,27 @@ class Action:
         kind = _text(raw.get("type"), 40)
         if kind == "delay":
             unit = "s" if _text(raw.get("unit"), 4) == "s" else "ms"
-            return cls(kind, "", _integer(raw.get("ms"), 0, 0, MAX_DELAY_MS), unit)
-        if kind == "speaker":
-            return cls(
-                kind, _text(raw.get("name"), 120), 0, "ms",
-                _text(raw.get("did"), 64),
-                _text(raw.get("text"), MAX_SPEAK_CHARS),
-                raw.get("silent") is True,
-            )
-        if kind == "virtual_event":
-            return cls(
-                type=kind,
-                name=_text(raw.get("name"), 120),
-                hub=_text(raw.get("hub"), 64),
-                hub_name=_text(raw.get("hub_name"), 120),
-            )
-        return None
+            return cls(kind, ms=_integer(raw.get("ms"), 0, 0, MAX_DELAY_MS), unit=unit)
+        if kind != "device_action":
+            # 旧形状（virtual_event / speaker）与未知类型：这一条动作留不住。
+            # 规则本身还在，用户重选一次即可——见模块 docstring「只认当前结构」。
+            return None
+        raws = raw.get("args")
+        args: dict[str, Any] = {}
+        if isinstance(raws, dict):
+            for key, value in raws.items():
+                name = _text(key, 60)
+                if not name:
+                    continue
+                # bool 要保持 bool：写盘再读回来还是 True，不能变成 "True"
+                args[name] = value if isinstance(value, bool) else _text(value, 400)
+        return cls(
+            type=kind,
+            did=_text(raw.get("did"), 64),
+            device=_text(raw.get("device"), 120),
+            action=_text(raw.get("action"), 60),
+            args=args,
+        )
 
 
 @dataclass(slots=True)
@@ -275,6 +301,9 @@ class Rule:
     condition_mode: str = "all"
     conditions: list[Condition] = field(default_factory=list)
     actions: list[Action] = field(default_factory=list)
+    #: 第 ④ 段「否则执行动作」。**只在条件不成立时跑**；空列表 = 什么都不做。
+    #: 条件为空的规则不允许有它（见 :func:`validate_rule`）。
+    else_actions: list[Action] = field(default_factory=list)
     cooldown_ms: int = DEFAULT_COOLDOWN_MS
     deleted: bool = False
     deleted_at: float = 0.0
@@ -308,6 +337,9 @@ class Rule:
         # 没归属（升级前的老数据）不写键更干净，读回来仍是空串
         if self.home:
             out["home"] = self.home
+        # 否则分支为空不写键：老版本读到这个键会当未知字段忽略，但保持文件干净
+        if self.else_actions:
+            out["else_actions"] = [a.to_dict() for a in self.else_actions]
         return out
 
     @classmethod
@@ -320,6 +352,7 @@ class Rule:
         mode = _text(raw.get("condition_mode"), 10)
         conds = raw.get("conditions")
         acts = raw.get("actions")
+        els = raw.get("else_actions")
         raws = raw.get("triggers")
         triggers = ([t for item in raws if (t := Trigger.from_dict(item))]
                     if isinstance(raws, list) else [])
@@ -337,6 +370,8 @@ class Rule:
             if isinstance(conds, list) else [],
             actions=[a for item in acts if (a := Action.from_dict(item))]
             if isinstance(acts, list) else [],
+            else_actions=[a for item in els if (a := Action.from_dict(item))]
+            if isinstance(els, list) else [],
             cooldown_ms=_integer(raw.get("cooldown_ms"), DEFAULT_COOLDOWN_MS,
                                  0, MAX_COOLDOWN_MS),
             deleted=raw.get("deleted") is True,
@@ -346,6 +381,43 @@ class Rule:
 
     def clone(self) -> Rule:
         return Rule.from_dict(self.to_dict()) or Rule(id=str(uuid.uuid4())[:8])
+
+
+def _action_errors(actions: list[Action], label: str) -> list[str]:
+    """一串动作的合法性。``label`` 只改文案前缀（「动作」/「否则动作」）。
+
+    ③ 与 ④ 是同一套动作、同一套填法，这里写一份给两处用——各写一遍必然会有一天
+    只改了一边，界面上就会出现在 ③ 报错、在 ④ 放过的情况。
+
+    **只校验形状**（选了设备没有、功能认不认识、参数填没填、长度超没超），**不校验
+    这台设备到底支不支持这个功能**：那要读 spec，而校验是纯函数。设备换了 / 固件变了
+    由执行层报错（日志里写"这台音箱没有该功能"），编辑页不拦。
+    """
+    errors: list[str] = []
+    for i, act in enumerate(actions, 1):
+        if act.type not in ACTION_TYPES:
+            # 编辑页的动作行默认停在「-」上（11-13 用户第八条）。这一层必须拦，
+            # 否则 ``Action.to_dict`` 会把空类型当成 device_action 写进 rules.json，
+            # 而 ``Action.from_dict`` 又读不回它——存进去就变成了另一条动作。
+            errors.append(f"{label} {i} 还没选动作类型")
+            continue
+        if act.type == "delay":
+            # 界面上延迟有两种录入刻度，上限只写毫秒的话「秒」档用户得自己换算
+            if not (0 <= act.ms <= MAX_DELAY_MS):
+                errors.append(f"{label} {i} 的延迟要在 0–{MAX_DELAY_MS} 毫秒"
+                              f"（{MAX_DELAY_MS // 1000} 秒）之间")
+            continue
+        if not act.did.strip():
+            errors.append(f"{label} {i} 没选设备")
+            continue
+        feat = action_catalog.feature(act.action)
+        if feat is None:
+            errors.append(f"{label} {i} 的功能未知（{act.action or '空'}）")
+            continue
+        _, why = action_catalog.clean_values(feat, act.args, truncate=False)
+        if why:
+            errors.append(f"{label} {i} {why}")
+    return errors
 
 
 def validate_rule(rule: Rule) -> list[str]:
@@ -402,32 +474,20 @@ def validate_rule(rule: Rule) -> list[str]:
             errors.append(f"条件 {i} 要填程序名")
     if not rule.actions:
         errors.append("至少要有一个动作")
-    for i, act in enumerate(rule.actions, 1):
-        if act.type not in ACTION_TYPES:
-            # 编辑页的动作行默认停在「-」上（11-13 用户第八条）。这一层必须拦，
-            # 否则 ``Action.to_dict`` 会把空类型当成 virtual_event 写进 rules.json，
-            # 而 ``Action.from_dict`` 又读不回它——存进去就变成了另一条动作。
-            errors.append(f"动作 {i} 还没选动作类型")
-            continue
-        if act.type == "virtual_event" and not act.name.strip():
-            errors.append(f"动作 {i} 没填虚拟事件名")
-        elif act.type == "delay" and not (0 <= act.ms <= MAX_DELAY_MS):
-            # 界面上延迟有两种录入刻度，上限只写毫秒的话「秒」档用户得自己换算
-            errors.append(f"动作 {i} 的延迟要在 0–{MAX_DELAY_MS} 毫秒"
-                          f"（{MAX_DELAY_MS // 1000} 秒）之间")
-        elif act.type == "speaker":
-            if not act.did.strip():
-                errors.append(f"动作 {i} 没选音箱")
-            if not act.text.strip():
-                errors.append(f"动作 {i} 没填要说的话")
-            elif len(act.text) > MAX_SPEAK_CHARS:
-                errors.append(f"动作 {i} 的指令超过 {MAX_SPEAK_CHARS} 个字符")
-    # 「至少有一条真会干事的动作」——以前只认虚拟事件，加了音箱指令之后
-    # 一条「按键 → 让音箱说句话」的规则完全成立，不能再拿老条件卡它。
-    if not any((a.type == "virtual_event" and a.name.strip())
-               or (a.type == "speaker" and a.did.strip() and a.text.strip())
+    errors.extend(_action_errors(rule.actions, "动作"))
+    # ④ 的前提是「有②」：没有条件就谈不上"条件不成立"，这段动作永远不会跑。
+    # 编辑页按用户要求**不清空**已有动作（可能只是在重排条件），所以只能在这里拦，
+    # 并且把两条出路都写出来，别让用户自己猜。
+    if rule.else_actions and not rule.conditions:
+        errors.append("没有状态条件时「否则执行动作」永远不会触发："
+                      "要么给它加一条条件，要么清空这一段")
+    errors.extend(_action_errors(rule.else_actions, "否则动作"))
+    # 「至少有一条真会干事的动作」——延迟不算，它只是等。以前这条只认虚拟事件，
+    # 加了音箱指令之后一条「按键 → 让音箱说句话」的规则完全成立，所以按"是不是设备
+    # 动作"判，而不是按具体功能判。
+    if not any(a.type == "device_action" and a.did.strip() and a.action
                for a in rule.actions):
-        errors.append("动作里至少要有一条「发虚拟事件」或「发音箱指令」")
+        errors.append("动作里至少要有一条设备动作（延迟只是等待，不算）")
     if not (0 <= rule.cooldown_ms <= MAX_COOLDOWN_MS):
         errors.append("冷静期超出范围")
     return errors

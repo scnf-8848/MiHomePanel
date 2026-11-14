@@ -42,8 +42,9 @@ from PySide6.QtWidgets import (
 
 from .. import __version__
 from ..core import speaker
-from ..core.alerts import Alert, AlertPolicy
+from ..core.alerts import ERROR, TOAST_COOLDOWN, Alert, AlertPolicy
 from ..core.api import Client, explain
+from ..core.automation import FAILED
 from ..core.automation.service import AutomationService
 from ..core.icons import IconCache
 from ..core.jobs import SerialWorker
@@ -296,6 +297,11 @@ class MainWindow(QMainWindow):
             store=self.store, client=self.client, worker=self.worker,
             window=self, parent=self,
         )
+        # 动作执行失败要让人知道（用户 11-14：失败**不走** ④，改用系统通知）。
+        # 去重键用规则 id：同一条规则失败二十次，用户要知道的是"这条在失败"，
+        # 不需要二十条通知；每次失败的明细在日志窗里都有，不丢信息。
+        self._auto_fail_at: dict[str, float] = {}
+        self.automation.log_added.connect(self._on_automation_log)
 
         # 右侧：顶部指令条 + 卡片墙。指令条占的正是警告条浮层那条横带
         # （同一个 ALERT_MARGIN_X / ALERT_MARGIN_TOP + AlertBar.H），所以警告条
@@ -521,6 +527,22 @@ class MainWindow(QMainWindow):
             8000,
             warning=alert.level != "success",
         )
+
+    def _on_automation_log(self, entry) -> None:
+        """自动化日志里只挑 ``FAILED``：条件不成立有 ④ 兜着，失败是故障，要打扰用户。
+
+        托盘不可用 / 系统关了通知时 ``_notify`` 内部静默跳过——日志窗是兜底通道。
+        """
+        if entry.outcome != FAILED:
+            return
+        now = time.monotonic()
+        last = self._auto_fail_at.get(entry.rule_id)
+        if last is not None and now - last < TOAST_COOLDOWN:
+            return
+        self._auto_fail_at[entry.rule_id] = now
+        detail = entry.detail if len(entry.detail) <= 120 else entry.detail[:119] + "…"
+        self._notify(Alert(ERROR, f"自动化「{entry.rule_name}」执行失败", detail,
+                           entry.rule_id))
 
     def _on_alert_dismissed(self) -> None:
         # 关掉只是不再打扰，状态胶囊与日志照旧记录

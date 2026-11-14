@@ -19,6 +19,7 @@ from .engine import (
     CONDITION,
     COOLDOWN,
     DONE,
+    ELSE,
     FAILED,
     FIRED,
     REENTRY,
@@ -29,6 +30,7 @@ from .engine import (
 #: outcome → 中文短名。下拉和表格共用一份，别在 UI 里另写一份。
 OUTCOME_LABELS: dict[str, str] = {
     FIRED: "触发",
+    ELSE: "否则分支",
     SENT: "发送 / 延迟",
     DONE: "执行完毕",
     COOLDOWN: "冷静期拦截",
@@ -39,7 +41,7 @@ OUTCOME_LABELS: dict[str, str] = {
 
 #: 下拉顺序：先正常流程，再各类拦截 / 异常
 OUTCOME_ORDER: tuple[str, ...] = (
-    FIRED, SENT, DONE, COOLDOWN, REENTRY, CONDITION, FAILED,
+    FIRED, ELSE, SENT, DONE, COOLDOWN, REENTRY, CONDITION, FAILED,
 )
 
 #: 时间范围下拉：(显示的文字, 秒数)。0 = 全部时间。
@@ -58,6 +60,7 @@ WARN_OUTCOMES: frozenset[str] = frozenset({COOLDOWN, REENTRY, CONDITION, FAILED}
 #: * ``ok``      触发 / 发送 / 执行完毕 → 绿
 #: * ``neutral`` 冷静期、重入丢弃、条件不成立 → 琥珀（**程序按设计没执行**，不是故障）
 #: * ``bad``     云端报错 / 后台异常 → 红
+#: **④「否则分支」不在 neutral 里**：它真的执行了一串动作，只是走另一条路，按 ``ok`` 染绿。
 NEUTRAL_OUTCOMES: frozenset[str] = frozenset({COOLDOWN, REENTRY, CONDITION})
 FAIL_OUTCOMES: frozenset[str] = frozenset({FAILED})
 

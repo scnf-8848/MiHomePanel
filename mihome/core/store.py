@@ -36,7 +36,6 @@ from .geek import candidates as geek_candidates
 from .geek import fetch as fetch_geek_entry
 from .geek import probe as geek_probe
 from .geek import remember as geek_remember
-from .geek import supports as geek_supports
 from .jobs import PRIORITY_CONTROL, PRIORITY_DATA, SerialWorker
 from .prefs import HIDDEN_ROOM, HIDDEN_ROOM_ID, Prefs
 from .spec import DeviceSpec, PropertySpec, SpecRepository, localize
@@ -397,19 +396,6 @@ class Store:
             if h.id == home_id:
                 return h.display_name
         return home_id or "我的家"
-
-    def home_has_hub(self, home_id: str) -> bool:
-        """这个家庭有没有中枢网关。
-
-        判据与「极客版入口」共用一套：``geek.supports(did, model)`` 的探测结论
-        （不耗码的 RPC 探出来、按 did 落在 ``geek_ability.json``）。还没探出结论
-        的设备不算——"能不能发虚拟事件"必须是**已证实**的能力，不猜。
-        """
-        return any(
-            self._home_id_of(st) == home_id
-            and geek_supports(st.node.did, st.node.model)
-            for st in self.devices.values()
-        )
 
     def _home_id_of(self, state: DeviceState) -> str:
         """设备归属的家庭 id。个别共享设备的 home_id 是空的，归到第一个家庭。"""
@@ -1015,6 +1001,17 @@ class Store:
             cb(did, expected, mute)
         except Exception:  # noqa: BLE001
             pass
+
+    def schedule_confirm(self) -> None:
+        """动作执行完，让界面那串 1 / 2.5 / 4 秒的全量读跑起来。
+
+        **只有"效果落在别的设备上"的动作需要**（目前是音箱的「执行文本指令」：
+        "打开客厅灯"这类指令经极客版 / 米家自动化去动别的设备，只能靠全量读看到
+        结果）。唤醒、播报文字、发送虚拟事件都不改变任何可读属性，回读只是把同一批
+        属性白读三遍，还占着串行队列给后面的动作添堵——判据在
+        ``automation.action_catalog.Feature.refreshes``，别在调用处写 ``if``。
+        """
+        self._notify_command_done()
 
     def _notify_command_done(self) -> None:
         """场景 / 音箱指令：没有目标设备，由界面按几个时点做全量读。"""

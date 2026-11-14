@@ -48,6 +48,7 @@ from mihome.core import speaker as SPK  # noqa: E402
 from mihome.core.automation import (  # noqa: E402
     Action, Condition, LogEntry, Rule, RuleSet, Trigger, validate_rule,
 )
+from mihome.core.automation import action_catalog as AC  # noqa: E402
 from mihome.ui import automation as A  # noqa: E402
 from mihome.ui import automation_style as AS  # noqa: E402
 from mihome.ui import confirm as CF  # noqa: E402
@@ -73,6 +74,25 @@ def check(name: str, ok: bool, detail: str = "") -> None:
 
 HOMES = {"1001": "1103 家", "1002": "共享家庭"}
 
+#: 选择窗的候选设备（11-14 起动作 = 设备 + 功能）。顺序即 ``collect`` 的排序：
+#: 在线的先、同房间按名字。离线那台仍然列出来但点不动。
+SPK_FEATS = ("wake-up", "play-text", "execute-text-directive")
+HUB_FEATS = ("emit-virtual-event",)
+
+
+def dev(did: str, name: str, feats=SPK_FEATS, *, room: str = "客厅",
+        online: bool = True) -> AC.ActionDevice:
+    return AC.ActionDevice(did=did, name=name, room=room, online=online,
+                           features=tuple(AC.feature(f) for f in feats))
+
+
+def sample_devices() -> list[AC.ActionDevice]:
+    return [
+        dev("d1", "小爱音箱Pro"),
+        dev("hub-a", "客厅中枢", HUB_FEATS),
+        dev("d5", "阳台音箱", room="阳台", online=False),
+    ]
+
 
 class FakeService(QObject):
     log_added = Signal(object)
@@ -87,10 +107,8 @@ class FakeService(QObject):
         self.syncs = 0
         # 真实服务上是 property（家庭 id）；这里做成普通属性，方便切家庭
         self.current_home = home
-        # 「发虚拟事件」要求家庭有中枢网关；默认有，专门用例里再关掉
-        self.hub_ready = True
-        # 家庭内的中枢候选（多台时编辑窗要把它们都列出来）
-        self.hubs = [("hub-a", "客厅中枢", True), ("hub-b", "书房中枢", False)]
+        # 当前家庭里能执行动作的设备（选择窗的候选）。专门用例里换成空列表
+        self.devices = sample_devices()
         # 注册状态：默认"已注册"，专门用例里改成"未注册"检查颜色
         self.registered = True
         # 编辑窗的「归属家庭」只读展示要换成显示名
@@ -103,9 +121,6 @@ class FakeService(QObject):
         want = home_id or self.current_home
         return HOMES.get(want, want)
 
-    def home_has_hub(self, home_id: str = "") -> bool:
-        return self.hub_ready
-
     def _on_rules_changed(self) -> None:
         self.sync()
         self.rules_changed.emit()
@@ -115,8 +130,8 @@ class FakeService(QObject):
             return "未设置"
         return "已注册" if self.registered else "未注册"
 
-    def hub_choices(self, home_id: str = "") -> list[tuple[str, str, bool]]:
-        return list(self.hubs) if self.hub_ready else []
+    def action_devices(self, home: str | None = None) -> list[AC.ActionDevice]:
+        return list(self.devices)
 
     def sync(self) -> None:
         self.syncs += 1
@@ -142,17 +157,29 @@ def trig(*keys: str) -> list[Trigger]:
     return [Trigger("keyboard", k) for k in keys]
 
 
+def evt_action(name: str, did: str = "hub-a", device: str = "客厅中枢") -> Action:
+    """一条「发送虚拟事件」动作（v4：设备 + 功能 + 按入参名存的参数）。"""
+    return Action("device_action", did=did, device=device,
+                  action="emit-virtual-event", args={"virtual-param": name})
+
+
+def speak_action(text: str, did: str = "d1", device: str = "小爱音箱Pro") -> Action:
+    """一条「执行文本指令」动作。"""
+    return Action("device_action", did=did, device=device,
+                  action="execute-text-directive", args={"text-content": text})
+
+
 def sample_rules() -> list[Rule]:
     return [
         Rule(id="r1", name="进门播报", triggers=trig("Ctrl+Alt+F7"), enabled=True,
              home="1001",
-             actions=[Action("virtual_event", "极客版按键自动化执行", 0)]),
+             actions=[evt_action("极客版按键自动化执行")]),
         Rule(id="r2", name="离开时关灯", triggers=trig("F8"), enabled=True,
              home="1001",
-             actions=[Action("virtual_event", "全屋关灯", 0)]),
+             actions=[evt_action("全屋关灯")]),
         Rule(id="r3", name="空规则示例", triggers=[], enabled=False,
              home="1001",
-             actions=[Action("virtual_event", "待填", 0)]),
+             actions=[evt_action("待填")]),
     ]
 
 
@@ -209,7 +236,7 @@ check("未设键位显示占位",
 # 多触发（用户 11-13 第十条）：卡片上要能看出挂了几个键
 multi_card = AL.RuleCard(Rule(id="mc", name="多触发",
                               triggers=trig("F7", "F8", "F9", "F10"),
-                              actions=[Action("virtual_event", "A", 0)]),
+                              actions=[evt_action("A")]),
                          theme.LIGHT, lambda *_: None, lambda *_: None, lambda *_: None)
 _mkeys = next(w for w in multi_card.findChildren(QLabel) if w.objectName() == "RuleKeys")
 check("列表卡片多触发正确呈现",
@@ -243,11 +270,11 @@ print("\n--- 列表窗：规则按家庭隔离（2026-11-13 第二轮用户要�
 home_service = FakeService(_TMP / "home-rules.json", [], home="1001")
 home_service.rules.rules = [
     Rule(id="a1", name="1103 的规则", triggers=trig("F1"), home="1001",
-         actions=[Action("virtual_event", "开灯", 0)]),
+         actions=[evt_action("开灯")]),
     Rule(id="a2", name="共享家庭的规则", triggers=trig("F2"), home="1002",
-         actions=[Action("virtual_event", "关灯", 0)]),
+         actions=[evt_action("关灯")]),
     Rule(id="a3", name="未指定家庭的规则", triggers=trig("F3"),
-         actions=[Action("virtual_event", "待归", 0)]),
+         actions=[evt_action("待归")]),
 ]
 home_service.rules.save()
 home_list = AL.AutomationListDialog(home_service, theme.LIGHT)
@@ -295,7 +322,7 @@ home_list.close()
 # 一条规则都没有时，空态要说明"只显示本家庭"——否则换个家庭看到 0 条会以为规则丢了
 empty_service = FakeService(_TMP / "home-empty.json", [], home="1002")
 empty_service.rules.rules = [Rule(id="x1", name="别家的", triggers=trig("F5"), home="1001",
-                                  actions=[Action("virtual_event", "开灯", 0)])]
+                                  actions=[evt_action("开灯")])]
 empty_service.rules.save()
 empty_list = AL.AutomationListDialog(empty_service, theme.LIGHT)
 _empty = next((w.text() for w in empty_list.findChildren(QLabel)
@@ -333,7 +360,7 @@ def bar_strip_colors(dlg, bar) -> set[str]:
 scroll_service = FakeService(_TMP / "scroll-rules.json", sample_logs())
 scroll_service.rules.rules = [
     Rule(id=f"s{i}", name=f"规则 {i}", triggers=trig(f"Ctrl+Alt+F{i}"), enabled=(i % 2 == 0),
-         actions=[Action("virtual_event", "极客版按键自动化执行", 0)])
+         actions=[evt_action("极客版按键自动化执行")])
     for i in range(8)
 ]
 scroll_service.rules.save()
@@ -422,7 +449,7 @@ trash_service = FakeService(_TMP / "scroll-trash.json", sample_logs())
 trash_service.rules.rules = [
     Rule(id=f"d{i}", name=f"删掉的 {i}", triggers=trig(f"Ctrl+Alt+F{i}"), enabled=False,
          deleted=True, deleted_at=time.time() - i * 60,
-         actions=[Action("virtual_event", "极客版按键自动化执行", 0)])
+         actions=[evt_action("极客版按键自动化执行")])
     for i in range(10)
 ]
 trash_service.rules.save()
@@ -621,24 +648,26 @@ check("历史为空时表格滚动条进 idle（只剩透明轨道）",
 empty_log.close()
 
 # ---------------------------------------------------------------------------
-print("\n--- 编辑窗：构造 / 三段层级 / 无启停 / 无测试发送 ---", flush=True)
+print("\n--- 编辑窗：构造 / 四段层级 / 无启停 / 无测试发送 ---", flush=True)
 service2 = FakeService(_TMP / "editor-rules.json", sample_logs())
 dlg = A.AutomationDialog(service2, theme.LIGHT)
 check("新建模式", dlg._is_new is True and dlg._draft.id)
 badges = [b.text() for b in dlg.findChildren(QLabel) if b.objectName() == "StepBadge"]
-check("三段编号圆徽章", badges == ["1", "2", "3"], str(badges))
-check("三段标题齐全",
-      all(any(k in t.text() for t in dlg.findChildren(QLabel)
+check("四段编号圆徽章", badges == ["1", "2", "3", "4"], str(badges))
+# 必须 startswith：「则执行动作」是「否则执行动作」的子串，用 in 会让 ③ 的检查
+# 被 ④ 顺带满足，缺了 ③ 也测不出来
+check("四段标题齐全",
+      all(any(t.text().startswith(k) for t in dlg.findChildren(QLabel)
               if t.objectName() == "SectionTitle")
-          for k in ("当以下情况发生时", "状态条件", "则执行动作")))
-# QLabel 也继承自 QFrame，编号徽章同样带 step；这里只数三段卡片
+          for k in ("当以下情况发生时", "状态条件", "则执行动作", "否则执行动作")))
+# QLabel 也继承自 QFrame，编号徽章同样带 step；这里只数四段卡片
 steps = sorted(str(c.property("step")) for c in dlg.findChildren(QFrame)
                if c.objectName() == "SectionCard" and c.property("step") is not None)
-check("三段卡片各有一条语义竖条", steps == ["1", "2", "3"], str(steps))
+check("四段卡片各有一条语义竖条", steps == ["1", "2", "3", "4"], str(steps))
 check("冷静期默认 1000ms 且界面明示", dlg.cooldown.text() == "1000")
 check("新建规则默认没有触发行（点按钮才加）", len(dlg._trigger_rows) == 0)
-check("① 的添加按钮文案与 ③ 一致", dlg.add_trigger_btn.text() == "＋ 添加动作",
-      dlg.add_trigger_btn.text())
+check("① 的按钮是「＋ 添加触发」（③ 改成两枚入口后不再叫「添加动作」）",
+      dlg.add_trigger_btn.text() == "＋ 添加触发", dlg.add_trigger_btn.text())
 check("① 添加按钮和冷静期在同一行",
       dlg.add_trigger_btn.parentWidget() is dlg.cooldown.parentWidget()
       and dlg.add_trigger_btn.parentWidget().layout().indexOf(dlg.cooldown) >= 0,
@@ -658,10 +687,22 @@ check("编辑窗没有日志列表", not dlg.findChildren(QListWidget)
       and not hasattr(dlg, "log_list"))
 check("编辑窗没有测试发送按钮", button_text(dlg, "测试发送") is None)
 check("编辑窗没有结果回显", not hasattr(dlg, "last_result"))
-check("默认一条动作，且停在空档「-」上（不替用户预选类型）",
-      len(dlg._action_rows) == 1 and dlg._action_rows[0]._kind_key() == ""
-      and dlg._action_rows[0].kind.currentText() == "-",
-      f"{len(dlg._action_rows)} / {dlg._action_rows[0].kind.currentText()!r}")
+check("新建规则默认没有动作行（点了按钮才加）", len(dlg._action_rows) == 0)
+check("③ 空态提示指向那两枚按钮",
+      not dlg.action_empty.isHidden() and dlg.action_empty.text() == A.ACTION_HINT_EMPTY,
+      dlg.action_empty.text())
+check("③ 两枚入口：＋ 选择设备 / ＋ 延迟",
+      dlg.add_action_btn.text() == "＋ 选择设备"
+      and dlg.add_delay_btn.text() == "＋ 延迟",
+      f"{dlg.add_action_btn.text()} / {dlg.add_delay_btn.text()}")
+check("④ 两枚入口文案与 ③ 一致（共用同一款 ActionRow）",
+      dlg.add_else_btn.text() == "＋ 选择设备"
+      and dlg.add_else_delay_btn.text() == "＋ 延迟",
+      f"{dlg.add_else_btn.text()} / {dlg.add_else_delay_btn.text()}")
+check("两枚按钮的 tooltip 说清各自加什么",
+      "中枢网关" in dlg.add_action_btn.toolTip()
+      and "等一段" in dlg.add_delay_btn.toolTip(),
+      f"{dlg.add_action_btn.toolTip()} / {dlg.add_delay_btn.toolTip()}")
 check("默认没有条件", len(dlg._cond_rows) == 0 and not dlg.cond_empty_box.isHidden())
 check("0 条条件时空态块的按钮上方分隔线让位（不叠线）",
       dlg.cond_btns_divider.isHidden())
@@ -684,7 +725,10 @@ check("编辑窗没有新建规则按钮", button_with(dlg, "Primary") is None
       or button_with(dlg, "Primary").text() != "＋ 新建规则")
 
 print("\n--- 编辑窗：动作行右侧控件（用户截图报「根本看不到」） ---", flush=True)
+# 先加一条延迟：延迟行是**最短**的形态（只有单位 + 数值），正好用来量右侧按钮
+dlg._add_action(A._new_delay())  # noqa: SLF001  内部 API，验证脚本直接用
 row0 = dlg._action_rows[0]
+check("加了一行后空态提示收起", dlg.action_empty.isHidden())
 icons = (row0.up_btn, row0.down_btn, row0.delete_btn)
 check("三枚都是独立 IconTool 样式", all(b.objectName() == "IconTool" for b in icons))
 check("图标按钮命中区 ≥28px", all(b.width() >= 28 and b.height() >= 28 for b in icons))
@@ -729,6 +773,10 @@ check("删掉第二条只影响它自己", len(dlg._trigger_rows) == 1
 # 版式基准：③ 序号之后的下拉框 = 44px（16 内边距 + 20 序号 + 8 行距）。
 # ① 的下拉、② 的条件行/按钮、三块底部按钮都用 28px 左边距对齐到这条线，
 # 不再有 104px 的空占位列（用户 11-13 第六、七次调整）。
+# 量的是**设备动作行**：延迟行没有设备 / 功能两列，左边第一格是单位下拉。
+dlg._add_action(Action("device_action", did="d1", device="小爱音箱Pro",
+                       action="execute-text-directive", args={"text-content": "开灯"}))
+dev_row = dlg._action_rows[1]
 dlg.resize(920, 760)
 dlg.show()
 app.processEvents()
@@ -738,16 +786,19 @@ def _left(widget) -> int:
     return widget.mapTo(dlg, QPoint(0, 0)).x()
 
 
-_action_kind = dlg._action_rows[0].kind
-check("①下拉 / ②条件按钮 / ③类型下拉 / 三块按钮都在同一条 44px 线",
-      _left(tr0.kind) == _left(dlg.add_cond_btn) == _left(_action_kind)
+_action_kind = dev_row.kind
+check("①下拉 / ②条件按钮 / ③设备按钮 / 三块按钮都在同一条 44px 线",
+      _left(tr0.kind) == _left(dlg.add_cond_btn) == _left(dev_row.device_btn)
       == _left(dlg.add_action_btn) == _left(dlg.add_trigger_btn),
       f"{_left(tr0.kind)} / {_left(dlg.add_cond_btn)} / "
-      f"{_left(_action_kind)} / {_left(dlg.add_action_btn)}")
+      f"{_left(dev_row.device_btn)} / {_left(dlg.add_action_btn)}")
 check("③ 序号仍在最左，只靠 20px 序号列 + 8px 行距形成 28px 偏移",
-      _left(dlg._action_rows[0].index_label) < _left(_action_kind)
-      and _left(_action_kind) - _left(dlg._action_rows[0].index_label) == 28,
-      f"{_left(dlg._action_rows[0].index_label)} → {_left(_action_kind)}")
+      _left(dev_row.index_label) < _left(dev_row.device_btn)
+      and _left(dev_row.device_btn) - _left(dev_row.index_label) == 28,
+      f"{_left(dev_row.index_label)} → {_left(dev_row.device_btn)}")
+check("设备名按钮右边紧跟功能下拉（固定宽度，不随内容跳）",
+      _left(_action_kind) == _left(dev_row.device_btn) + A._DEVICE_W + A._ROW_GAP,
+      f"{_left(dev_row.device_btn)} / {_left(_action_kind)}")
 check("② 空态提示与添加按钮同一条 44px 左缘",
       _left(dlg.cond_empty) == _left(dlg.add_cond_btn),
       f"{_left(dlg.cond_empty)} / {_left(dlg.add_cond_btn)}")
@@ -837,9 +888,7 @@ check("空档条件报「还没选条件类型」，而不是「类型未知」"
       any("还没选条件类型" in e for e in validate_rule(dlg._collect())),
       str(validate_rule(dlg._collect())))
 # ② 的行内红字（用户 11-13 第九条）：参数为空的空档先让路，等选了类型再报
-dlg._action_rows[0].kind.setCurrentIndex(
-    dlg._action_rows[0].kind.findData("virtual_event"))
-dlg._action_rows[0].value_edit.setText("占位事件")
+# ③ 这时是「延迟 + 执行文本指令」两条都填好的行，唯一会拦保存的就是上面这个空档条件
 check("空档条件点保存：行内亮「要先选条件类型」",
       dlg._save(quiet=True) is False
       and blank_cond.hint.text() == "要先选条件类型"
@@ -908,49 +957,228 @@ check("改比较符也算改动（关窗会提示未保存）", dlg._dirty is Tr
 check("改比较符会重算红字（≥ / ≤ 都收数字，没红字）",
       blank_cond.hint.text() == "", blank_cond.hint.text())
 dlg._remove_condition(blank_cond)
-dlg._action_rows[0].kind.setCurrentIndex(dlg._action_rows[0].kind.findData(""))
-dlg._action_rows[0].value_edit.clear()
 dlg._set_error("")
 
-dlg._action_rows[0].kind.setCurrentIndex(
-    dlg._action_rows[0].kind.findData("virtual_event"))
-dlg._action_rows[0].value_edit.setText("极客版按键自动化执行")
-dlg._add_action(Action("delay", "", 2000))
-check("添加延迟后两行", len(dlg._action_rows) == 2)
-check("序号连续", [r.index_label.text() for r in dlg._action_rows] == ["1.", "2."])
+# 行内红字：文字的缺失 / 超长 / 发不出的字符，判据要和 rules.validate_rule 逐条对齐
+dev_row.value_edit.clear()
+check("文字没填行内报「要填文字」", dev_row.hint.text() == "要填文字", dev_row.hint.text())
+check("红字带 tooltip 说清该填什么", bool(dev_row.hint.toolTip()), dev_row.hint.toolTip())
+dev_row.value_edit.setText("灯" * (SPK.MAX_CHARS + 3))
+check("超长不静默截断，行内报「多了 3 个字」",
+      dev_row.hint.text() == "多了 3 个字", dev_row.hint.text())
+check("超长的 tooltip 说清上限", str(SPK.MAX_CHARS) in dev_row.hint.toolTip(),
+      dev_row.hint.toolTip())
+dev_row.value_edit.setText("开灯~")
+check("带白名单外的字符行内报「含 1 个发不出的字符」",
+      dev_row.hint.text() == "含 1 个发不出的字符", dev_row.hint.text())
+dev_row.value_edit.setText("极客版按键自动化执行")
+check("填回合规文字后红字消失", dev_row.hint.text() == "", dev_row.hint.text())
+
+check("value() 读出设备 + 功能 + 参数",
+      dev_row.value().to_dict() == {
+          "type": "device_action", "did": "d1", "device": "小爱音箱Pro",
+          "action": "execute-text-directive",
+          "args": {"text-content": "极客版按键自动化执行", "silent-execution": False}},
+      str(dev_row.value().to_dict()))
+dev_row.silent.setCurrentIndex(dev_row.silent.findData(True))
+check("静默勾上后只是个参数，不改功能",
+      dev_row.value().args.get("silent-execution") is True
+      and dev_row.value().action == "execute-text-directive")
+dev_row.silent.setCurrentIndex(dev_row.silent.findData(False))
+
+# 无参功能**收掉整列**，不留一个灰着的空框（用户 11-14）：灰框会被当成"这里该填点什么"
+dev_row.kind.setCurrentIndex(dev_row.kind.findData("wake-up"))
+check("切到唤醒：输入框与静默列整列收掉，靠占位顶住右半边",
+      dev_row.value_edit.isHidden() and dev_row.silent.isHidden()
+      and not dev_row.spacer.isHidden())
+check("无参功能行内不亮红字（没有可填的东西）",
+      dev_row.hint.text() == "" and dev_row.hint.isHidden(), dev_row.hint.text())
+check("无参功能的 args 是空字典（不写空键）", dev_row.value().args == {},
+      str(dev_row.value().args))
+dev_row.kind.setCurrentIndex(dev_row.kind.findData("play-text"))
+check("切到播报文字：输入框回来、静默列不出现、占位让位",
+      not dev_row.value_edit.isHidden() and dev_row.silent.isHidden()
+      and dev_row.spacer.isHidden())
+check("换功能会清掉上一功能的残留文字", dev_row.value_edit.text() == "",
+      dev_row.value_edit.text())
+check("播报文字的 placeholder 说明要念什么",
+      "念出来" in dev_row.value_edit.placeholderText(),
+      dev_row.value_edit.placeholderText())
+dev_row.kind.setCurrentIndex(dev_row.kind.findData("execute-text-directive"))
+check("切到执行文本指令：静默列出现且默认「不静默」",
+      not dev_row.silent.isHidden() and dev_row.silent.currentData() is False)
+check("功能下拉只列这台设备能用的三个（中枢的虚拟事件不混进来）",
+      [dev_row.kind.itemText(i) for i in range(dev_row.kind.count())]
+      == ["唤醒", "播报文字", "执行文本指令"],
+      str([dev_row.kind.itemText(i) for i in range(dev_row.kind.count())]))
+dev_row.value_edit.setText("极客版按键自动化执行")
+
+# 设备名是个按钮：点它重开选择窗（不另做设备下拉，两套入口迟早不一致）
+check("设备名按钮显示设备名", dev_row.device_btn.text() == "小爱音箱Pro",
+      dev_row.device_btn.text())
+check("设备名按钮的 tooltip 带房间与「点一下重选」",
+      "客厅" in dev_row.device_btn.toolTip() and "重" in dev_row.device_btn.toolTip(),
+      dev_row.device_btn.toolTip())
+dev_row.set_device(sample_devices()[1])
+check("换到中枢后功能下拉重建成中枢的能力",
+      [dev_row.kind.itemText(i) for i in range(dev_row.kind.count())] == ["发送虚拟事件"],
+      str([dev_row.kind.itemText(i) for i in range(dev_row.kind.count())]))
+check("换设备后设备名按钮跟着变", dev_row.device_btn.text() == "客厅中枢",
+      dev_row.device_btn.text())
+dev_row.set_device(sample_devices()[0])
+check("换回音箱后功能回到它的能力列表", dev_row.kind.count() == 3,
+      str(dev_row.kind.count()))
+dev_row.kind.setCurrentIndex(dev_row.kind.findData("execute-text-directive"))
+dev_row.value_edit.setText("极客版按键自动化执行")
+
+# 顺序 / 序号 / 上下移：两行就是「延迟 + 设备动作」
+check("两行时序号连续", [r.index_label.text() for r in dlg._action_rows] == ["1.", "2."])
 check("两行时四枚箭头全部可点（首行 ↑ / 末行 ↓ 只是按了不动）",
       all(r.up_btn.isEnabled() and r.down_btn.isEnabled()
           for r in dlg._action_rows))
+
+
+def _types() -> list[str]:
+    return [r.value().type for r in dlg._action_rows]
+
+
 dlg._move_action(dlg._action_rows[0], -1)
-check("首行按 ↑ 顺序不变", [r.value().type for r in dlg._action_rows]
-      == ["virtual_event", "delay"])
+check("首行按 ↑ 顺序不变", _types() == ["delay", "device_action"], str(_types()))
 dlg._move_action(dlg._action_rows[-1], 1)
-check("末行按 ↓ 顺序不变", [r.value().type for r in dlg._action_rows]
-      == ["virtual_event", "delay"])
+check("末行按 ↓ 顺序不变", _types() == ["delay", "device_action"], str(_types()))
 dlg._move_action(dlg._action_rows[1], -1)
-check("上移生效", dlg._action_rows[0].value().type == "delay")
-check("延迟值读回", dlg._action_rows[0].value().ms == 2000)
+check("上移生效", _types() == ["device_action", "delay"], str(_types()))
+check("顺序变了但每行的值跟着行走",
+      dlg._action_rows[1].value().ms == 1000 and dlg._action_rows[1].value().unit == "ms",
+      str(dlg._action_rows[1].value()))
+check("移动后序号重排", [r.index_label.text() for r in dlg._action_rows] == ["1.", "2."])
 check("移动后边界箭头仍可点", all(r.up_btn.isEnabled() and r.down_btn.isEnabled()
       for r in dlg._action_rows))
 dlg._move_action(dlg._action_rows[0], 1)
-check("下移生效", dlg._action_rows[0].value().type == "virtual_event")
-dlg._remove_action(dlg._action_rows[1])
-check("删除动作回到一行", len(dlg._action_rows) == 1)
-check("回到单行后箭头仍可点", dlg._action_rows[0].down_btn.isEnabled())
+check("下移生效", _types() == ["delay", "device_action"], str(_types()))
 
-# 换类型残留旧值会让 int() 失败，用户看到"填了东西却报校验错"
-dlg._action_rows[0].kind.setCurrentIndex(
-    dlg._action_rows[0].kind.findData("delay"))
-check("切到延迟重置成 1000 ms", dlg._action_rows[0].value_edit.text() == "1000")
-dlg._action_rows[0].kind.setCurrentIndex(
-    dlg._action_rows[0].kind.findData("virtual_event"))
-check("切回事件清空事件名", dlg._action_rows[0].value_edit.text() == "")
+# 延迟的两种录入刻度：同一份毫秒值的两把尺子，换刻度只换算不重置
+delay_row = dlg._action_rows[0]
+delay_row.value_edit.setText("2000")
+delay_row.unit.setCurrentIndex(delay_row.unit.findData("s"))
+check("毫秒换成秒：2000 → 2", delay_row.value_edit.text() == "2",
+      delay_row.value_edit.text())
+check("秒档 placeholder 说明最多 3 位小数",
+      "3 位小数" in delay_row.value_edit.placeholderText(),
+      delay_row.value_edit.placeholderText())
+delay_row.value_edit.setText("1.2345")
+check("秒档 4 位小数行内报「最多 3 位小数」",
+      delay_row.hint.text() == "最多 3 位小数", delay_row.hint.text())
+delay_row.value_edit.setText("1.5")
+check("秒档读回仍折成毫秒（1500 ms，unit=s 只用来回显）",
+      (delay_row.value().ms, delay_row.value().unit) == (1500, "s"),
+      str(delay_row.value()))
+delay_row.unit.setCurrentIndex(delay_row.unit.findData("ms"))
+check("秒换回毫秒：1.5 秒 → 1500", delay_row.value_edit.text() == "1500",
+      delay_row.value_edit.text())
+delay_row.value_edit.setText("abc")
+check("毫秒档填字母行内报「只能填整数」",
+      delay_row.hint.text() == "只能填整数", delay_row.hint.text())
+delay_row.value_edit.setText("")
+check("延迟没填行内报「要填延迟时间」",
+      delay_row.hint.text() == "要填延迟时间", delay_row.hint.text())
+delay_row.value_edit.setText("601000")
+check("延迟超过上限行内立刻报（不用点保存）",
+      delay_row.hint.text() == "不能超过 600000 毫秒", delay_row.hint.text())
+delay_row.value_edit.setText("1000")
+check("填回合法值后红字消失", delay_row.hint.text() == "" and delay_row.hint.isHidden())
+
+dlg._remove_action(dev_row)
+dlg._remove_action(delay_row)
+check("删到 0 行时空态提示回来", len(dlg._action_rows) == 0
+      and not dlg.action_empty.isHidden())
+dlg._remove_action(dev_row)  # 已经删过，这次应该什么都不做
+check("重复删同一行不炸", len(dlg._action_rows) == 0)
+
+# 重新攒一条能保存的规则：触发 + 一条「执行文本指令」
+dlg._add_action(Action("device_action", did="d1", device="小爱音箱Pro",
+                       action="execute-text-directive",
+                       args={"text-content": "极客版按键自动化执行"}))
+dev_row = dlg._action_rows[0]
+check("重新加回来的行回填了设备与功能",
+      dev_row.device_btn.text() == "小爱音箱Pro"
+      and dev_row._kind_key() == "execute-text-directive",
+      f"{dev_row.device_btn.text()} / {dev_row._kind_key()}")
+check("重新加回来的行回填了文字",
+      dev_row.value_edit.text() == "极客版按键自动化执行", dev_row.value_edit.text())
+
+print("\n--- 编辑窗：选择设备窗（11-14 新入口） ---", flush=True)
+picked: list = []
+_orig_pick = A.DevicePicker.pick
+try:
+    # 「＋ 选择设备」：先弹窗，选中才加行；取消什么都不加
+    A.DevicePicker.pick = staticmethod(lambda *a, **k: sample_devices()[1])
+    dlg._pick_and_add()
+    check("选中设备后加出一行", len(dlg._action_rows) == 2)
+    check("新行就是刚选的那台设备",
+          dlg._action_rows[1].device_btn.text() == "客厅中枢",
+          dlg._action_rows[1].device_btn.text())
+    check("新行的功能默认落在第一个（中枢只有虚拟事件）",
+          dlg._action_rows[1]._kind_key() == "emit-virtual-event",
+          dlg._action_rows[1]._kind_key())
+    A.DevicePicker.pick = staticmethod(lambda *a, **k: None)
+    dlg._pick_and_add()
+    check("取消选择就什么都不加", len(dlg._action_rows) == 2)
+    dlg._pick_and_add(to_else=True)
+    check("④ 也一样：取消不加行", len(dlg._else_rows) == 0)
+    A.DevicePicker.pick = staticmethod(lambda *a, **k: sample_devices()[2])
+    dlg._add_condition(Condition("idle_minutes", "ge", "10"))
+    dlg._pick_and_add(to_else=True)
+    check("④ 选中后加进否则队列而不是 ③", len(dlg._else_rows) == 1
+          and len(dlg._action_rows) == 2)
+    check("④ 的行独立编号（也从 1 开始）", dlg._else_rows[0].index_label.text() == "1.")
+    check("④ 加到离线设备也照加（离线在执行时才报）",
+          "（离线）" in dlg._else_rows[0].device_btn.text(),
+          dlg._else_rows[0].device_btn.text())
+    dlg._remove_else_action(dlg._else_rows[0])
+    dlg._remove_condition(dlg._cond_rows[0])
+    dlg._remove_action(dlg._action_rows[1])
+finally:
+    A.DevicePicker.pick = _orig_pick
+
+# 选择窗本体：行文本、搜索、离线点不动、空列表
+picker = A.DevicePicker(sample_devices(), theme.LIGHT)
+check("选择窗每台设备一行", picker.list.count() == 3, str(picker.list.count()))
+check("行文本 = 设备名 + 房间",
+      picker.list.item(0).text() == "小爱音箱Pro　　客厅", picker.list.item(0).text())
+check("离线那台在行尾标出来",
+      picker.list.item(2).text().endswith("离线"), picker.list.item(2).text())
+check("离线行不可选（点不动）",
+      not (picker.list.item(2).flags() & Qt.ItemIsSelectable))
+picker.search.setText("阳台")
+check("按房间搜得到", not picker.list.item(2).isHidden()
+      and picker.list.item(0).isHidden())
+picker.search.setText("不存在")
+check("搜不到时给空态文案", not picker.empty.isHidden()
+      and picker.empty.text() == "没有匹配的设备。", picker.empty.text())
+picker.search.clear()
+check("清空搜索后列表回来", picker.empty.isHidden()
+      and not picker.list.item(0).isHidden())
+picker._on_item(picker.list.item(2))
+check("点离线那台不会被选走", picker.chosen() is None, str(picker.chosen()))
+picker._on_item(picker.list.item(1))
+check("点在线那台即选中", picker.chosen() is not None
+      and picker.chosen().did == "hub-a", str(picker.chosen()))
+picker.close()
+empty_picker = A.DevicePicker([], theme.LIGHT)
+check("没有设备时列表收起、给空态文案",
+      empty_picker.list.isHidden() and not empty_picker.empty.isHidden()
+      and empty_picker.empty.text() == "当前家庭没有可执行动作的设备。",
+      empty_picker.empty.text())
+empty_picker.close()
 
 print("\n--- 编辑窗：校验 / 保存即关闭 ---", flush=True)
 dlg.name_edit.setText("测试播报")
 dlg._action_rows[0].value_edit.setText("")
-check("空事件名保存被拦", dlg._save(quiet=True) is False)
-check("错误提示可见", bool(dlg.error_label.text()))
+check("空文字保存被拦", dlg._save(quiet=True) is False)
+check("行内红字是唯一提示（底部错误条不重复）",
+      dlg._action_rows[0].hint.text() == "要填文字" and dlg.error_label.text() == "",
+      f"{dlg._action_rows[0].hint.text()!r} / {dlg.error_label.text()!r}")
 dlg._action_rows[0].value_edit.setText("极客版按键自动化执行")
 
 accepted: list[int] = []
@@ -967,8 +1195,13 @@ check("保存后不再是 dirty / 不再是新建",
       dlg._dirty is False and dlg._is_new is False)
 saved = service2.rules.rules[0]
 check("落盘内容含键位与冷静期", saved.keys == "Ctrl+Alt+F7" and saved.cooldown_ms == 1000)
-check("动作只有一条虚拟事件", len(saved.actions) == 1
-      and saved.actions[0].name == "极客版按键自动化执行")
+check("动作只有一条执行文本指令", len(saved.actions) == 1
+      and saved.actions[0].action == "execute-text-directive",
+      str([a.to_dict() for a in saved.actions]))
+check("落盘的动作带着设备 id 与文字",
+      (saved.actions[0].did, saved.actions[0].args.get("text-content"))
+      == ("d1", "极客版按键自动化执行"),
+      str(saved.actions[0].to_dict()))
 check("保存触发热键同步", service2.syncs >= 1)
 check("新建规则归到当前家庭（存的是家庭 id）",
       saved.home == service2.current_home == "1001", repr(saved.home))
@@ -979,9 +1212,10 @@ check("落盘的是触发列表", [t.keys for t in saved.triggers] == ["Ctrl+Alt
 
 # 冲突检测（系统热键被占用 / 同键被别的规则用）：都长在触发行右侧
 conflict_svc = FakeService(_TMP / "conflict-rules.json")
-conflict_svc.rules.rules = [Rule(id="c1", name="占用者", triggers=trig("Ctrl+Alt+F7"),
-                                home="1001",
-                                actions=[Action("virtual_event", "A", 0)])]
+conflict_svc.rules.rules = [Rule(
+    id="c1", name="占用者", triggers=trig("Ctrl+Alt+F7"), home="1001",
+    actions=[Action("device_action", did="hub-a", device="客厅中枢",
+                    action="emit-virtual-event", args={"virtual-param": "A"})])]
 cdlg = A.AutomationDialog(conflict_svc, theme.LIGHT)
 cdlg._add_trigger()
 ctr = cdlg._trigger_rows[0]
@@ -993,9 +1227,8 @@ conflict_svc.rules.set_enabled("c1", False)
 cdlg._refresh_status()
 check("停用的规则不算冲突", "占用者" not in ctr.status.text(), ctr.status.text())
 # 删到 0 行：界面允许，但保存不能当"无触发规则"存下去
-cdlg._action_rows[0].kind.setCurrentIndex(
-    cdlg._action_rows[0].kind.findData("virtual_event"))
-cdlg._action_rows[0].value_edit.setText("A")
+cdlg._add_action(Action("device_action", did="d1", device="小爱音箱Pro",
+                        action="execute-text-directive", args={"text-content": "A"}))
 cdlg._remove_trigger(ctr)
 check("删到 0 行允许，但保存报「至少要有一个触发方式」",
       cdlg._save(quiet=True) is False
@@ -1005,7 +1238,8 @@ cdlg.close()
 
 # 老规则（home 为空）打开时按当前家庭固定：归属只读展示，保存即落盘（开发中间态收口）
 old_rule = Rule(id="old1", name="老规则", triggers=trig("F11"),
-                actions=[Action("virtual_event", "旧事件", 0)])
+                actions=[Action("device_action", did="d1", device="小爱音箱Pro",
+                                action="wake-up")])
 service2.rules.rules.append(old_rule)
 ed_old = A.AutomationDialog(service2, theme.LIGHT, "old1")
 check("编辑老规则时归属固定为当前家庭 id",
@@ -1024,51 +1258,25 @@ check("保存后老规则归到当前家庭",
       repr(service2.rules.get("old1").home if service2.rules.get("old1") else None))
 ed_old.close()
 
-# 「发虚拟事件」需要当前家庭有中枢网关（判据同极客版入口）------------------------
-service2.hub_ready = False
-ed_hub = A.AutomationDialog(service2, theme.LIGHT)
-row = ed_hub._action_rows[0]
-row.kind.setCurrentIndex(row.kind.findData("virtual_event"))
-check("无中枢网关：虚拟事件输入框禁用", not row.value_edit.isEnabled())
-check("无中枢网关：中枢下拉也禁用", not row.hub.isEnabled())
-check("无中枢网关：红字提示", row.hint.text() == "该家庭缺少中枢网关",
-      row.hint.text())
-check("无中枢网关：保存被拦", ed_hub._save(quiet=True) is False)
-row.kind.setCurrentIndex(row.kind.findData("delay"))
-check("切到延迟后输入框恢复可用", row.value_edit.isEnabled())
-check("切到延迟后红字撤掉", row.hint.text() == "", row.hint.text())
-ed_hub.close()
-
-# 换到有中枢的家庭（重新打开编辑窗）就实时变回可用
-service2.hub_ready = True
-ed_hub2 = A.AutomationDialog(service2, theme.LIGHT)
-row2 = ed_hub2._action_rows[0]
-row2.kind.setCurrentIndex(row2.kind.findData("virtual_event"))
-check("有中枢网关：虚拟事件输入框可用", row2.value_edit.isEnabled())
-check("有中枢网关：没有红字", row2.hint.text() == "", row2.hint.text())
-check("家庭内多台中枢全部列进下拉", row2.hub.count() == 2
-      and row2.hub.itemText(0) == "客厅中枢"
-      and "书房中枢（离线）" == row2.hub.itemText(1),
-      f"{row2.hub.count()} / {row2.hub.itemText(0)} / {row2.hub.itemText(1)}")
-check("默认落在第一台在线的中枢", row2._current_hub() == "hub-a", row2._current_hub())
-row2.hub.setCurrentIndex(row2.hub.findData("hub-b"))
-act_hub = row2.value()
-check("可切换到另一台中枢并写进 Action",
-      (act_hub.hub, act_hub.hub_name) == ("hub-b", "书房中枢"),
-      f"{act_hub.hub} / {act_hub.hub_name}")
-row2.hub.setCurrentIndex(row2.hub.findData("hub-a"))
-check("切回第一台也按选中的写", row2.value().hub == "hub-a")
-ed_hub2.close()
-
-# 旧动作存的中枢已经不在当前家庭：仍显示一条带标记的项，执行时由服务层报原因
-stale_row = A.ActionRow(Action("virtual_event", "A", hub="gone", hub_name="旧中枢"),
-                        theme.LIGHT, lambda: None, lambda *_: None, lambda *_: None,
-                        hubs=[("hub-a", "客厅中枢", True)])
-check("不在当前家庭的中枢仍能回显",
-      stale_row._current_hub() == "gone"
-      and "旧中枢（不在当前家庭）" in stale_row.hub.itemText(0),
-      stale_row.hub.itemText(0))
-stale_row.deleteLater()
+# 旧规则里的设备已经不在当前家庭：仍回显名字（不能变成一行空白），执行时才由服务层报原因
+stale = Rule(id="stale1", name="设备没了的规则", triggers=trig("F10"),
+             actions=[Action("device_action", did="gone", device="旧音箱",
+                             action="execute-text-directive",
+                             args={"text-content": "开灯"})])
+service2.rules.rules.append(stale)
+ed_stale = A.AutomationDialog(service2, theme.LIGHT, "stale1")
+srow = ed_stale._action_rows[0]
+check("设备不在候选里也回显原名", srow.device_btn.text() == "旧音箱",
+      srow.device_btn.text())
+check("设备不见了要说明白（tooltip 指出可能被移除 / 换家庭）",
+      "不在当前家庭" in srow.device_btn.toolTip(), srow.device_btn.toolTip())
+check("设备不在候选里时功能下拉退回整个白名单（原来选的那项还在）",
+      srow._kind_key() == "execute-text-directive"
+      and srow.kind.count() == len(AC.FEATURES),
+      f"{srow._kind_key()} / {srow.kind.count()}")
+check("设备不见了的行照样能保存（不在编辑页拦，执行时才报）",
+      ed_stale._save(quiet=True) is True, ed_stale.error_label.text())
+ed_stale.close()
 
 ed2 = A.AutomationDialog(service2, theme.LIGHT, saved.id)
 check("编辑既有规则回填名称", ed2.name_edit.text() == "测试播报")
@@ -1141,9 +1349,9 @@ c_tr = click_dlg._trigger_rows[0]
 c_tr.kind.setCurrentIndex(c_tr.kind.findData("keyboard"))
 c_tr._mod_boxes["Ctrl"].setChecked(True)
 c_tr.key_combo.setCurrentIndex(c_tr.key_combo.findData("F9"))
-click_dlg._action_rows[0].kind.setCurrentIndex(
-    click_dlg._action_rows[0].kind.findData("virtual_event"))
-click_dlg._action_rows[0].value_edit.setText("点按钮事件")
+click_dlg._add_action(Action("device_action", did="hub-a", device="客厅中枢",
+                             action="emit-virtual-event",
+                             args={"virtual-param": "点按钮事件"}))
 _orig_accept = QDialog.accept
 QDialog.accept = lambda self: accepted.append(1)  # type: ignore[assignment]
 try:
@@ -1428,105 +1636,43 @@ check("反向证明：按 p.bg 起算浅色下只剩一圈描边",
                theme.surface_bg(theme.LIGHT)) < 1.2,
       f"{contrast(theme.blend(theme.LIGHT.bg, theme.LIGHT.text, 0.12), theme.surface_bg(theme.LIGHT)):.2f}:1")
 
-# 15) ③ 只留一枚「＋ 添加动作」（用户 11-13 第八条）：加出来落在空档「-」上，
-#     用户再在下拉里挑类型；空档不选就保存会被拦。延迟仍是「一档 + 单位下拉」。
-print("\n15) ③ 一枚「＋ 添加动作」+ 空档「-」+ 延迟单位下拉 + 发音箱指令")
+# 15) ③ 的两枚入口（用户 11-14）：动作 = 对某台设备做一件事，或者等一会。
+#     「＋ 选择设备」先弹窗、选中才加行；「＋ 延迟」直接加一行延迟。
+print("\n15) ③ 两枚入口「＋ 选择设备 / ＋ 延迟」+ 延迟刻度与精度")
 dsvc = FakeService(_TMP / "delay-units.json")
 ddlg = A.AutomationDialog(dsvc, theme.LIGHT)
 ddlg.resize(860, 900)
 ddlg.show()
 app.processEvents()
 texts = {b.text() for b in ddlg.findChildren(QPushButton)}
-check("③ 只剩一枚「＋ 添加动作」（不再是三种动作各一枚）",
-      "＋ 添加动作" in texts
-      and not any(t in texts for t in ("＋ 发虚拟事件", "＋ 延迟", "＋ 发音箱指令")),
+check("③ 只有两枚入口（选择设备 / 延迟）",
+      "＋ 选择设备" in texts and "＋ 延迟" in texts
+      and not any(t in texts for t in ("＋ 添加动作", "＋ 发虚拟事件", "＋ 发音箱指令")),
       str(sorted(texts)))
 check("延迟不再按毫秒 / 秒拆成两枚按钮",
       not any("延迟（" in t for t in texts), str(sorted(texts)))
-check("②③ 两枚添加按钮都是 #Tool，长得一样",
+check("②③ 的添加按钮都是 #Tool，长得一样",
       ddlg.add_action_btn.objectName() == "Tool"
       and button_text(ddlg, "＋ 添加条件").objectName() == "Tool")
 
+QTest.mouseClick(ddlg.add_delay_btn, Qt.LeftButton)
+app.processEvents()
 row = ddlg._action_rows[0]
-check("新建默认那行停在空档上", row._kind_key() == "" and row.kind.currentText() == "-",
-      f"{row._kind_key()!r} / {row.kind.currentText()!r}")
-check("空档行输入框灰着、placeholder 说明先选类型",
-      not row.value_edit.isEnabled() and "先选" in row.value_edit.placeholderText(),
-      row.value_edit.placeholderText())
-check("空档行刚加进来不亮红字（别边让人挑边骂人）",
-      row.hint.text() == "" and row.hint.isHidden(), row.hint.text())
-check("空档没选就点保存会被拦",
-      ddlg._save(quiet=True) is False and row.hint.text() == "要先选动作类型",
-      row.hint.text())
-check("这条红字带 tooltip 说清怎么补", bool(row.hint.toolTip()), row.hint.toolTip())
-check("被拦时焦点落在类型下拉（输入框还禁着）",
-      ddlg.focusWidget() is row.kind, type(ddlg.focusWidget()).__name__)
-
-row.kind.setCurrentIndex(row.kind.findData("delay"))
-app.processEvents()
-check("在下拉里选「延迟」后变成延迟行",
-      row._kind_key() == "delay" and row.value().type == "delay", row._kind_key())
-check("选完类型红字立刻撤掉、输入框能编辑了",
-      row.hint.text() == "" and row.value_edit.isEnabled())
-check("类型下拉四档：空档 + 三种动作",
-      [row.kind.itemData(i) for i in range(row.kind.count())]
-      == ["", "virtual_event", "delay", "speaker"],
-      str([row.kind.itemText(i) for i in range(row.kind.count())]))
-
-# 三块按钮都在卡片内边距（不再为对齐留空列）；③ 的类型下拉只被窄序号列右推
-app.processEvents()
-add_btn = ddlg.add_action_btn
-_btn_x = add_btn.mapTo(ddlg, QPoint(0, 0)).x()
-_kind_x = row.kind.mapTo(ddlg, QPoint(0, 0)).x()
-check("③ 按钮左缘和类型下拉对齐（44px）",
-      _btn_x == _kind_x, f"按钮 {_btn_x} vs 下拉 {_kind_x}")
-check("①/②/③ 的添加按钮共用同一条控件列",
-      ddlg.add_trigger_btn.mapTo(ddlg, QPoint(0, 0)).x()
-      == ddlg.add_cond_btn.mapTo(ddlg, QPoint(0, 0)).x() == _btn_x,
-      f"{ddlg.add_trigger_btn.mapTo(ddlg, QPoint(0, 0)).x()} / "
-      f"{ddlg.add_cond_btn.mapTo(ddlg, QPoint(0, 0)).x()} / {_btn_x}")
-
-# ② 的一行没有序号，用 28px 左内边距补齐到 ③ 序号之后的下拉框那条线
-ddlg._add_condition(Condition(type="", op=""))
-app.processEvents()
-_cond_x = ddlg._cond_rows[-1].kind.mapTo(ddlg, QPoint(0, 0)).x()
-check("② 条件行的类型下拉和 ③ 动作下拉 / 三块按钮对齐",
-      _cond_x == _kind_x == _btn_x,
-      f"条件 {_cond_x} / 动作 {_kind_x} / 按钮 {_btn_x}")
-check("「＋ 添加条件」左边缘和条件行下拉对齐",
-      button_text(ddlg, "＋ 添加条件").mapTo(ddlg, QPoint(0, 0)).x() == _cond_x,
-      f"按钮 {button_text(ddlg, '＋ 添加条件').mapTo(ddlg, QPoint(0, 0)).x()} "
-      f"vs 下拉 {_cond_x}")
-check("加完条件焦点直接在类型下拉上（不用再点一次）",
-      ddlg.focusWidget() is ddlg._cond_rows[-1].kind,
-      type(ddlg.focusWidget()).__name__)
-# 条件行的红字也长在同一行右侧（像素量：须在参数框右边界之后）
-_cond_row = ddlg._cond_rows[-1]
-_cond_row.kind.setCurrentIndex(_cond_row.kind.findData("idle_minutes"))
-app.processEvents()
-check("条件行红字在参数框右边（不换行、不占行高）",
-      _cond_row.hint.isVisible()
-      and _cond_row.hint.geometry().left() >= _cond_row.arg.geometry().right(),
-      f"arg.right={_cond_row.arg.geometry().right()} "
-      f"hint.left={_cond_row.hint.geometry().left()} / {_cond_row.hint.text()!r}")
-check("空档条件选完类型后：空参数立刻在行内说「要填参数」",
-      _cond_row.hint.text() == "要填参数", _cond_row.hint.text())
-ddlg._remove_condition(ddlg._cond_rows[-1])
-
-QTest.mouseClick(ddlg.add_action_btn, Qt.LeftButton)
-app.processEvents()
-check("真点「＋ 添加动作」加出空档行、焦点直接在类型下拉上",
-      ddlg._action_rows[-1]._kind_key() == ""
-      and ddlg.focusWidget() is ddlg._action_rows[-1].kind,
-      type(ddlg.focusWidget()).__name__)
-ddlg._remove_action(ddlg._action_rows[-1])
+check("点「＋ 延迟」直接加出一条延迟（不是空档行）",
+      len(ddlg._action_rows) == 1 and row.value().type == "delay",
+      f"{len(ddlg._action_rows)} / {row.value().type}")
 check("毫秒是默认单位，默认值 1000",
       row._unit() == "ms" and row.unit.currentText() == "毫秒"
       and row.value_edit.text() == "1000",
       f"{row.unit.currentText()} / {row.value_edit.text()}")
-check("延迟行只露单位那一格（音箱 / 静默收起）",
-      not row.unit.isHidden() and row.speaker.isHidden() and row.silent.isHidden(),
-      f"{row.unit.isHidden()}/{row.speaker.isHidden()}/{row.silent.isHidden()}")
+check("延迟行只露单位那一格（设备 / 功能 / 静默都收起）",
+      not row.unit.isHidden() and row.device_btn.isHidden()
+      and row.kind.isHidden() and row.silent.isHidden(),
+      f"{row.device_btn.isHidden()}/{row.kind.isHidden()}/{row.silent.isHidden()}")
+check("刚加的延迟没有红字（默认值就是合法的）",
+      row.hint.text() == "" and row.hint.isHidden(), row.hint.text())
+check("加完焦点直接在数值框上（不用再点一次）",
+      ddlg.focusWidget() is row.value_edit, type(ddlg.focusWidget()).__name__)
 
 # 单位下拉就是原来那两把尺子：同一份 ms，只换刻度
 row.unit.setCurrentIndex(row.unit.findData("s"))
@@ -1544,20 +1690,10 @@ row.unit.setCurrentIndex(row.unit.findData("s"))
 check("再切回秒还是 30（没被重置成 1）", row.value_edit.text() == "30",
       row.value_edit.text())
 
-# 换类型才清空；同一类型换单位只换算
-row.kind.setCurrentIndex(row.kind.findData("virtual_event"))
-app.processEvents()
-check("切到发事件才清空输入框", row.value_edit.text() == "", repr(row.value_edit.text()))
-row.kind.setCurrentIndex(row.kind.findData("delay"))
-app.processEvents()
-check("从事件切回延迟拿到默认值（跟着当前单位走）",
-      row.value_edit.text() == "1", row.value_edit.text())
-
 row.value_edit.setText("601")
 check("秒档超上限被拦", row.value().ms > 600_000
       and bool(validate_rule(Rule(id="u", name="n", triggers=trig("Ctrl+Alt+F7"),
-                                  actions=[Action("virtual_event", name="A"),
-                                           row.value()]))),
+                                  actions=[evt_action("A"), row.value()]))),
       str(row.value().ms))
 # 越界以前只有点保存后由 validate_rule 在底部说一句，现在是**就地**红字
 check("秒档超上限行内就说「不能超过 600 秒」",
@@ -1565,7 +1701,7 @@ check("秒档超上限行内就说「不能超过 600 秒」",
 check("越界提示写明了多少秒",
       any("600 秒" in e for e in validate_rule(Rule(
           id="u", name="n", triggers=trig("Ctrl+Alt+F7"),
-          actions=[Action("virtual_event", name="A"), row.value()]))))
+          actions=[evt_action("A"), row.value()]))))
 
 # 精度（用户 11-13 专门问的）：执行精度是 1 ms → 毫秒档不收小数、秒档收到 3 位，
 # 超了要**明说**，不能静默四舍五入成另一个数。
@@ -1607,6 +1743,8 @@ check("改对之后红字立刻消失",
 row.value_edit.setText("abc")
 check("秒档乱填不会静默变 0", row.value().ms < 0, str(row.value().ms))
 check("秒档乱填报「要填数字」", "数字" in row.format_error(), row.format_error())
+row.value_edit.setText("1.5")
+check("秒档 1.5 秒 = 1500 ms", row.value().ms == 1500, str(row.value().ms))
 
 row.unit.setCurrentIndex(row.unit.findData("ms"))
 row.value_edit.setText("1.5")
@@ -1625,115 +1763,13 @@ row.value_edit.setText("2000")
 check("毫秒档正常值无格式问题", row.format_error() == "" and row.value().ms == 2000)
 check("正常值行内没有红字", not row.hint.isVisible(), row.hint.text())
 
-# -- 发音箱指令：「选音箱 / 静默 / 指令」三格 ------------------------------
-QTest.mouseClick(ddlg.add_action_btn, Qt.LeftButton)
-app.processEvents()
-sp_row = ddlg._action_rows[-1]
-check("点「＋ 添加动作」加出来的是空档行", sp_row._kind_key() == "")
-check("空档行不亮红字、输入框也灰着",
-      sp_row.hint.text() == "" and not sp_row.value_edit.isEnabled())
-sp_row.kind.setCurrentIndex(sp_row.kind.findData("speaker"))
-app.processEvents()
-check("在下拉里选「发音箱指令」就变成音箱行", sp_row._kind_key() == "speaker",
-      sp_row._kind_key())
-check("音箱行露音箱与静默两格、单位那格收起",
-      sp_row.unit.isHidden() and not sp_row.speaker.isHidden()
-      and not sp_row.silent.isHidden(),
-      f"{sp_row.unit.isHidden()}/{sp_row.speaker.isHidden()}/{sp_row.silent.isHidden()}")
-check("没有可选音箱时说清原因",
-      sp_row.hint.text() == "没有可选音箱" and sp_row.hint.isVisible(), sp_row.hint.text())
-check("音箱行的红字也挂在输入框右边",
-      sp_row.hint.geometry().left() >= sp_row.value_edit.geometry().right())
-check("没有音箱时候保存被拦", ddlg._save(quiet=True) is False)
-sp_row.value_edit.setText("关灯😀")
-check("含发不出的字符时红字盖过「没有可选音箱」",
-      sp_row.error_text() == "含 1 个发不出的字符", sp_row.error_text())
-check("带脏字符的行保存被拦", ddlg._save(quiet=True) is False)
-sp_row.value_edit.setText("说" * 205)
-check("超长时红字报差额并拦住保存",
-      sp_row.error_text() == "多了 5 个字" and ddlg._save(quiet=True) is False,
-      sp_row.error_text())
-sp_row.value_edit.setText("")
-
-# 三格宽度是写死的（118 / 176 / 92），字体一变（系统缩放、换主题）文字就可能被省略号吃掉。
-# 留 40px 给左右内边距 + 下拉箭头，四格都要放得下自己最长的条目。
-for _name, _combo in (("类型", sp_row.kind), ("音箱", sp_row.speaker),
-                      ("静默", sp_row.silent), ("单位", sp_row.unit)):
+# 四格宽度是写死的（设备 132 / 功能 118 / 静默 92 / 单位 80），字体一变（系统缩放、
+# 换主题）文字就可能被省略号吃掉。留 40px 给左右内边距 + 下拉箭头。
+for _name, _combo in (("功能", row.kind), ("静默", row.silent), ("单位", row.unit)):
     _fm = _combo.fontMetrics()
     _need = max(_fm.horizontalAdvance(_combo.itemText(i)) for i in range(_combo.count()))
     check(f"{_name}下拉放得下最长那一条（不被省略号吃掉）",
           _need + 40 <= _combo.width(), f"需要 {_need}+40，实际 {_combo.width()}")
-
-spk_a = SPK.Target("dA", "客厅音箱", "xiaomi-lx06", 3, 1,
-                   ("text-content", "silent-execution"), True, "客厅")
-spk_b = SPK.Target("dB", "卧室音箱", "xiaomi-x6a", 1, 4,
-                   ("text-content", "silent-execution"), False, "卧室")
-with_spk = A.ActionRow(Action("speaker", "", 0, "ms", "", ""), theme.LIGHT,
-                       lambda: None, lambda *_: None, lambda *_: None, [spk_a, spk_b])
-check("有候选时默认挑第一台在线的", with_spk._current_did() == "dA",
-      with_spk._current_did())
-check("离线那台在下拉里标出来",
-      "（离线）" in with_spk.speaker.itemText(1), with_spk.speaker.itemText(1))
-with_spk.value_edit.setText("打开客厅灯")
-check("静默默认是「不静默」", with_spk._is_silent() is False
-      and with_spk.value().silent is False)
-with_spk.silent.setCurrentIndex(with_spk.silent.findData(True))
-act = with_spk.value()
-check("切到静默会写进 Action",
-      act.silent is True and act.did == "dA" and act.text == "打开客厅灯"
-      and act.name == "客厅音箱",
-      f"{act.did} / {act.silent} / {act.name} / {act.text}")
-check("这时音箱行没有红字", with_spk.hint.text() == "", with_spk.hint.text())
-check("静默落盘写成 silent:true",
-      json.loads(json.dumps(act.to_dict())).get("silent") is True)
-check("不静默时不写 silent 键（旧读法不受影响）",
-      "silent" not in with_spk.value().to_dict()
-      or with_spk.value().to_dict().get("silent") is True)
-with_spk.silent.setCurrentIndex(with_spk.silent.findData(False))
-check("切回不静默后 to_dict 里没有 silent",
-      "silent" not in with_spk.value().to_dict(), json.dumps(with_spk.value().to_dict()))
-with_spk.value_edit.setText("")
-check("空指令报「要填指令」", "指令" in with_spk.hint.text(), with_spk.hint.text())
-with_spk.value_edit.setText("说" * 201)
-check("指令超 200 字报出「多了 1 个字」（报差额，不静默截断）",
-      with_spk.hint.text() == "多了 1 个字", with_spk.hint.text())
-check("超长时 tooltip 说清上限与差额",
-      "200" in with_spk.hint.toolTip() and "1" in with_spk.hint.toolTip(),
-      with_spk.hint.toolTip())
-with_spk.value_edit.setText("说" * 260)
-check("超得更多时差额跟着变", with_spk.hint.text() == "多了 60 个字", with_spk.hint.text())
-with_spk.value_edit.setText("关灯😀")
-check("含白名单外的字符报「含 1 个发不出的字符」",
-      with_spk.hint.text() == "含 1 个发不出的字符", with_spk.hint.text())
-check("tooltip 把那几个字符列出来", "😀" in with_spk.hint.toolTip(),
-      with_spk.hint.toolTip())
-with_spk.value_edit.setText("关灯，谢谢！")
-check("「，」全角逗号与「！」是白名单内的，不报错",
-      with_spk.hint.text() == "", with_spk.hint.text())
-with_spk.value_edit.setText("关灯")
-check("改回正常指令后红字消失", with_spk.hint.text() == "", with_spk.hint.text())
-check("返回值带着 did / text / name 三样",
-      with_spk.value().to_dict() == {"type": "speaker", "did": "dA",
-                                     "name": "客厅音箱", "text": "关灯"},
-      json.dumps(with_spk.value().to_dict(), ensure_ascii=False))
-
-# 规则里只有一条音箱动作也能成立（以前硬要求至少一条虚拟事件）
-spk_rule = Rule(id="s1", name="音箱规则", triggers=trig("Ctrl+Alt+F7"),
-                actions=[with_spk.value()])
-check("只发音箱指令的规则能通过校验", validate_rule(spk_rule) == [],
-      str(validate_rule(spk_rule)))
-check("音箱动作读回来一字不差",
-      Action.from_dict(spk_rule.to_dict()["actions"][0]) == with_spk.value())
-
-# 指向「别的家庭 / 已移除」的音箱：仍要能显示，不能变成空下拉
-stale = A.ActionRow(Action("speaker", "老音箱", 0, "ms", "dZ", "开灯"), theme.LIGHT,
-                    lambda: None, lambda *_: None, lambda *_: None, [spk_a])
-check("已不在当前家庭的音箱仍显示在下拉里",
-      "不在当前家庭" in stale.speaker.itemText(0), stale.speaker.itemText(0))
-check("它读回来还是原来那个 did", stale.value().did == "dZ", stale.value().did)
-
-with_spk.deleteLater()
-stale.deleteLater()
 
 # 3 位小数不是随便挑的：执行精度 1 ms，所以这个精度**往返无损**，再少就会出现
 # "存 1234 ms → 重开显示 1.2 秒 → 变成 1200 ms"这种自己改自己数据的事。
@@ -1748,7 +1784,7 @@ lossless.deleteLater()
 
 # 落盘再打开：秒档仍然是秒档（unit 只影响显示，不该在重开时丢）
 saved_rule = Rule(id="unit1", name="秒档落盘", triggers=trig("Ctrl+Alt+F7"), actions=[
-    Action("virtual_event", "极客版按键自动化执行"),
+    evt_action("极客版按键自动化执行"),
     Action("delay", ms=30000, unit="s"),
     Action("delay", ms=2000),
 ])
@@ -1758,11 +1794,13 @@ reopened = A.AutomationDialog(dsvc, theme.LIGHT, "unit1")
 reopened.resize(860, 900)
 reopened.show()
 app.processEvents()
-check("重开后秒档行还是「延迟」",
-      reopened._action_rows[1]._kind_key() == "delay",
-      reopened._action_rows[1].kind.currentText())
-check("重开后单位那格回到「秒」",
-      reopened._action_rows[1].unit.currentText() == "秒",
+check("重开后第一条是设备动作",
+      reopened._action_rows[0].value().type == "device_action"
+      and reopened._action_rows[0].device_btn.text() == "客厅中枢",
+      reopened._action_rows[0].device_btn.text())
+check("重开后秒档行还是延迟",
+      reopened._action_rows[1].value().type == "delay"
+      and reopened._action_rows[1].unit.currentText() == "秒",
       reopened._action_rows[1].unit.currentText())
 check("重开后秒档显示 30 而不是 30000",
       reopened._action_rows[1].value_edit.text() == "30",
@@ -1777,6 +1815,99 @@ check("重开后读回的值仍是 30000 ms",
 reopened.close()
 ddlg.close()
 
+# 16) ④ 否则分支（用户 11-14）：结构复用 ③，跟着 ② 走，删条件不清空
+print("\n16) ④ 否则分支：跟着 ② 走、删条件不清空 ④、保存必须拦")
+esvc = FakeService(_TMP / "else-rules.json")
+edlg = A.AutomationDialog(esvc, theme.LIGHT)
+edlg.resize(860, 900)
+edlg.show()
+app.processEvents()
+check("② 没条件时 ④ 的两枚按钮都是灰的",
+      not edlg.add_else_btn.isEnabled() and not edlg.add_else_delay_btn.isEnabled())
+check("灰着时 tooltip 说明原因",
+      "永远不会触发" in edlg.add_else_btn.toolTip(), edlg.add_else_btn.toolTip())
+check("④ 空态先说「先加条件」", "先加一条状态条件" in edlg.else_hint.text(),
+      edlg.else_hint.text())
+
+edlg._add_condition(Condition(type="idle_minutes", op="ge", arg="10"))
+check("加一条条件后两枚按钮都恢复可用",
+      edlg.add_else_btn.isEnabled() and edlg.add_else_delay_btn.isEnabled())
+check("空态改成「可以留空」", "可以留空" in edlg.else_hint.text(),
+      edlg.else_hint.text())
+
+QTest.mouseClick(edlg.add_else_delay_btn, Qt.LeftButton)
+app.processEvents()
+check("④ 加出来一行延迟",
+      len(edlg._else_rows) == 1 and edlg._else_rows[0].value().type == "delay",
+      str([r.value().type for r in edlg._else_rows]))
+check("有行之后空态提示让位", edlg.else_hint.isHidden())
+erow = edlg._else_rows[0]
+check("④ 的延迟行和 ③ 是同一款行（同样的三枚图标按钮）",
+      erow.delete_btn.objectName() == "IconTool"
+      and A.ActionRow is type(erow))
+erow.value_edit.setText("")
+check("④ 的行内红字同样生效（点保存后报「要填延迟时间」）",
+      edlg._save(quiet=True) is False and erow.error_text() == "要填延迟时间",
+      erow.error_text())
+erow.value_edit.setText("500")
+check("填完值后没有行内红字", erow.error_text() == "", erow.error_text())
+edlg.close()
+
+# 落盘一条「有条件 + 有 ④」的规则，重开后检查两段编号互不干扰
+else_rule = Rule(
+    id="else1", name="否则落盘", triggers=trig("Ctrl+Alt+F7"),
+    conditions=[Condition("idle_minutes", "ge", "10")],
+    actions=[evt_action("主一"), evt_action("主二")],
+    else_actions=[speak_action("还没到点"), Action("delay", ms=500)],
+)
+check("有条件的规则带 ④ 能通过校验", validate_rule(else_rule) == [],
+      str(validate_rule(else_rule)))
+check("④ 落盘成一个 else_actions 键",
+      len(else_rule.to_dict().get("else_actions") or []) == 2)
+check("没有 ④ 的规则不写这个键",
+      "else_actions" not in Rule(id="n1", name="x").to_dict())
+
+esvc.rules.add(else_rule)
+edlg2 = A.AutomationDialog(esvc, theme.LIGHT, "else1")
+edlg2.resize(860, 900)
+edlg2.show()
+app.processEvents()
+check("重开后 ④ 的动作一条不少", len(edlg2._else_rows) == 2)
+check("重开后 ④ 的动作顺序也对",
+      [r.value().action or r.value().type for r in edlg2._else_rows]
+      == ["execute-text-directive", "delay"],
+      str([r.value().action or r.value().type for r in edlg2._else_rows]))
+check("③ 与 ④ 的序号各自从 1 开始",
+      [r.index_label.text() for r in edlg2._action_rows] == ["1.", "2."]
+      and [r.index_label.text() for r in edlg2._else_rows] == ["1.", "2."],
+      f"{[r.index_label.text() for r in edlg2._action_rows]} / "
+      f"{[r.index_label.text() for r in edlg2._else_rows]}")
+edlg2._move_else_action(edlg2._else_rows[1], -1)
+check("④ 里上移只在自己那段内换位",
+      [r.value().action or r.value().type for r in edlg2._else_rows]
+      == ["delay", "execute-text-directive"],
+      str([r.value().action or r.value().type for r in edlg2._else_rows]))
+check("④ 上移不影响 ③ 的顺序",
+      [r.value().args.get("virtual-param") for r in edlg2._action_rows] == ["主一", "主二"],
+      str([r.value().args.get("virtual-param") for r in edlg2._action_rows]))
+
+# 删光 ② 的条件：④ 的动作**留着**，但按钮变灰、保存被拦
+edlg2._remove_condition(edlg2._cond_rows[0])
+check("删光条件后 ④ 的动作不清空", len(edlg2._else_rows) == 2)
+check("删光条件后 ④ 的两枚按钮变灰",
+      not edlg2.add_else_btn.isEnabled()
+      and not edlg2.add_else_delay_btn.isEnabled())
+check("删光条件后不能保存", edlg2._save(quiet=True) is False)
+check("错误条说清两条出路",
+      "要么给它加一条条件，要么清空这一段" in edlg2.error_label.text(),
+      edlg2.error_label.text())
+while edlg2._else_rows:
+    edlg2._remove_else_action(edlg2._else_rows[0])
+check("清空 ④ 后同一条规则就能存", edlg2._save(quiet=True) is True,
+      edlg2.error_label.text())
+check("清空后落盘也不再写 else_actions 键",
+      "else_actions" not in (esvc.rules.get("else1") or Rule(id="x")).to_dict())
+edlg2.close()
 print(f"\n合计 {N} 项，失败 {len(FAILS)} 项")
 for line in FAILS:
     print("  !! " + line)

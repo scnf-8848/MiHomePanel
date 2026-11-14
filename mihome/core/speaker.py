@@ -29,6 +29,8 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any
 
+from . import miot_action
+
 #: 音箱服务的 URN 名（``urn:miot-spec-v2:service:...:intelligent-speaker:...`` 的第 4 段）
 SERVICE = "intelligent-speaker"
 #: 执行文本指令（米家 App 里叫「执行文本指令」）
@@ -91,30 +93,10 @@ class Cleaned:
 def _find_action(spec: Any, name: str) -> Any:
     """在规格里按**名字**找 action。
 
-    先只看 ``intelligent-speaker`` 服务；那儿没有（固件改了服务名）再全服务搜。
-    不按 siid/aiid 找——那正是本项目踩过的坑（按型号拼版本会得出"不支持"的错误结论）。
+    实现已收敛到 ``core/miot_action.py``：这里只补上"优先看
+    ``intelligent-speaker`` 服务"这一条提示（固件改名时它会退到全服务搜）。
     """
-    if spec is None:
-        return None
-    services = getattr(spec, "services", ()) or ()
-    ordered = [s for s in services if s.name == SERVICE]
-    ordered += [s for s in services if s.name != SERVICE]
-    for svc in ordered:
-        for act in getattr(svc, "actions", ()) or ():
-            if act.name == name:
-                return act
-    return None
-
-
-def _arg_names(spec: Any, act: Any) -> tuple[str, ...]:
-    """把 ``in_piids`` 翻成入参名字。取不到名字的槽留空串，保持位置。"""
-    by_piid: dict[int, str] = {}
-    for svc in getattr(spec, "services", ()) or ():
-        if getattr(svc, "siid", None) != getattr(act, "siid", None):
-            continue
-        for prop in svc.properties:
-            by_piid[prop.piid] = prop.name
-    return tuple(by_piid.get(piid, "") for piid in act.in_piids)
+    return miot_action.find_action(spec, name, SERVICE)
 
 
 def target_for(
@@ -136,7 +118,7 @@ def target_for(
         model=model,
         siid=int(act.siid),
         aiid=int(act.aiid),
-        args=_arg_names(spec, act),
+        args=miot_action.arg_names(spec, act),
         online=bool(online),
         room=room,
     )
@@ -197,20 +179,14 @@ def directive(target: Target, text: str, silent: bool = False) -> list[Any]:
     """拼 ``execute-text-directive`` 的实参。
 
     按 ``args`` 里每个入参的名字取值，所以 ``in_piids`` 换个顺序也不会把"静默"
-    塞进"文本"里。名字全认不出时退回米家的实际顺序 ``[文本, 是否静默]``。
+    塞进"文本"里。名字认不出时退回米家的实际顺序 ``[文本, 是否静默]``——见
+    ``core/miot_action.payload``。
     """
-    values = []
-    for name in target.args:
-        if name == ARG_TEXT:
-            values.append(text)
-        elif name == ARG_SILENT:
-            values.append(bool(silent))
-        else:
-            # 有认不出的入参：整条退回米家的实际顺序，别猜着往某个槽里塞
-            return [text, bool(silent)]
-    if not values:
-        return [text, bool(silent)]
-    return values
+    return miot_action.payload(
+        target.args,
+        {ARG_TEXT: text, ARG_SILENT: bool(silent)},
+        [text, bool(silent)],
+    )
 
 
 # ---------------------------------------------------------------------------
