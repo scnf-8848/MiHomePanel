@@ -1,0 +1,1193 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+"""自绘窗口外壳：标题栏 + 无边框窗口的边缘缩放。
+
+为什么不用系统标题栏：Windows 原生标题栏是一块纯白或纯灰的方块，和这套"暖灰底 +
+大圆角卡片"的界面拼在一起像两个程序。这里用 38px 的自绘条换掉它，颜色跟着主题走，
+右上角三个按钮的交互和系统保持一致（悬停变色、关闭悬停变红）。
+
+去掉系统边框之后，有两个系统行为必须自己补回来：
+
+* **拖动 / 双击最大化** —— 按下标题栏交给 ``startSystemMove()``，让系统去处理贴边
+  分屏；双击自己切最大化。
+* **边缘缩放** —— 在四边四角铺 8 个透明热区，按下时调 ``startSystemResize()``；
+  平台不支持时退回手动改 geometry。
+
+最大化不调 ``showMaximized()``：无边框窗口在 Windows 上被当成 WS_POPUP，最大化会连
+任务栏一起盖住。改成手动铺满 ``availableGeometry()``，并且记住还原尺寸。
+"""
+
+from __future__ import annotations
+
+import math
+import random
+
+from PySide6.QtCore import (
+    QEvent,
+    QObject,
+    QPoint,
+    QPointF,
+    QRect,
+    QRectF,
+    Qt,
+)
+from PySide6.QtGui import (
+    QColor,
+    QCursor,
+    QFont,
+    QFontMetrics,
+    QImage,
+    QPainter,
+    QPainterPath,
+    QPen,
+    QPixmap,
+    QPolygonF,
+    QRegion,
+)
+from PySide6.QtWidgets import QApplication, QDialog, QSizePolicy, QWidget
+
+from . import app_icon, theme
+from .widgets import draw_text
+
+BTN_W = 46
+BAR_H = 38
+EDGE = 5
+CORNER = 12
+#: 窗口圆角。
+WINDOW_RADIUS = theme.RADIUS_WINDOW
+
+#: 渐变背景的抖动：**随机取整**（stochastic rounding）。
+#:
+#: 为什么必须自己算像素：``QLinearGradient`` 光栅化到 8-bit，两 stop 拉满整屏时量化
+#: 台阶极宽（深色「夜色」#142438→#0B1521 的通道只差 9～23 级，斜跨 2380×1575 后
+#: **要 120 物理像素才跳一级**），那一级台阶在平滑底色上就是一条肉眼可见的斜分界线。
+#:
+#: 关键认知：**恒定密度的噪点去不掉台阶**。先叠白黑各半的 α3 噪点只是在平均色上加
+#: 一层纹理，台阶两侧的**均值**照旧差一级，低通（眼睛）之后界线还在——实测 993 px
+#: 平台段缩到 12 px，但每一段的均值仍然逐级跳。真正管用的是让**每个像素先加一个
+#: ±0.5 级（8-bit 一级）的均匀随机偏移再取整**：一个 1 级台阶就摊成宽度等于台阶
+#: 宽度的"细点带"，点密度随位置线性变化，低通之后是一条真正的连续斜坡。
+#:
+#: 做法：线性渐变在一维上只依赖投影 ``t = (x-cx)·dx + (y-cy)·dy``，所以整张图就是
+#: 一条色带。先按 t 预生成 ``_DITHER_CLASSES`` 套带随机偏移的一维像素串（每套偏移
+#: 不同，用来让相邻行/列的噪点互不相关），再按行（或按列）切片拼图——同一条慢轴
+#: 位置上，快轴每走一格 t 就前进同样的量，所以一行的字节就是色带的一段连续切片，
+#: 直接 ``bytes`` 拷贝即可，纯 Python 也能做到几十毫秒。只在尺寸/主题变化时算一次，
+#: 之后每帧只是一次 ``drawPixmap``。
+#:
+#: **任意角度都走这条路**（2026-11-17 推广）。以前只支持 45°/135° 那一族（那时
+#: ``t = x ± y`` 是整数），其它角度退回"渐变 + 噪点"、台阶照旧；现在按"哪个轴的
+#: 投影分量大"选行切片还是列切片：慢轴每前进一格，快轴起点平移 ``slow/fast`` 格
+#: （< 1 格），取整误差最多半格，折算成色值远小于 1 级——实测四角与两个轴向的
+#: 窗均值都在 0.1 级以内，见 ``scripts/verify_backdrop_dither.py``。
+_DITHER_CLASSES = 16
+_DITHER_SEED = 0x5EED
+
+#: 抖动背景图缓存：``(宽, 高, dpr, surface)`` → pixmap。留两张是为了 resize 前后
+#: 来回拖时不用每次都重算，又不能无限涨——一张 2380×1575 就是 15 MB。
+_backdrop_cache: dict[tuple, QPixmap] = {}
+_BACKDROP_CACHE_MAX = 2
+
+
+def _dithered_image(pw: int, ph: int, surface) -> QImage:
+    """把渐变换成一张已经抖动好的 8-bit 图（物理像素 1:1）。"""
+    stops = [QColor(c) for c in surface.stops]
+    last = len(stops) - 1
+    radians = math.radians(surface.angle)
+    dx, dy = math.cos(radians), math.sin(radians)
+    # 与 ``Surface.brush`` 同一套几何：渐变线斜跨矩形，起点/终点都压在边界上
+    cx, cy = pw / 2.0, ph / 2.0
+    half = (abs(pw * dx) + abs(ph * dy)) / 2.0
+    span = (2.0 * half) or 1.0
+
+    # 快轴 = 投影变化更大的那个轴（用它做"每格前进一格"的切片轴）。
+    # ``step`` 是快轴上每像素的归一化投影增量，``shift`` 是慢轴每格让快轴起点平移的量。
+    horizontal = abs(dx) >= abs(dy)
+    if horizontal:
+        fast, slow, n_fast, n_slow = dx, dy, pw, ph
+    else:
+        fast, slow, n_fast, n_slow = dy, dx, ph, pw
+    step = fast / span
+    shift = slow / span
+    # 左上角那个**像素中心**的投影（色带下标 0 就定在这里）。
+    # 少了它整条色带会整体偏移半个像素对角线的量——两个通角（45°/135°）上恰好抵消，
+    # 斜角与竖直/水平上却是实打实的色偏，所以必须显式算出来。
+    p00 = ((0.5 - cx) * dx + (0.5 - cy) * dy + half) / span
+
+    # 慢轴第 k 格对应的色带下标偏移（相对第 0 格）。|shift/step| ≤ 1，所以每格最多挪一格，
+    # 取整误差 ≤ 半格 ≈ 0.04 个色级——比 8-bit 的 1 级小一个数量级，可以忽略。
+    offsets = [round(k * shift / step) for k in range(n_slow)]
+    low = min(offsets)
+    n = max(offsets) - low + n_fast + 1
+
+    ideal = []
+    for i in range(n):
+        proj = p00 + (i + low) * step
+        proj = 0.0 if proj < 0.0 else (1.0 if proj > 1.0 else proj)
+        pos = proj * last
+        j = min(int(pos), last - 1) if last else 0
+        f = pos - j if last else 0.0
+        lo, hi = stops[j], stops[j + 1 if last else 0]
+        ideal.append((
+            lo.red() + (hi.red() - lo.red()) * f,
+            lo.green() + (hi.green() - lo.green()) * f,
+            lo.blue() + (hi.blue() - lo.blue()) * f,
+        ))
+
+    rng = random.Random(_DITHER_SEED)
+    templates: list[bytes] = []
+    for _ in range(_DITHER_CLASSES):
+        # ±0.5 级均匀偏移 = 随机取整：期望值等于理想值，1 级台阶被打散成密度渐变的细点
+        deltas = [rng.random() - 0.5 for _ in range(n)]
+        buf = bytearray(n * 4)
+        for i in range(n):
+            r, g, b = ideal[i]
+            d = deltas[i]
+            buf[i * 4] = 0 if b + d <= 0.0 else (255 if b + d >= 255.0 else int(b + d + 0.5))
+            buf[i * 4 + 1] = 0 if g + d <= 0.0 else (255 if g + d >= 255.0 else int(g + d + 0.5))
+            buf[i * 4 + 2] = 0 if r + d <= 0.0 else (255 if r + d >= 255.0 else int(r + d + 0.5))
+            buf[i * 4 + 3] = 255
+        templates.append(bytes(buf))
+
+    # 每条慢轴位置都是同一条色带的平移：直接切 bytes，比逐像素快两个数量级。
+    # 竖向（|dy| > |dx|）时一行只有一路色，切片必须按列写——bytearray 的扩展切片
+    # 一次只搬一个字节，所以四个通道各来一遍（C 层按步长拷，仍比逐像素快一个数量级）。
+    stride = pw * 4
+    data = bytearray(stride * ph)
+    if horizontal:
+        for y in range(ph):
+            off = (offsets[y] - low) * 4
+            data[y * stride:(y + 1) * stride] = (
+                templates[y % _DITHER_CLASSES][off:off + stride])
+    else:
+        for x in range(pw):
+            off = (offsets[x] - low) * 4
+            col = templates[x % _DITHER_CLASSES][off:off + ph * 4]
+            head = x * 4
+            for ch in range(4):
+                start = head + ch
+                data[start:start + ph * stride:stride] = col[ch::4]
+    img = QImage(bytes(data), pw, ph, stride, QImage.Format_ARGB32_Premultiplied)
+    return img.copy()
+
+
+def _backdrop_pixmap(pw: int, ph: int, dpr: float, surface) -> QPixmap:
+    """抖动背景图（带缓存）。同一尺寸重复调用直接命中。"""
+    key = (pw, ph, round(dpr, 2), surface)
+    hit = _backdrop_cache.get(key)
+    if hit is not None:
+        return hit
+    img = _dithered_image(pw, ph, surface)
+    img.setDevicePixelRatio(dpr)
+    pm = QPixmap.fromImage(img)
+    if len(_backdrop_cache) >= _BACKDROP_CACHE_MAX:
+        _backdrop_cache.pop(next(iter(_backdrop_cache)))
+    _backdrop_cache[key] = pm
+    return pm
+
+#: 浮窗外圈留白（像素）：窗口比可见面板大这么多，空白处铺阴影。
+#: 12 不够——``QGraphicsDropShadowEffect`` 对顶层窗口无效，阴影只能自己画，
+#: 而"软"的最小半径就是 16 上下，留 12 会把最外两圈裁掉（看着像描边不像阴影）。
+SHADOW_PAD = 24
+#: 阴影纵向偏移（光从上面来，影子略向下）。超过 ``SHADOW_PAD`` 的部分会被窗口边界裁掉。
+SHADOW_DY = 4
+
+
+def shadow_alpha(p: theme.Palette) -> float:
+    """浮窗的投影浓度（所有浮窗共用：弹窗 / 确认框 / 详情 / 独立摄像头窗）。
+
+    定值的第一版是 0.30 / 0.55，那是**配着主窗口压暗**用的：底色先整体压掉
+    12% / 24%，投影再叠一层，两层加起来才够"浮起来"。压暗归零（``DIM_ALPHA``）
+    之后，投影是唯一的深度信号，旧值在浅色白卡上会糊成一圈黑晕（实测贴边压暗
+    48 档），所以整组按"贴边压暗档位"重新定：
+
+    * 浅色 **0.18** —— 白卡（luma 252）贴边掉 **33 档**（约 13%）。超过 ~40 档
+      白卡开始发脏，低于 ~25 档又看不出纸片浮起；
+    * 深色 **0.44** —— 中深卡片（luma 50~58）贴边掉 **13~16 档**（约 26%）。
+      深色 alpha 给得比浅色大是**同一个方法**的结果：深底明度只有白卡的 1/5，
+      同样的 alpha 绝对差会小到看不见，按目标档位反解才需要更大的比例。
+
+    两档都是"先定目标档位、再反解 alpha"，不是拍两个数字。想再调，动这里就行
+    （实测数据见 ``verify_dim_click.py`` 的第 9 节）。
+    """
+    return 0.44 if p.is_dark else 0.18
+
+
+def floating_size(w: int, h: int) -> tuple[int, int]:
+    """内容尺寸 → 浮窗窗口尺寸（两边各加一圈阴影留白）。
+
+    各窗口 ``resize()`` 写的都是**内容**尺寸，不改这个换算的话，改成浮窗后
+    内容会凭空少 48px，设置页那种按最小尺寸卡死的页会当场挤掉一行。
+    """
+    return w + 2 * SHADOW_PAD, h + 2 * SHADOW_PAD
+
+
+def rounded_path(rect: QRectF, radius: float, corners: str = "tl tr br bl") -> QPainterPath:
+    """圆角矩形路径，可以只圆其中几个角（``"tl"``/``"tr"``/``"br"``/``"bl"``）。
+
+    窗口外框必须**抗锯齿**地画出来：``setMask`` 是 1 bit 的，圆角在 21 物理像素
+    （12dp @1.75）上只能近似成台阶；卡片圆角用的是 ``drawRoundedRect``（抗锯齿），
+    两者放在一起，窗口的角明显更"毛"。所以这里返回路径，由调用方 ``fillPath``。
+    """
+    x, y, w, h = rect.x(), rect.y(), rect.width(), rect.height()
+    r = max(0.0, min(radius, w / 2, h / 2))
+    tl, tr = "tl" in corners, "tr" in corners
+    br, bl = "br" in corners, "bl" in corners
+
+    path = QPainterPath()
+    path.moveTo(x + (r if tl else 0), y)
+    path.lineTo(x + w - (r if tr else 0), y)
+    if tr:
+        path.quadTo(x + w, y, x + w, y + r)
+    path.lineTo(x + w, y + h - (r if br else 0))
+    if br:
+        path.quadTo(x + w, y + h, x + w - r, y + h)
+    path.lineTo(x + (r if bl else 0), y + h)
+    if bl:
+        path.quadTo(x, y + h, x, y + h - r)
+    path.lineTo(x, y + (r if tl else 0))
+    if tl:
+        path.quadTo(x, y, x + r, y)
+    path.closeSubpath()
+    return path
+
+
+def bar_bg(p: theme.Palette) -> str:
+    """主窗口标题栏底色（公式在 theme 里，渐变档与纯色档方向相反）。
+
+    纯色档仍是"比窗口底色亮/暗一点点"的浅带；渐变档改成压深一档（见
+    :func:`theme.bar_bg`），这样顶栏那排白色胶囊才有落差。
+    """
+    return theme.bar_bg(p)
+
+
+# 子窗口（详情 / 设置 / 登录）跟主窗口原本是同底色 + 同标题栏，叠在一起就是两块
+# 一样的灰糊成一片，看不出谁在前。这里把子窗口整体挪开一档：
+#   surface —— 正文底色，浅色往深挪、深色往浅挪，方向都朝着"浮起来"；
+#   bar     —— 标题栏再挪一档，形成一条明显的 header 带；
+#   border  —— 一圈描边，无边框窗口没有系统边框，这一圈就是"这是另一个窗口"的信号。
+def surface_bg(p: theme.Palette) -> str:
+    # 公式在 theme 里（``theme.surface_bg``）——分类栏 rail_bg 要相对它算，
+    # 两处各写一遍的话，以后改一档明度必然会漏掉一处。
+    return theme.surface_bg(p)
+
+
+def dialog_bar_bg(p: theme.Palette) -> str:
+    return theme.blend(surface_bg(p), "#FFFFFF" if p.is_dark else "#000000", 0.05)
+
+
+def surface_border(p: theme.Palette) -> str:
+    # 深色下 1px 的中灰几乎不可见，比例要放大一点才看得出"这里有一圈框"
+    return theme.blend(surface_bg(p), p.text, 0.15 if p.is_dark else 0.16)
+
+
+class _GlyphButton:
+    """标题栏按钮的命中矩形，纯粹是数据。"""
+
+    def __init__(self, name: str, rect: QRect) -> None:
+        self.name = name
+        self.rect = rect
+
+
+class TitleBar(QWidget):
+    """自绘标题栏。``frame`` 用来做最大化/还原，对话框传 None 只保留关闭。"""
+
+    def __init__(
+        self,
+        title: str,
+        palette: theme.Palette,
+        *,
+        subtitle: str = "",
+        buttons: tuple[str, ...] = ("min", "max", "close"),
+        frame: WindowFrame | None = None,
+        height: int = BAR_H,
+        variant: str = "window",
+        radius: int | None = None,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._p = palette
+        self._title = title
+        self._sub = subtitle
+        self._buttons = tuple(buttons)
+        self._frame = frame
+        self._variant = variant
+        # 顶部两角要跟着窗口的圆弧走。浮窗（18）和主窗口（12）不是同一个半径，
+        # 写死常量会让标题栏把面板的弧盖掉——只有浮窗出现后才看得见这个错。
+        self._radius = (radius if radius is not None
+                        else (frame.radius if frame is not None else WINDOW_RADIUS))
+        self._hover = -1
+        self._down = -1
+        self._drag_origin: QPoint | None = None
+        self.setFixedHeight(height)
+        self.setMouseTracking(True)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.setObjectName("TitleBar")
+
+    # -- 外部接口 --------------------------------------------------------
+    def set_palette(self, palette: theme.Palette) -> None:
+        self._p = palette
+        self.update()
+
+    def set_title(self, title: str) -> None:
+        if title != self._title:
+            self._title = title
+            self.update()
+
+    def set_subtitle(self, subtitle: str) -> None:
+        if subtitle != self._sub:
+            self._sub = subtitle
+            self.update()
+
+    # -- 绘制 ------------------------------------------------------------
+    def _button_list(self) -> list[_GlyphButton]:
+        out: list[_GlyphButton] = []
+        x = self.width()
+        for name in reversed(self._buttons):
+            x -= BTN_W
+            out.append(_GlyphButton(name, QRect(x, 0, BTN_W, self.height())))
+        return out
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        pal = self._p
+        is_dialog = self._variant == "dialog"
+        # 顶部两个角必须自己圆：窗口背景是抗锯齿画的，标题栏这里如果整块铺色，
+        # 方角会把窗口的圆弧盖掉（关闭按钮悬停变红时最明显）。用抗锯齿裁剪，
+        # 悬停色块也就跟着被裁圆了。
+        p.setClipPath(rounded_path(QRectF(self.rect()), self._radius, "tl tr"))
+        # 主窗口标题栏跟着卡片一起透：它横跨整窗顶部，做实了就是一条白带压在
+        # 渐变最亮的一端，用户会看成"背景没有渐变"。子窗口保持不透明——它叠在
+        # 主窗口上，透出底下的卡片墙只会糊成一片。
+        if is_dialog:
+            p.fillRect(self.rect(), QColor(dialog_bar_bg(pal)))
+        else:
+            p.fillRect(self.rect(), theme.alpha(bar_bg(pal), pal.card_alpha))
+
+        if is_dialog and self.window().isActiveWindow():
+            # 焦点在哪一层：左侧一条主色窄边，失焦自动消失
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(pal.accent))
+            p.drawRect(QRect(0, 0, 3, self.height()))
+
+        logo = QRect(16, (self.height() - 20) // 2, 20, 20)
+        self._paint_logo(p, logo, pal.accent)
+
+        text_x = logo.right() + 10
+        avail = self.width() - text_x - BTN_W * len(self._buttons) - 16
+        # 副标题跟在标题后面（不是右对齐）：它是对标题的补充，不是窗口状态
+        title_font = QFont()
+        title_font.setPixelSize(13)
+        title_font.setWeight(QFont.DemiBold)
+        title_w = min(QFontMetrics(title_font).horizontalAdvance(self._title), avail)
+        draw_text(p, QRect(text_x, 0, title_w, self.height()), self._title,
+                  size=13, color=pal.text, weight=QFont.DemiBold, elide=False)
+        if self._sub:
+            sub_x = text_x + title_w + 10
+            draw_text(p, QRect(sub_x, 0, max(0, avail - (sub_x - text_x)), self.height()),
+                      self._sub, size=12, color=pal.text_mute)
+
+        for i, btn in enumerate(self._button_list()):
+            self._paint_button(p, btn, pal, self._hover == i, self._down == i)
+
+        # 一条极淡的下边线，把标题栏和内容分开。
+        # 主窗口 + 渐变档不画：顶栏（``HeaderBand``）铺的是同一支 ``bar_bg``，两者本来
+        # 就是一条完整的窗框带，中间夹一条"从背景推的单一颜色"只会留下接缝。
+        # 纯色档和子窗口照旧——那里标题栏确实需要一条界线。
+        if is_dialog or not pal.surface.is_gradient():
+            p.setPen(QPen(QColor(pal.border), 1))
+            p.drawLine(0, self.height() - 1, self.width(), self.height() - 1)
+        p.end()
+
+    @staticmethod
+    def _paint_logo(p: QPainter, rect: QRect, accent: str) -> None:
+        """标题栏左上角那枚标记：**直接用程序图标** ``assets/app.ico``。
+
+        以前这里是代码画的"主色方块 + 白色小房子"，跟任务栏、托盘各是各的图形，
+        同一个程序三处三个样（2026-11-17 用户反馈"标题栏还是旧图标"）。现在三处
+        共用一份 ICO。
+
+        取图用 ``icon.pixmap(rect.size(), dpr)`` 而不是 ``scaled()``：ICO 里 16 / 24 /
+        32 三档的**几何是分别画的**（16 那档砍掉屏幕只留房子），让 QIcon 自己按
+        设备像素挑档，比拿一张大图缩放稳。20 逻辑像素在 175% 缩放下是 35 物理像素，
+        Qt 会挑 48 那档缩下来——细边框还留得住，不会糊成一枚色块。
+
+        找不到 ICO 时退回旧画法：标题栏空一块比图形不对更难看。
+        """
+        icon = app_icon.load()
+        if not icon.isNull():
+            dpr = p.device().devicePixelRatioF()
+            p.setRenderHint(QPainter.SmoothPixmapTransform, True)
+            p.drawPixmap(rect, icon.pixmap(rect.size(), dpr))
+            return
+
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(accent))
+        p.drawRoundedRect(rect, 6, 6)
+        # 一个极简的"房子"：屋顶三角 + 屋身
+        cx = rect.center().x()
+        roof = QPolygonF([
+            QPointF(cx, rect.top() + 4.0),
+            QPointF(rect.right() - 4.0, rect.top() + 9.0),
+            QPointF(rect.left() + 4.0, rect.top() + 9.0),
+        ])
+        p.setBrush(QColor("#FFFFFF"))
+        p.drawPolygon(roof)
+        p.drawRoundedRect(
+            QRect(rect.left() + 6, rect.top() + 9, rect.width() - 12, rect.height() - 13), 1.5, 1.5
+        )
+
+    def _paint_button(self, p: QPainter, btn: _GlyphButton, pal: theme.Palette,
+                      hover: bool, down: bool) -> None:
+        name = btn.name
+        if hover:
+            color = "#E5484D" if name == "close" else theme.blend(bar_bg(pal), pal.text, 0.09)
+            if down:
+                color = theme.blend(color, "#000000", 0.10)
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(color))
+            p.drawRect(btn.rect)
+
+        glyph = "#FFFFFF" if (hover and name == "close") else pal.text_soft
+        p.setPen(QPen(QColor(glyph), 1.2, Qt.SolidLine, Qt.RoundCap))
+        p.setBrush(Qt.NoBrush)
+        c = btn.rect.center()
+        s = 5
+        if name == "min":
+            p.drawLine(c.x() - s, c.y() + s, c.x() + s, c.y() + s)
+        elif name == "max":
+            if self._frame is not None and self._frame.is_maximized:
+                p.drawRect(QRect(c.x() - s + 1, c.y() - s + 1, s * 2 - 2, s * 2 - 2))
+                p.drawRect(QRect(c.x() - s, c.y() - s, s * 2 - 3, s * 2 - 3))
+            else:
+                p.drawRect(QRect(c.x() - s, c.y() - s, s * 2, s * 2))
+        elif name == "close":
+            p.drawLine(c.x() - s, c.y() - s, c.x() + s, c.y() + s)
+            p.drawLine(c.x() + s, c.y() - s, c.x() - s, c.y() + s)
+
+    # -- 交互 ------------------------------------------------------------
+    def _hit(self, pos: QPoint) -> int:
+        for i, btn in enumerate(self._button_list()):
+            if btn.rect.contains(pos):
+                return i
+        return -1
+
+    def mouseMoveEvent(self, event) -> None:  # noqa: N802
+        if self._drag_origin is not None and (event.buttons() & Qt.LeftButton):
+            self.window().move(QCursor.pos() - self._drag_origin)
+            return
+        idx = self._hit(event.position().toPoint())
+        if idx != self._hover:
+            self._hover = idx
+            self.setCursor(Qt.ArrowCursor)
+            self.update()
+
+    def leaveEvent(self, event) -> None:  # noqa: N802
+        if self._hover != -1:
+            self._hover = -1
+            self.update()
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802
+        if event.button() != Qt.LeftButton:
+            return
+        idx = self._hit(event.position().toPoint())
+        if idx >= 0:
+            self._down = idx
+            self.update()
+            return
+        # 空白处 = 拖动窗口。最大化状态下先还原，让鼠标停在原来的相对位置
+        win = self.window()
+        if self._frame is not None and self._frame.is_maximized:
+            self._frame.restore_under_cursor(QCursor.pos())
+        handle = win.windowHandle()
+        if handle is not None and handle.startSystemMove():
+            return
+        self._drag_origin = QCursor.pos() - win.frameGeometry().topLeft()
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802
+        self._drag_origin = None
+        if event.button() != Qt.LeftButton:
+            return
+        idx = self._hit(event.position().toPoint())
+        pressed, self._down = self._down, -1
+        self.update()
+        if pressed >= 0 and pressed == idx:
+            self._activate(self._button_list()[idx].name)
+
+    def mouseDoubleClickEvent(self, event) -> None:  # noqa: N802
+        if event.button() != Qt.LeftButton or self._hit(event.position().toPoint()) >= 0:
+            return
+        if self._frame is not None:
+            self._frame.toggle_maximize()
+
+    def _activate(self, name: str) -> None:
+        win = self.window()
+        if name == "min":
+            win.showMinimized()
+        elif name == "max":
+            if self._frame is not None:
+                self._frame.toggle_maximize()
+            else:
+                win.showNormal() if win.isMaximized() else win.showMaximized()
+        elif name == "close":
+            win.close()
+
+
+class _ResizeEdge(QWidget):
+    """窗口边缘的透明热区。系统支持就走系统缩放，否则手动改 geometry。"""
+
+    def __init__(self, parent: QWidget, edges: Qt.Edges, cursor: Qt.CursorShape) -> None:
+        super().__init__(parent)
+        self._edges = edges
+        self._manual = False
+        self._press = QPoint()
+        self._geo = QRect()
+        self.setCursor(cursor)
+        self.setAttribute(Qt.WA_NoSystemBackground, True)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802
+        if event.button() != Qt.LeftButton:
+            return
+        win = self.window()
+        handle = win.windowHandle()
+        if handle is not None and handle.startSystemResize(self._edges):
+            self._manual = False
+            return
+        self._manual = True
+        self._press = event.globalPosition().toPoint()
+        self._geo = win.geometry()
+
+    def mouseMoveEvent(self, event) -> None:  # noqa: N802
+        if not self._manual:
+            return
+        delta = event.globalPosition().toPoint() - self._press
+        geo = QRect(self._geo)
+        e = self._edges
+        if e & Qt.LeftEdge:
+            geo.setLeft(min(geo.left() + delta.x(), geo.right() - 640))
+        if e & Qt.RightEdge:
+            geo.setRight(max(geo.right() + delta.x(), geo.left() + 640))
+        if e & Qt.TopEdge:
+            geo.setTop(min(geo.top() + delta.y(), geo.bottom() - 420))
+        if e & Qt.BottomEdge:
+            geo.setBottom(max(geo.bottom() + delta.y(), geo.top() + 420))
+        self.window().setGeometry(geo)
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802
+        self._manual = False
+
+
+class _FrameBorder(QWidget):
+    """最上面一层 1px 描边。
+
+    子控件（标题栏、列表）会把窗口边缘盖住，父窗口先画、子控件后画，所以描边不能
+    跟填充一起画——单独放一个不吃鼠标的透明覆盖层，永远在最上面。
+    """
+
+    def __init__(self, parent: QWidget, frame: WindowFrame) -> None:
+        super().__init__(parent)
+        self._frame = frame
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.setAttribute(Qt.WA_NoSystemBackground, True)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        f = self._frame
+        if f.is_maximized or not f.border_color:
+            return
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        # 0.5 内缩：1px 的描边正好压在第一像素列上，不会糊成 2px
+        panel = QRectF(f.panel_rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        path = rounded_path(panel, f.radius)
+        p.setPen(QPen(QColor(f.border_color()), 1))
+        p.setBrush(Qt.NoBrush)
+        p.drawPath(path)
+        p.end()
+
+
+class WindowFrame(QObject):
+    """给任意顶层窗口装上"无边框 + 圆角 + 边缘缩放 + 手动最大化"。
+
+    圆角用 ``WA_TranslucentBackground`` + 抗锯齿路径画，**不再用 setMask**：
+    mask 只有 1 bit，12dp 的圆弧在 1.75 倍屏上就是 21 像素的台阶；卡片圆角是
+    ``drawRoundedRect`` 抗锯齿画的，两者放一起，窗口的角会明显更毛。
+    代价是窗口矩形的四角对鼠标仍然"存在"（透明但可点），12px 可以接受。
+
+    ``shadow=SHADOW_PAD`` 打开"浮窗"形态：窗口四边各长出这么多透明留白，用来铺
+    手绘阴影；可见面板缩在中间，内容必须放进 :attr:`body`（尺寸自动跟着面板走）。
+    为什么要在窗口里画而不是用 ``QGraphicsDropShadowEffect``：图形效果**对顶层
+    窗口无效**，阴影必须落在窗口矩形里才看得见，所以窗口自己得先够大。
+    """
+
+    def __init__(
+        self,
+        window: QWidget,
+        *,
+        resizable: bool = True,
+        radius: int = WINDOW_RADIUS,
+        fill=None,
+        border=None,
+        shadow: int = 0,
+        shadow_alpha: float = 0.24,
+        backdrop=None,
+    ) -> None:
+        super().__init__(window)
+        self.win = window
+        self.radius = radius
+        self._resizable = resizable
+        self._fill = fill          # () -> "#rrggbb"：窗口底色（纯色兜底）
+        self._border = border      # () -> "#rrggbb"：1px 描边色
+        #: 主窗口的整块背景面（``theme.Surface``，纯色或渐变）。给了它就走它，
+        #: ``fill`` 只当兜底；弹窗不需要渐变，仍只传 ``fill``。
+        self._backdrop = backdrop
+        self._overlay: _FrameBorder | None = None
+        self._max = False
+        self._normal: QRect | None = None
+        self._edges: list[_ResizeEdge] = []
+        self._pad = max(0, int(shadow))
+        self._shadow_alpha = float(shadow_alpha)
+        self._shadow_img: QImage | None = None
+        self._shadow_key: tuple[float, ...] | None = None
+        #: 内容容器。``shadow > 0`` 时才有值，各窗口的根布局挂在这上面。
+        self.body: QWidget | None = None
+
+        window.setWindowFlags(window.windowFlags() | Qt.FramelessWindowHint)
+        if fill is not None:
+            # 有了这一条，四角才是"真的透明"，抗锯齿边缘才能压到桌面上
+            window.setAttribute(Qt.WA_TranslucentBackground, True)
+            if border is not None:
+                self._overlay = _FrameBorder(window, self)
+        if self._pad > 0:
+            # 普通子控件绘制前不会被 Qt 铺底色（autoFillBackground 默认关），
+            # 但显式关掉系统背景更稳：面板底色由窗口自绘画在它下面。
+            self.body = QWidget(window)
+            self.body.setAttribute(Qt.WA_NoSystemBackground, True)
+            self.body.setObjectName("WindowBody")
+        window.installEventFilter(self)
+        # Python 侧引用跟着被监控的窗口走。只有 ``self.win`` 不够：调用方若没有
+        # 长期持有 frame（对话框常是局部变量），wrapper 被回收而 C++ 对象还挂在
+        # 窗口名下时，Qt 仍会回调 ``eventFilter``，访问 ``self.win`` 就是
+        # ``AttributeError: 'WindowFrame' object has no attribute 'win'``。
+        window._window_frame = self
+
+    @property
+    def is_maximized(self) -> bool:
+        return self._max
+
+    def fill_color(self) -> str:
+        return self._fill() if self._fill is not None else ""
+
+    def background_brush(self, rect: QRectF):
+        """当前背景刷子：主窗口可能是渐变，其余窗口仍是纯色。"""
+        if self._backdrop is not None:
+            return self._backdrop().brush(rect)
+        return QColor(self.fill_color())
+
+    def border_color(self) -> str:
+        return self._border() if self._border is not None else ""
+
+    # -- 几何 ------------------------------------------------------------
+    @property
+    def shadow_pad(self) -> int:
+        """浮窗外圈留白。0 = 老形态（无阴影，面板铺满整个窗口）。"""
+        return self._pad
+
+    def panel_rect(self) -> QRect:
+        """可见面板在窗口内的矩形（不含阴影留白）。"""
+        if self._pad <= 0:
+            return self.win.rect()
+        return QRect(self.win.rect()).adjusted(self._pad, self._pad,
+                                               -self._pad, -self._pad)
+
+    def panel_geometry(self) -> QRect:
+        """可见面板的**全局**矩形。点击层挖洞要用它：阴影不是窗口的一部分。
+
+        用 ``mapToGlobal`` 而不是 ``frameGeometry().topLeft()``：无边框窗口在高
+        dpi 下两者可能差 1px，点击层和窗口自己必须用同一套换算。
+        """
+        rect = self.panel_rect()
+        return QRect(self.win.mapToGlobal(rect.topLeft()), rect.size())
+
+    def set_shadow_alpha(self, alpha: float) -> None:
+        """切主题时调（深色要更黑）。只丢缓存，不重建窗口。"""
+        if abs(alpha - self._shadow_alpha) < 1e-3:
+            return
+        self._shadow_alpha = float(alpha)
+        self._shadow_key = None
+        self.win.update()
+
+    def eventFilter(self, obj, event) -> bool:  # noqa: N802
+        # ``self.win`` 可能已经不在了：frame 与 window 是**双向引用**
+        # （``self.win`` / ``window._window_frame``），环只能靠 gc 收；gc 清对象时
+        # ``__dict__`` 先没了，而 C++ 那个 QObject 还挂在 window 上，Qt 照样把事件
+        # 送进来 —— 一次 ``AttributeError`` 会被 PySide 包成
+        # ``SystemError: ... returned NULL without setting an exception``，
+        # 出现在完全无关的调用栈上（2026-11-16：加到背景抖动后才踩到，
+        # 之前只是事件赶上趟了没撞上）。此时只能放手。
+        win = getattr(self, "win", None)
+        if win is None:
+            return False
+        if obj is win:
+            kind = event.type()
+            if kind == QEvent.Paint:
+                # 事件过滤器先于窗口自己的 paintEvent 跑，正好当"背景层"用
+                self._paint_fill()
+            elif kind == QEvent.Show:
+                self._ensure_edges()
+                self._place()
+            elif kind == QEvent.Resize:
+                self._place()
+            elif kind in (QEvent.ActivationChange, QEvent.WindowActivate, QEvent.WindowDeactivate):
+                # 标题栏靠 isActiveWindow() 决定画不画焦点条，状态变了要重绘
+                self.win.update()
+        return False
+
+    # -- 背景 ------------------------------------------------------------
+    def _paint_fill(self) -> None:
+        if self._fill is None and self._backdrop is None:
+            return
+        p = QPainter(self.win)
+        p.setRenderHint(QPainter.Antialiasing)
+        rect = QRectF(self.win.rect())
+        surface = self._backdrop() if self._backdrop is not None else None
+        # 渐变走"整张抖动图"；纯色没有台阶，直接填色最省
+        dither = surface is not None and surface.is_gradient()
+        if self._pad > 0 and not self._max:
+            rect = QRectF(self.panel_rect())
+        shot = self._backdrop_shot(surface, rect) if dither else None
+        if self._max:
+            # 最大化时不能留圆角，否则四角会漏出桌面
+            if shot is not None:
+                p.drawPixmap(rect.topLeft(), shot)
+            else:
+                p.fillRect(rect, self.background_brush(rect))
+        else:
+            if self._pad > 0:
+                self._paint_shadow(p)
+            # 路径落在整数像素边界上：直边是满覆盖（不会糊成半透明的一圈），
+            # 只有圆弧处的边缘像素才带 alpha
+            path = rounded_path(rect, self.radius)
+            if shot is not None:
+                # 抖动图是物理像素 1:1 的，裁剪只能靠 path：圆角处要抗锯齿
+                p.setRenderHint(QPainter.SmoothPixmapTransform, False)
+                p.setClipPath(path)
+                p.drawPixmap(rect.topLeft(), shot)
+                p.setClipping(False)
+            else:
+                p.fillPath(path, self.background_brush(rect))
+        p.end()
+
+    def _backdrop_shot(self, surface, rect: QRectF) -> QPixmap | None:
+        """抖动好的渐变背景图；纯色背景返回 None（没有台阶，直接填色最省）。"""
+        if surface is None or not surface.is_gradient():
+            return None
+        dpr = self.win.devicePixelRatioF() or 1.0
+        # 用 ceil 而不是 round：宁可多出不到 1 个物理像素（被窗口/圆角裁掉），
+        # 也不能少量一列，否则右/下边会漏出一条没画到的底色
+        pw = max(1, math.ceil(rect.width() * dpr))
+        ph = max(1, math.ceil(rect.height() * dpr))
+        return _backdrop_pixmap(pw, ph, dpr, surface)
+
+    def _paint_shadow(self, p: QPainter) -> None:
+        key = (self.win.width(), self.win.height(), self.win.devicePixelRatioF() or 1.0,
+               float(self.radius), self._shadow_alpha, float(self._pad))
+        if self._shadow_key != key or self._shadow_img is None:
+            self._shadow_img = self._build_shadow(key)
+            self._shadow_key = key
+        # 阴影图是半分辨率生成的，放大时要平滑，否则圆弧外沿会看到方块
+        p.setRenderHint(QPainter.SmoothPixmapTransform)
+        p.drawImage(QRectF(self.win.rect()), self._shadow_img)
+
+    def _build_shadow(self, key: tuple[float, ...]) -> QImage:
+        """把阴影画进一张透明位图并缓存。
+
+        顶层窗口用不了 ``QGraphicsDropShadowEffect``，手绘高斯又太重，这里用
+        **多层扩张**近似：从最外圈往里叠 ``pad`` 层圆角矩形，每层 alpha 很小，
+        越靠里累积越浓。窗口不动时这张图一直复用，每帧只是一次 ``drawImage``。
+        """
+        w, h, dpr, radius, alpha, pad = key
+        # 半分辨率：阴影本来就是糊的，24 层 fillPath 的耗时与像素数成正比，
+        # 砍到 1/4 后 resize 那一下从 ~3ms 降到 ~1ms，放大看不出差别。
+        # 图不带 dpr，绘制端显式给目标矩形（见 ``_paint_shadow``）。
+        ratio = max(0.25, dpr * 0.5)
+        img = QImage(max(1, int(round(w * ratio))), max(1, int(round(h * ratio))),
+                     QImage.Format_ARGB32_Premultiplied)
+        img.fill(Qt.transparent)
+        p = QPainter(img)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.scale(ratio, ratio)
+
+        layers = max(1, int(pad))
+        peak = max(0.0, min(1.0, alpha)) * 255.0
+        panel = QRectF(self.panel_rect()).translated(0.0, float(SHADOW_DY))
+        # 每层 alpha 要按**权重归一**，不能直接除以层数：贴边处被所有层覆盖，
+        # 那里的累计值才是 peak。除层数会得到 peak/2 左右（曲线平均值），阴影淡到
+        # 看不见——第一版就是这么翻的。
+        weights = [((1.0 - (i / layers) ** 2) ** 1.6) for i in range(layers, 0, -1)]
+        total = sum(weights) or 1.0
+        for i, w in zip(range(layers, 0, -1), weights):
+            a = int(round(peak * w / total))
+            if a <= 0:
+                continue
+            p.fillPath(rounded_path(panel.adjusted(-i, -i, i, i), radius + i),
+                       QColor(0, 0, 0, a))
+        p.end()
+        return img
+
+    # -- 最大化 ----------------------------------------------------------
+    def toggle_maximize(self) -> None:
+        self.set_maximized(not self._max)
+
+    def set_maximized(self, on: bool) -> None:
+        if on == self._max:
+            return
+        if on:
+            self._normal = self.win.geometry()
+            screen = self.win.screen() or QApplication.primaryScreen()
+            if screen is not None:
+                self.win.setGeometry(screen.availableGeometry())
+            self._max = True
+        else:
+            if self._normal is not None:
+                self.win.setGeometry(self._normal)
+            self._max = False
+        self._place()
+        self.win.update()
+
+    def restore_under_cursor(self, global_pos: QPoint) -> None:
+        """从最大化状态还原，并让鼠标落在标题栏的同一横向比例上。"""
+        if not self._max:
+            return
+        width = max(1, self.win.width())
+        ratio = min(0.92, max(0.08, (global_pos.x() - self.win.x()) / width))
+        normal = self._normal or self.win.geometry()
+        self._max = False
+        self.win.setGeometry(normal)
+        self.win.move(global_pos.x() - int(normal.width() * ratio),
+                      max(0, global_pos.y() - 19))
+        self._place()
+        self.win.update()
+
+    # -- 热区 ------------------------------------------------------------
+    def _ensure_edges(self) -> None:
+        if self._edges or not self._resizable:
+            return
+        specs = [
+            (Qt.TopEdge, Qt.SizeVerCursor),
+            (Qt.BottomEdge, Qt.SizeVerCursor),
+            (Qt.LeftEdge, Qt.SizeHorCursor),
+            (Qt.RightEdge, Qt.SizeHorCursor),
+            (Qt.TopEdge | Qt.LeftEdge, Qt.SizeFDiagCursor),
+            (Qt.TopEdge | Qt.RightEdge, Qt.SizeBDiagCursor),
+            (Qt.BottomEdge | Qt.LeftEdge, Qt.SizeBDiagCursor),
+            (Qt.BottomEdge | Qt.RightEdge, Qt.SizeFDiagCursor),
+        ]
+        self._edges = [_ResizeEdge(self.win, edges, cursor) for edges, cursor in specs]
+
+    def _place(self) -> None:
+        if self.body is not None:
+            # 内容容器跟着面板走：窗口比面板大一圈（阴影留白），
+            # 各窗口的根布局挂在这上面，子控件就不会画进阴影区。
+            self.body.setGeometry(self.panel_rect())
+        if self._overlay is not None:
+            # 描边层永远压在最上面：子控件是后加的，尺寸变化后要重新抬一次
+            self._overlay.setGeometry(self.win.rect())
+            self._overlay.raise_()
+        if not self._edges:
+            return
+        if self._max:
+            for edge in self._edges:
+                edge.hide()
+            return
+        # 热区贴在**面板**边（不是窗口边），阴影区不参与缩放——那块是透明留白，
+        # 用户看它不属于窗口。
+        panel = self.panel_rect()
+        x, y, w, h = panel.x(), panel.y(), panel.width(), panel.height()
+        geo = {
+            Qt.TopEdge: QRect(x + CORNER, y, w - CORNER * 2, EDGE),
+            Qt.BottomEdge: QRect(x + CORNER, y + h - EDGE, w - CORNER * 2, EDGE),
+            Qt.LeftEdge: QRect(x, y + CORNER, EDGE, h - CORNER * 2),
+            Qt.RightEdge: QRect(x + w - EDGE, y + CORNER, EDGE, h - CORNER * 2),
+            Qt.TopEdge | Qt.LeftEdge: QRect(x, y, CORNER, CORNER),
+            Qt.TopEdge | Qt.RightEdge: QRect(x + w - CORNER, y, CORNER, CORNER),
+            Qt.BottomEdge | Qt.LeftEdge: QRect(x, y + h - CORNER, CORNER, CORNER),
+            Qt.BottomEdge | Qt.RightEdge: QRect(x + w - CORNER, y + h - CORNER,
+                                                CORNER, CORNER),
+        }
+        for edge in self._edges:
+            edge.setGeometry(geo[edge._edges])  # noqa: SLF001
+            edge.show()
+            edge.raise_()
+
+
+#: 弹窗打开时主窗口的压暗强度，按明暗模式分开给。
+#:
+#: 当前取 **0 = 完全不压暗**：模态弹出时主窗口保持原样，弹窗与背景的分离交给
+#: 弹窗自己的投影（``shadow_alpha``）和 1px 描边（``surface_border``）。
+#: 想恢复原来的暗色，只改这一处（改造前的取值是浅色 0.12 / 深色 0.24）。
+#:
+#: **不要把这个值和"点击屏蔽"混成一个参数**：``DimClickShield`` 那层 alpha=1 的
+#: 填充是 Windows 逐像素命中测试的前提（见该类注释），和压不压暗毫无关系，
+#: 压暗归零时它必须原样保留。
+DIM_ALPHA: dict[str, float] = {"light": 0.0, "dark": 0.0}
+
+
+class DimOverlay(QWidget):
+    """盖在父窗口上的一层压暗蒙版，用来把"当前在跟哪个窗口打交道"说清楚。
+
+    子窗口弹出来时主窗口变暗，前层就自动成为视觉焦点——这是系统模态窗口原本
+    自带的效果，无边框之后得自己补。蒙版不吃鼠标事件，否则主窗口的悬停全废。
+
+    "点压暗区域关掉子窗口"不在这里做：应用模态期间 Qt 会在窗口系统层丢弃落到
+    主窗口上的点击（主窗口里的任何控件都收不到），见 ``DimClickShield``。
+
+    强度由模块常量 :data:`DIM_ALPHA` 决定；取 0 时这里什么都不画（只保留显隐
+    逻辑，方便以后把常量调回去就生效）。
+    """
+
+    def __init__(self, parent: QWidget) -> None:
+        super().__init__(parent)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.setAttribute(Qt.WA_NoSystemBackground, True)
+        self._alpha = DIM_ALPHA["light"]
+        self.hide()
+
+    def set_palette(self, palette: theme.Palette) -> None:
+        self._alpha = DIM_ALPHA["dark" if palette.is_dark else "light"]
+        if self.isVisible():
+            self.update()
+
+    def cover(self, on: bool) -> None:
+        if not on:
+            self.hide()
+            return
+        parent = self.parentWidget()
+        if parent is not None:
+            self.setGeometry(parent.rect())
+        self.show()
+        self.raise_()
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        if self._alpha <= 0:
+            # 压暗关闭：不画任何东西。命中测试由 DimClickShield 独立负责，
+            # 这里少一次整窗 fillPath。
+            return
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        # 跟着窗口的圆角走，否则四角会被压成方角（窗口本身已经是透明的了）
+        p.fillPath(rounded_path(QRectF(self.rect()), WINDOW_RADIUS),
+                   QColor(0, 0, 0, int(round(255 * self._alpha))))
+        p.end()
+
+
+class DimClickShield(QWidget):
+    """模态子窗口外侧的点击层：点一下压暗区 = 按 Esc，只关当前这一层。
+
+    为什么不让 ``DimOverlay`` 直接吃点击：``QDialog.exec()`` 是应用模态，模态期间
+    Qt 在窗口系统层就把落到被拦窗口（主窗口）上的鼠标事件丢掉了，主窗口里的控件
+    根本收不到。唯一仍然能收点击的是模态窗口自己的子窗口，所以这里给每个弹窗挂
+    一个透明子窗口，铺满主窗口，再用 ``setMask`` 把弹窗本身挖空：
+
+    * 洞外按下再松开 —— ``reject()``，和 Esc 同一条路径；
+    * 洞内点击 —— 命中下面的弹窗，视频单击、滑条拖动都不受影响；
+    * 洞外按下、拖进弹窗再松开 —— 松开点落在洞里，不关；
+    * 弹窗上按下、拖到洞外松开 —— 按下事件不经过这里，不关；
+    * 滚轮 / 右键 —— 不参与。
+
+    视觉上可能什么都没有（``DIM_ALPHA`` 取 0 时主窗口不压暗），这一层也不画可见
+    的内容；点击区域是"弹窗以外的整片主窗口"（同样的圆角、同样的范围），洞内被
+    弹窗占住的部分不算。
+
+    **必须画一层 alpha=1**。Windows 对 ``WS_EX_LAYERED`` 窗口的命中测试是逐像素的：
+    alpha=0 的地方鼠标消息会直接穿透（微软文档里写明的 "hit testing of a layered
+    window... alpha value is zero will let the mouse messages through"），
+    ``setMask`` 只裁剪窗口区域，不会把零透明像素变成可点。完全透明的窗口在真机上
+    表现就是"看着有遮罩、点哪都没反应"；离屏 QPA 不模拟这条，所以只有真机能测出来。
+    alpha=1 的黑在 255 级里肉眼不可见，点击却能正常落到这一层。
+    """
+
+    def __init__(self, dialog: QWidget) -> None:
+        super().__init__(dialog, Qt.Window | Qt.FramelessWindowHint
+                         | Qt.WindowDoesNotAcceptFocus)
+        self.setAttribute(Qt.WA_ShowWithoutActivating, True)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WA_NoSystemBackground, True)
+        self._dialog = dialog
+        self._press: QPoint | None = None
+        dialog.installEventFilter(self)
+        # 和 WindowFrame 同一条理由：Python 引用必须跟着弹窗走，别只靠调用方
+        # 那个局部变量（否则 wrapper 被回收、C++ 还在，eventFilter 里就报
+        # 'DimClickShield' object has no attribute '_dialog'）。
+        dialog._dim_click_shield = self
+        if dialog.isVisible() and self._place():
+            self.show()
+            self.raise_()
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        # alpha=1 是给 Windows 命中测试看的（见类注释），肉眼不可见；
+        # 压暗与这层无关（``DIM_ALPHA`` 现在就是 0，主窗口一点不变暗）。
+        # setMask 已经把洞挖掉，这层填充只会落在可点的区域上。
+        p = QPainter(self)
+        p.fillRect(self.rect(), QColor(0, 0, 0, 1))
+        p.end()
+
+    # -- 跟随弹窗 --------------------------------------------------------
+    def eventFilter(self, obj, event) -> bool:  # noqa: N802
+        if obj is self._dialog:
+            kind = event.type()
+            if kind == QEvent.Show:
+                if self._place():
+                    self.show()
+                    self.raise_()
+                    self._raise_layer_windows()
+            elif kind in (QEvent.Move, QEvent.Resize):
+                if self._place():
+                    self.raise_()
+                    self._raise_layer_windows()
+            elif kind in (QEvent.Hide, QEvent.Close):
+                self.hide()
+        return False
+
+    def _anchor(self) -> QWidget | None:
+        """铺哪个窗口：弹窗所在的最外层窗口（主窗口）。
+
+        嵌套时（详情页里再弹确认框）弹窗的 parent 是上一层弹窗，一直往上是主窗口。
+        """
+        w = self._dialog.parentWidget()
+        if w is None:
+            return None
+        while w.parentWidget() is not None:
+            w = w.parentWidget()
+        return w
+
+    def _stack(self) -> list[QWidget]:
+        """当前这一层弹窗 + 它自己开的独立子窗口。
+
+        **父弹窗不再算洞**（2026-11-15 修）。以前把还开着的父弹窗一起挖掉，理由是
+        "别盖住父窗"；但父窗此刻正被自己的应用模态禁用，点上去只会被 Qt 丢掉：
+        用户看到的就是"点上级窗口关不掉子窗"。更糟的是这一下点击落在了模态栈之外，
+        再点主窗口时点击路径已经不是"点遮罩"了（用户报的"整个程序被最小化"）。
+        现在父窗区域留在遮罩里，点它就等同 Esc 关掉当前这一层；父窗自己的遮罩还在，
+        这一层关掉后再点才轮到它。
+
+        弹窗自己再开的独立子窗口（例如摄像头的独立播放窗）仍然挖掉：那些区域属于
+        当前这一层，不该被判成"点外侧"。
+        """
+        out: list[QWidget] = []
+        if self._dialog.isVisible():
+            out.append(self._dialog)
+        for child in self._dialog.findChildren(
+                QWidget, options=Qt.FindDirectChildrenOnly):
+            if child is not self and child.isWindow() and child.isVisible():
+                out.append(child)
+        return out
+
+    def _raise_layer_windows(self) -> None:
+        """遮罩抬起后，把弹窗上的独立子窗口再抬回去，免得盖住它们。"""
+        for child in self._dialog.findChildren(
+                QWidget, options=Qt.FindDirectChildrenOnly):
+            if child is not self and child.isWindow() and child.isVisible():
+                child.raise_()
+
+    def _place(self) -> bool:
+        anchor = self._anchor()
+        if anchor is None or not anchor.isVisible():
+            self.hide()
+            return False
+        self.setGeometry(anchor.geometry())
+        # 外边界跟压暗蒙版用同一条圆角路径，点击区域和看到的一致
+        base = QRegion(rounded_path(QRectF(self.rect()), WINDOW_RADIUS)
+                       .toFillPolygon().toPolygon())
+        holes = QRegion()
+        for w in self._stack():
+            holes += QRegion(self._hit_rect(w).translated(-self.x(), -self.y()))
+        self.setMask(base.subtracted(holes))
+        return True
+
+    @staticmethod
+    def _hit_rect(w: QWidget) -> QRect:
+        """弹窗的**可见面板**（全局坐标），浮窗要去掉阴影留白。
+
+        阴影是透明留白，点它算"点外侧"——那圈本来就不算窗口。``_place`` 与
+        ``_over_dialog`` 必须用同一个矩形，否则会出现"点得到但不关窗"。
+        """
+        frame = getattr(w, "_window_frame", None)
+        if isinstance(frame, WindowFrame):
+            return frame.panel_geometry()
+        return w.frameGeometry()
+
+    def _over_dialog(self, global_pos: QPoint) -> bool:
+        for w in self._stack():
+            if self._hit_rect(w).contains(global_pos):
+                return True
+        return False
+
+    # -- 交互 ------------------------------------------------------------
+    def mousePressEvent(self, event) -> None:  # noqa: N802
+        self._press = (event.globalPosition().toPoint()
+                       if event.button() == Qt.LeftButton else None)
+        event.accept()
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802
+        press, self._press = self._press, None
+        if event.button() != Qt.LeftButton or press is None:
+            return
+        if not self.rect().contains(event.position().toPoint()):
+            return
+        # 按下和松开必须都在洞外：拖进 / 拖出弹窗的两端都不算"点遮罩"
+        if self._over_dialog(press) or self._over_dialog(event.globalPosition().toPoint()):
+            return
+        self._dialog.reject()
+
+    def wheelEvent(self, event) -> None:  # noqa: N802
+        # 压在遮罩上的滚轮不改变任何东西，更不关窗
+        event.ignore()
+
+
+def exec_with_dim_click(dialog: QDialog) -> int:
+    """模态执行弹窗，顺便让"点外侧压暗区"等同 Esc。
+
+    只关当前这一层：``reject()`` 和 Esc 是同一条路径；嵌套时每个弹窗各有一层
+    ``DimClickShield``，最上层的 shield 也在最上面，点到的只会是最上层。
+
+    **关掉就销毁**（``deleteLater``，2026-11-12 修）。以前关掉只是 hide：``dialog``
+    的 parent 是主窗口，C++ 对象被 parent 一直持有，于是挂在它身上的两个事件过滤器
+    （``WindowFrame`` / ``DimClickShield``）也活了下来；而 Python 侧这些对象只由
+    ``dialog.__dict__`` 和调用方的局部变量引用，函数一返回就可能被 GC。之后 Qt 继续
+    回调它们的 ``eventFilter``，访问 ``self.win`` / ``self._dialog`` 就是
+    ``AttributeError: 'WindowFrame' object has no attribute 'win'``——用户报的
+    "连续开关设置页后终端刷错、主页面变空"就是这个。顺带解决另一件事：每次都新建
+    对话框，不销毁就会越攒越多（每个还都是 ``Qt.Dialog`` 顶层窗口），反复开关会闪。
+    """
+    shield = getattr(dialog, "_dim_click_shield", None)
+    if shield is None:
+        shield = DimClickShield(dialog)
+        dialog._dim_click_shield = shield
+    try:
+        return dialog.exec()
+    finally:
+        shield.hide()
+        dialog.hide()
+        dialog.deleteLater()
+
+__all__ = [
+    "BAR_H",
+    "DIM_ALPHA",
+    "DimClickShield",
+    "DimOverlay",
+    "SHADOW_DY",
+    "SHADOW_PAD",
+    "TitleBar",
+    "WINDOW_RADIUS",
+    "WindowFrame",
+    "bar_bg",
+    "dialog_bar_bg",
+    "exec_with_dim_click",
+    "floating_size",
+    "rounded_path",
+    "shadow_alpha",
+    "surface_bg",
+    "surface_border",
+]

@@ -1,0 +1,47 @@
+# 虚拟环境
+.venv/
+# Python 缓存
+__pycache__/
+*.py[cod]
+# 探测与截图产物（含真实 did、设备名、账号快照，不要提交）
+scripts/out/
+# 根目录手写的临时截图（正式产物一律写 scripts/out/，别落在仓库根）
+/_*.png
+# 可选的 go2rtc 可执行文件（MIT，按需下载，不进仓库）
+tools/go2rtc/
+# 本地运行数据
+*.log
+# 手工调试留下的 go2rtc 配置（含真实 passToken、局域网 IP；pause.log 已由 *.log 覆盖）
+pause.yaml
+# 本地长期记忆（含真实设备名、IP、DID）
+.workbuddy/
+# 米家 App 原始采集（截图 + uiautomator dump）：只做本地开发参考，不进仓库。
+# 两点原因见 TODO「工程约定：参考材料不入库」——是别人的 App 界面（版权），
+# 且截图里必然带账号/家庭/设备信息（隐私），脱敏一次不代表以后不用再脱。
+# 蒸馏后的规范文档 docs/reference/*.md 才是要提交的部分。
+docs/reference/mihome-app/
+# ruff 缓存
+.ruff_cache/
+# GPL-3.0 参考项目副本：现已挪到仓库外（..\_refs\），这条留着防回滚
+MiHome-Windows-0.5.0/
+# 打包产物（PyInstaller / Nuitka）
+build/
+dist/
+# 自建 go2rtc 的发布产物（exe / BUILD.txt / LICENSE / Release 附件）
+dist-go2rtc/
+# AI / 编辑器 / 系统杂项
+.idea/
+.vscode/
+Thumbs.db
+desktop.ini
+# 备份与临时文件
+*.bak
+*.bak-*
+*.orig
+*.rej
+*.tmp
+# 隐私审计的本地产物：基线只存哈希，词表含真实家庭名 / 设备名，都不能入库
+.privacy-baseline.json
+.privacy-words.txt
+# 发布产物（防手滑）
+*.zip

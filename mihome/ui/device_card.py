@@ -1,0 +1,958 @@
+"""设备卡片。
+
+一张卡片只回答三个问题：**这是什么、现在什么状态、我能立刻做什么**。
+
+卡片被切成两条横带，1×1 和 2×1 **共用同一套坐标**：
+
+    ┌──────────────────────────┐
+    │ 设备名              ╭──╮ │   ← 标题带 y=14..76
+    │ 状态/读数            ╰──╯ │      （名称左上，电源右上）
+    ├──────────────────────────┤
+    │                          │
+    │       产品图 / 控件        │   ← 内容带 y=76..154
+    │                          │
+    └──────────────────────────┘
+
+**为什么标题必须顶置、产品图下沉**：1×1 卡片如果学米家把名字沉底，
+和同排的 2×1（名字在顶）混在一起时，两个标题会差 80px，肉眼一眼就看歪。
+统一顶置后两种卡的标题同基线、内容带同起点，一行里混排完全整齐。
+代价是 1×1 的标题可用宽只有 94px（电源键占了右上），所以标题**单行 + 省略号**，
+靠悬停提示（``ui/tooltip.py``）兜全名。
+
+几个决定观感的细节：
+
+* **开启状态靠底色染品类色，不靠边框。** 边框一旦变色，整面墙会显得脏；
+  淡色底 + 白卡片交错，才是米家的观感。
+* **产品图不染色、不加圆底。** 官方图本身就是白底实拍，染色反而假。
+* **读数和状态文字只用一档字号。** 卡片上塞第二档小字就会变成"工具感"。
+* **离线不是画红叉**，是整卡降透明度 + 状态文字改成"已离线"。
+
+外壳和内容是分开的：外壳（底色 / 标题 / 电源键）始终在这里自绘，内容带
+交给 ``ui/card_templates.py`` 的样式。标准样式（1×1）不创建子控件，产品图
+和多键面板还是自绘；带滑条的样式（2×1）在 ``_body_rect()`` 里挂一个真实
+``CardBody``。两者共用同一套坐标，所以 1×1 和 2×1 混排时标题、内容带的
+基线不会错开。宽度由样式自带，卡片本身不再接受单独的"大小"参数。
+"""
+
+from __future__ import annotations
+
+from PySide6.QtCore import QPoint, QPointF, QRect, QRectF, QSize, Qt, Signal
+from PySide6.QtGui import QColor, QCursor, QFont, QFontMetrics, QPainter, QPen
+from PySide6.QtWidgets import QSizePolicy, QWidget
+
+from ..core.catalog import gang_summary, summary_line
+from ..core.store import DeviceState
+from . import theme, tooltip
+from .card_templates import (
+    BODY_FAN,
+    BODY_GEEK,
+    BODY_VIDEO,
+    STYLES,
+    CardBody,
+    CardStyle,
+)
+from .fan_body import FanBody
+from .card_controls import CardControl
+from .geek_button import GeekButton
+from .widgets import IconProvider, draw_text
+
+PAD = 14
+#: 标题带：名称单行（22），副标题（18）。副标题**用满宽**——
+#: 它从电源键下沿才开始，不再受右上角那个圆让位的限制，
+#: 否则 "3 W · 4238.9 lx" 这类读数会被截掉最关键的后半段。
+TITLE_TOP = 14
+TITLE_H = 22
+SUB_TOP = 44
+SUB_H = 18
+BODY_TOP = 76
+#: 产品图边长。内容带高 78，图 76 居中后上下各留 1px。
+ART = 76
+#: 电源键。32 而不是 34：省出来的 2px 让标题多放半个字，
+#: 同时下沿正好落在副标题起点之上，两者不抢空间。
+POWER_D = 32
+POWER_TOP = 12
+GANG_H = 32
+GANG_GAP = 8
+#: 2–3 键改用"竖条"：整条铺满内容带、并排而立，模仿实体开关被分成几个模块的样子。
+#: 4 键及以上仍用胶囊网格——四个竖条只有 28px 宽，竖排文字会被压成一条缝。
+GANG_BAR_MAX = 3
+#: 竖条的圆角比胶囊小一档。12 的圆角落在 40px 宽的条上会变成胶囊，
+#: 而实体开关模块的边角是接近直角的。
+GANG_BAR_RADIUS = 10
+#: 竖排文字上下留白。78 高的条留 12 之后，12px 字号正好排得下 4 个字
+#: （4×16 = 64），再长才降字号或省略。
+VERT_PAD = 6
+GANG_LABEL_PX = 12
+GANG_LABEL_MIN_PX = 10
+
+
+def use_bars(count: int) -> bool:
+    """这一路数该画竖条还是胶囊。
+
+    1–3 键都用"整块面板"的画法：单开就是一块满宽的按键，三开就是切成三格。
+    4 键以上竖条只剩 28px 宽，竖排文字排不开，退回胶囊网格。
+    """
+    return 1 <= count <= GANG_BAR_MAX
+
+
+def _label_font(size: int) -> QFont:
+    font = QFont()
+    font.setPixelSize(size)
+    font.setWeight(QFont.Medium)
+    return font
+
+
+def label_line_h(size: int) -> float:
+    """竖排时每个字的步进高度 = 行高 + 1px 字距。
+
+    不能用 ``size`` 当步进：中文行高比字号大 30% 左右，按字号算会挤成一团。
+    """
+    return QFontMetrics(_label_font(size)).height() + 1
+
+
+def stack_lines(label: str, inner_h: float, line_h: float) -> list[str]:
+    """把标签拆成逐字竖排的行；装不下时末位换成省略号。"""
+    fit = max(1, int(inner_h // line_h)) if line_h > 0 else 1
+    if len(label) <= fit:
+        return list(label)
+    return [*label[: max(1, fit - 1)], "…"]
+
+
+def is_ascii(label: str) -> bool:
+    return all(ord(ch) < 128 for ch in label)
+
+
+def label_extent(label: str, size: int) -> float:
+    """这个标签在竖条里排下来需要多少**高度**。
+
+    中文按"字数 × 步进"，纯西文整体转 90°（见 ``paint_vertical_label``），
+    所以它占的高度等于它的文字宽度。
+    """
+    if not label:
+        return 0.0
+    if is_ascii(label):
+        return QFontMetrics(_label_font(size)).horizontalAdvance(label)
+    return len(label) * label_line_h(size)
+
+
+def paint_vertical_label(
+    p: QPainter, rect: QRectF, label: str, color: str, size: int, line_h: float
+) -> None:
+    """在竖条里画标签。
+
+    中文按**一个字一行**竖排（竖排是中文的原生写法）；纯西文则整体转 -90°——
+    把 "Ceiling" 拆成七个字母竖着码，读起来就是一串散字母。
+    """
+    if not label:
+        return
+    font = _label_font(size)
+    p.setFont(font)
+    p.setPen(QColor(color))
+
+    if is_ascii(label):
+        text = QFontMetrics(font).elidedText(label, Qt.ElideRight, int(rect.height()) - VERT_PAD * 2)
+        p.save()
+        p.translate(rect.center())
+        p.rotate(-90)
+        p.drawText(
+            QRectF(-rect.height() / 2, -rect.width() / 2, rect.height(), rect.width()),
+            Qt.AlignCenter,
+            text,
+        )
+        p.restore()
+        return
+
+    lines = stack_lines(label, rect.height() - VERT_PAD * 2, line_h)
+    y = rect.center().y() - len(lines) * line_h / 2
+    for ch in lines:
+        p.drawText(QRectF(rect.x(), y, rect.width(), line_h), Qt.AlignCenter, ch)
+        y += line_h
+
+
+class DeviceCard(QWidget):
+    clicked = Signal(str)  # did
+    toggled = Signal(str, int, int)  # did, siid, piid
+    menu_requested = Signal(str, QPoint)  # did, 全局坐标
+    value_committed = Signal(str, int, int, object)  # did, siid, piid, value（松手才发）
+    #: 用户点了「极客版入口」那颗按钮。取码、复制、开浏览器都由 ``MainWindow`` 串。
+    #: 挂在基类上而不是某个子类：**按钮是内容带的一种 body**（``BODY_GEEK``），
+    #: 和滑条 / 读数同级，不是什么特殊卡片才有的东西。
+    geek_requested = Signal(str)  # did
+
+    def __init__(
+        self,
+        state: DeviceState,
+        icons: IconProvider,
+        palette: theme.Palette,
+        style: CardStyle | None = None,
+    ) -> None:
+        super().__init__()
+        self.state = state
+        self._icons = icons
+        self._p = palette
+        # 不传 style 的调用方（验证脚本、详情页预览）拿到默认 1×1 标准小卡
+        self._style = style or STYLES[0]
+        self._body: CardBody | None = None
+        #: 「极客版入口」那颗按钮（只有 ``BODY_GEEK`` 样式才有）；必须在
+        #: ``_build_body()`` 之前就位——父类构造最后一行会调它
+        self._geek: GeekButton | None = None
+        #: 布局在窄窗口里做的降级覆盖；``None`` = 用样式自带的尺寸
+        self._grid_span: int | None = None
+        self._grid_rows: int | None = None
+        #: 拖动排序时这张卡就是"占位框"：保留格子、不画内容
+        self._placeholder = False
+        #: 按下落在电源键 / 多键上时，松手不要再当成"打开详情"
+        self._press_on_control = False
+        self._hover = False
+        self._hot: tuple[str, int] | None = None  # ("power",0) 或 ("gang", siid)
+        self.setMouseTracking(True)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        self._apply_geometry()
+        self._build_body()
+        # 标题是单行 + 省略号，全名靠悬停提示兜着。用自绘的而不是 ``setToolTip``：
+        # Qt 原生的唤醒机制是全局的，一旦弹过一次，之后每张卡片都秒出，且四角
+        # 外面还有一块系统画的方形底（见 ui/tooltip.py）。
+        # 命中区是标题带 +「转无线」的那几格按键：内容带里可能挂着真实滑条 /
+        # 多键按键，气泡盖上去既挡读数又挡拖动。hit_test 是动态的，卡片
+        # 1×1 ↔ 2×1 改宽度后仍然准。
+        tooltip.watch(self, self._tip_text, hit_test=self._tip_hit)
+
+    # -- 尺寸与模板 -------------------------------------------------------
+    @property
+    def span(self) -> int:
+        return self._style.span
+
+    @property
+    def rows(self) -> int:
+        return self._style.rows
+
+    @property
+    def style(self) -> CardStyle:
+        return self._style
+
+    @property
+    def grid_span(self) -> int:
+        """当前实际占的列数。窄窗口把 2×2 降级时由布局覆盖。"""
+        return self._grid_span if self._grid_span is not None else self._style.span
+
+    @property
+    def grid_rows(self) -> int:
+        """当前实际占的行数。"""
+        return self._grid_rows if self._grid_rows is not None else self._style.rows
+
+    def set_grid_cells(self, span: int, rows: int) -> None:
+        """布局按列数做的降级：只改几何，不改样式偏好。
+
+        用户在右键菜单里选的仍是 2×2；窗口拉宽后布局会再次调回 2×2。
+        """
+        span, rows = max(1, int(span)), max(1, int(rows))
+        if (span, rows) == (self.grid_span, self.grid_rows):
+            return
+        self._grid_span, self._grid_rows = span, rows
+        self._apply_geometry()
+        if self._body is not None:
+            self._body.setGeometry(self._body_rect())
+        self.update()
+
+    def _apply_geometry(self) -> None:
+        # 2×1 = 两张 1×1 加一条列间距，跨列卡和单列卡才能严丝合缝地对齐
+        w = theme.CARD_MIN_W * self.grid_span + theme.CARD_GAP * (self.grid_span - 1)
+        # 2×2 = 两行等高卡加一条行间距
+        h = theme.CARD_H * self.grid_rows + theme.CARD_GAP * (self.grid_rows - 1)
+        # 缓存设计尺寸：sizeHint 必须回这个固定值，不能回 self.width()——
+        # 后者在当前尺寸被布局拉伸后会返回错误值，形成"越来越大"的反馈循环。
+        self._design = QSize(w, h)
+        self.setFixedSize(self._design)
+
+    def sizeHint(self) -> QSize:  # noqa: N802
+        # CardGridLayout 用 sizeHint 决定每行放几张，必须是稳定的设计尺寸
+        return self._design
+
+    def minimumSizeHint(self) -> QSize:  # noqa: N802
+        return self.sizeHint()
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        # 改宽度（1×1 ↔ 2×1）后 body 要跟着重摆，否则滑条还留在旧的 138 宽里
+        if self._body is not None:
+            self._body.setGeometry(self._body_rect())
+        # 极客版按钮还要连带换文案（窄卡「重新获取」/ 宽卡完整那句）
+        self._place_button()
+
+    # -- 模板 body --------------------------------------------------------
+    def _build_body(self) -> None:
+        if self._body is not None:
+            old = self._body
+            old.setParent(None)
+            old.deleteLater()
+            self._body = None
+        if self._style.body == BODY_GEEK:
+            # 「极客版入口」：内容带里放一颗大按钮（画面样式仍由 CameraCard 自己铺）
+            if self._geek is None:
+                self._geek = GeekButton(self._p, self)
+                self._geek.clicked.connect(self._on_geek_click)
+            self._place_button()
+            self._sync_button()
+            self._geek.show()
+            return
+        self._drop_button()
+        if not self._style.has_body or self._style.body == BODY_VIDEO:
+            # 画面样式由 CameraCard 自己铺视频控件，这里不建 body
+            return
+        # 风扇是两列四格的布局，一行一个槽位的 ``CardBody`` 摆不下（见 FanBody）。
+        # 两者的对外接口一致（``sync`` / ``apply_theme`` / 三个信号），所以下面
+        # 的装配代码一个字都不用分叉。
+        maker = FanBody if self._style.body == BODY_FAN else CardBody
+        body = maker(
+            self._style,
+            self.state,
+            self._p,
+            theme.category_color(self.state.card.category),
+            self,
+        )
+        body.setGeometry(self._body_rect())
+        body.value_committed.connect(self._on_body_committed)
+        body.previewed.connect(self.update)
+        body.menu_requested.connect(
+            lambda pos: self.menu_requested.emit(self.state.did, pos)
+        )
+        body.show()  # 子控件默认 hidden，父已 show 时也必须显式 show
+        self._body = body
+
+    def _on_body_committed(self, siid: int, piid: int, value: object) -> None:
+        self.value_committed.emit(self.state.did, siid, piid, value)
+
+    # -- 极客版入口（BODY_GEEK） ------------------------------------------
+    # 按钮是内容带的一种 body，和滑条 / 读数同级，所以逻辑留在这里，不再单独
+    # 派生一个卡片类。**曾经有过一个 ``GeekCard``**（2026-11-11 ～ 11-16），
+    # 但它只是 ``DeviceCard`` 多一条支路的超集，而墙上非摄像头又一律用它，
+    # 结果"极客专用的几何"被误用到所有卡上，整面墙的产品图消失过一次
+    # （见 ``_art_rect`` 的注释）。并进来之后，"当前样式用不用得着右半按钮"
+    # 只剩 ``self._style.body == BODY_GEEK`` 一个判据，没有第二种可能。
+
+    #: 左半产品图与右半按钮之间的留白。12 让两者之间有一条能喘气的缝，
+    #: 同时不至于把按钮挤窄（2×1 的内容带只有 312 宽，各分 150）
+    GEEK_GAP = 12
+    #: 内容带窄于这个宽度就不分栏。1×1 的 body 只有 138 宽，对半分给产品图
+    #: 只剩 63——图会糊成一条竖杠，按钮也被挤到放不下文案。窄卡因此整条让给按钮
+    #: （``_draws_art()`` 同时关掉产品图）。2×1 是 312，留 12 的余量给边界情况。
+    GEEK_SPLIT_MIN_W = 300
+
+    @property
+    def button(self) -> GeekButton | None:
+        """「极客版入口」那颗按钮；当前样式不是极客版时为 ``None``。"""
+        return self._geek
+
+    def _geek_wide(self) -> bool:
+        """够宽才「左图 + 右按钮」；1×1 让按钮铺满整条内容带。"""
+        return self._body_rect().width() >= self.GEEK_SPLIT_MIN_W
+
+    def _place_button(self) -> None:
+        """按钮落点 + 窄卡文案，一处算完。几何和文案都跟着卡片宽度走。"""
+        if self._geek is None:
+            return
+        wide = self._geek_wide()
+        self._geek.set_compact(not wide)
+        self._geek.setGeometry(self._geek_rect())
+
+    def _geek_rect(self) -> QRect:
+        area = self._body_rect()
+        if not self._geek_wide():
+            # 1×1：整条内容带就是按钮，连 1px 的边都不留（外面那圈是卡片自己的
+            # 圆角与内边距，再缩就成小一号的按钮了）
+            return area
+        left = (area.width() - self.GEEK_GAP) // 2
+        return QRect(
+            area.x() + left + self.GEEK_GAP,
+            area.y(),
+            area.width() - left - self.GEEK_GAP,
+            area.height(),
+        )
+
+    def _drop_button(self) -> None:
+        if self._geek is None:
+            return
+        self._geek.setParent(None)
+        self._geek.deleteLater()
+        self._geek = None
+
+    def _sync_button(self) -> None:
+        if self._geek is not None:
+            self._geek.set_live(bool(self.state.online))
+
+    def _on_geek_click(self) -> None:
+        self.geek_requested.emit(self.state.did)
+
+    def set_busy(self, busy: bool) -> None:
+        """取码往返期间置忙（由 ``WallView`` 在发请求前后各调一次）。"""
+        if self._geek is not None:
+            self._geek.set_busy(busy)
+
+    def set_result(self, code: str) -> None:
+        """取码成功：把这串码直接印在按钮上（由 ``WallView._on_geek_done`` 调）。"""
+        if self._geek is not None:
+            self._geek.set_result(code)
+
+    def set_error(self) -> None:
+        """取码失败：按钮转成「获取登录码失败 + 重新获取」。"""
+        if self._geek is not None:
+            self._geek.set_error()
+
+    def set_style(self, style: CardStyle) -> None:
+        """右键菜单改样式（宽度随样式一起换）：只动这一张卡，不重建整面墙。"""
+        if style == self._style:
+            return
+        self._style = style
+        # 新样式有自己的尺寸；之前窄窗口的 1×1 降级不能继续压着它
+        self._grid_span = self._grid_rows = None
+        self._apply_geometry()
+        self._build_body()
+        self.update()
+
+    def set_palette(self, palette: theme.Palette) -> None:
+        self._p = palette
+        if self._body is not None:
+            self._body.apply_theme(palette, theme.category_color(self.state.card.category))
+        if self._geek is not None:
+            self._geek.set_palette(palette)
+        self.update()
+
+    def refresh(self, state: DeviceState | None = None) -> None:
+        if state is not None:
+            self.state = state
+        self._icons.ensure(self.state.node.model)
+        self._apply_geometry()
+        if self._body is not None:
+            # 拖动中的滑条会自己跳过外部赋值，不会把用户手里的值拽回去
+            self._body.sync(self.state)
+        self._place_button()
+        self._sync_button()
+        self.update()
+
+    # -- 绘制 ------------------------------------------------------------
+    def paintEvent(self, event) -> None:  # noqa: N802
+        p = QPainter(self)
+        p.setRenderHints(QPainter.Antialiasing | QPainter.SmoothPixmapTransform)
+        st = self.state
+        card = st.card
+        pal = self._p
+        rect = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+
+        if self._placeholder:
+            # 拖动中的落点：保留原来的格子，只画一个虚线框；内容在
+            # ``set_drag_placeholder`` 里已隐藏，网格不会因为少一张卡而塌。
+            p.setPen(QPen(QColor(pal.accent), 2, Qt.DashLine))
+            p.setBrush(QColor(theme.blend(pal.card, pal.accent, 0.08)))
+            p.drawRoundedRect(rect, theme.RADIUS_CARD, theme.RADIUS_CARD)
+            p.end()
+            return
+
+        on = st.any_on
+        base = theme.category_color(card.category)
+        # 开启时染一层很淡的品类色；悬停只挪一档明度，**不加描边**。
+        # 浅色模式下混色会把卡片压得和背景一样暗（电视、摄像头这类深灰品类甚至
+        # 更暗），所以给它一个"不许低于背景 +10 亮度"的下限，见 theme.tint
+        strength = 0.10 if on else 0.0
+        if strength:
+            bg = theme.tint(base, strength, pal, min_gap=6)
+        else:
+            bg = pal.card
+        if self._hover:
+            bg = theme.card_hover_color(bg, pal)
+
+        p.setOpacity(1.0 if st.online else 0.45)
+        p.setPen(Qt.NoPen)
+        p.setBrush(theme.card_fill(bg, pal))
+        p.drawRoundedRect(rect, theme.RADIUS_CARD, theme.RADIUS_CARD)
+
+        # 内容带：挂了模板 body 就整块让给子控件。它们是真实 QWidget，画在
+        # 父窗口之上；这里再画一次产品图只会从滑条缝里透出来，显得脏。
+        if self._draws_art():
+            # 「隐藏转无线」把按键剔空了就退回产品图：单开整块转无线时，
+            # 卡片上没有任何能点的东西，产品图比一块空内容带更像回事。
+            if self._paints_gangs():
+                self._paint_gangs(p, base, bg)
+            else:
+                self._paint_art(p)
+
+        # 标题：**单行 + 省略号**。电源键占住右上角，标题只能让出它的宽度
+        # （166 宽 - 两侧 14 - 电源 32 - 间距 10 = 96），刚好 5 个半中文字；
+        # 再长的型号名交给 tooltip。两行会顶到内容带，所以不放开。
+        draw_text(p, QRect(PAD, TITLE_TOP, self._title_width(), TITLE_H), st.name,
+                  size=theme.FS_CARD_TITLE, color=pal.text, weight=QFont.Medium)
+        # 副标题在电源键下沿之下展开，用满宽
+        draw_text(p, QRect(PAD, SUB_TOP, self.width() - PAD * 2, SUB_H), self._subtitle(),
+                  size=theme.FS_CARD_SUB, color=pal.text_soft)
+
+        if not card.gangs:
+            self._paint_power(p, base, on, pal)
+
+        p.end()
+
+    def _subtitle(self) -> str:
+        st = self.state
+        if not st.online:
+            return "已离线"
+        if st.error:
+            return st.error
+        if not st.node.spec_type:
+            return "不支持控制"
+        if st.card.gangs:
+            return self._gang_subtitle(st)
+        # 样式自己拼的摘要优先（风扇：「扫风角度 60° · 风速 3 档」）。它同时是
+        # body 让出标签宽度的判据（``CardStyle.summary_slots``），所以"写什么"
+        # 和"body 少画什么"必须走同一个函数（``summary_text``）。
+        text = self._style.summary_text(st) or summary_line(st.card, st.values)
+        if text:
+            return text
+        if st.power is None:
+            # 没有开关的设备（网关、纯只读传感器…）副标题本来就没话可说。
+            # 留一个破折号会被读成"值还没到"，空白才是"这卡没有这一句"。
+            return ""
+        return "已开启" if st.power else "已关闭"
+
+    def _gang_subtitle(self, st: DeviceState) -> str:
+        """多键面板的副标题。
+
+        **转无线那一路不计入"几路开启"**：它的继电器恒通（就是为了给智能灯一直
+        供电），算进去会让面板永远显示开着，"全部关闭"也永远出不来。无线单独报
+        一个数，能不能点另说（见 ``mousePressEvent``）。
+
+        带无线时换成「3 路 · 1 开 · 1 无线」这种紧凑写法：副标题只有 138px 宽，
+        「3 路 · 1 路开启 · 1 路转无线」会被省略号切成没信息量的半句。
+        """
+        # 「隐藏转无线」样式下统计的是**画出来的那几路**：卡片上只剩两块键，
+        # 副标题还写"3 路"会自相矛盾。
+        gangs = self._gangs()
+        if not gangs:
+            return f"{len(st.card.gangs)} 路 · 全部转无线"
+        return gang_summary(gangs, st.values)
+
+    def _wireless(self, gang) -> bool:
+        """这一路当前是不是"转无线"（继电器常通、按键不切换）。"""
+        return gang.is_wireless(self.state.values)
+
+    def _gangs(self) -> list:
+        """这张卡**要画**的按键。
+
+        默认就是卡片声明的全部路数。选了「隐藏转无线」样式时，把转无线的那几路
+        剔掉——它们在物理上不控制通断，占着位置只会让人以为能点（而且点下去
+        什么都不会发生，见 ``mousePressEvent``）。剔完还是空，就退回产品图。
+        """
+        gangs = self.state.card.gangs
+        if not self._style.hide_wireless:
+            return gangs
+        return [g for g in gangs if not self._wireless(g)]
+
+    def _gang_for(self, siid: int):
+        return next((g for g in self._gangs() if g.siid == siid), None)
+
+    def _paints_gangs(self) -> bool:
+        """内容带画按键还是产品图。样式（「隐藏转无线」）把按键剔空时退回产品图。"""
+        return bool(self._gangs())
+
+    # -- 布局 ------------------------------------------------------------
+    def _wireless_gang_at(self, pos: QPoint):
+        """光标下面那一格是不是"转无线"的按键。不是就返回 None。"""
+        gangs = self._gangs()
+        if not gangs:
+            return None
+        for gang, rect in zip(gangs, self._gang_rects()):
+            if self._wireless(gang) and rect.contains(QPointF(pos)):
+                return gang
+        return None
+
+    def _tip_text(self) -> str:
+        """悬停提示：标题带显示设备名，转无线的那一路显示解释。"""
+        gang = self._wireless_gang_at(self.mapFromGlobal(QCursor.pos()))
+        if gang is not None:
+            # 转无线的键**不发写请求**：固件不理 on/off，真发出去还可能把常通的
+            # 继电器断掉——那是给智能灯供电的那一路。也不能"发一条按下"：click
+            # 是设备事件，云端没有 event/set（见
+            # docs/reference/mijia-automation-events.md 第 11 节），所以联动只认
+            # 实体键。这里解释清楚，别让用户以为界面坏了。
+            return f"{gang.label}已转无线：这一路常通电，要联动请在实体键上按"
+        return self.state.name
+
+    def _tip_hit(self, pos: QPoint) -> bool:
+        """悬停提示的有效区：标题带 + 转无线的那几格按键。
+
+        标题带之外的按键区不让气泡盖上去（既挡读数又挡拖动），唯一例外是
+        转无线的格子——它点了也没反应，只有一段解释可说。
+        """
+        return self._title_hit(pos) or self._wireless_gang_at(pos) is not None
+
+    def _title_hit(self, pos: QPoint) -> bool:
+        """悬停提示的有效区：名称 + 状态文字那一条，右上角电源键除外。
+
+        内容带（y ≥ BODY_TOP）整个不算——那里是产品图、多键按键或模板 body
+        里的亮度/色温滑条。提示框从光标右下 16px 展开，一旦在内容带弹出就会
+        压住控件。电源键虽然也在标题带，但它自身是热点，扣掉后不会在瞄准
+        开关时糊上一层字。
+        """
+        band = QRect(PAD, TITLE_TOP, self.width() - PAD * 2,
+                     SUB_TOP + SUB_H - TITLE_TOP)
+        if not band.contains(pos):
+            return False
+        if (not self.state.card.gangs
+                and self.state.card.control("power") is not None
+                and self._power_rect().adjusted(-2, -2, 2, 2).contains(pos)):
+            return False
+        return True
+
+    def _title_width(self) -> int:
+        """标题可用宽。电源键占住右上角，标题给它让位。"""
+        w = self.width() - PAD * 2
+        if not self.state.card.gangs and self.state.card.control("power") is not None:
+            w -= POWER_D + 10
+        return max(48, w)
+
+    def _body_rect(self) -> QRect:
+        """内容带：产品图、多键胶囊、以后的控件模板都只能画在这个矩形里。"""
+        return QRect(PAD, BODY_TOP, self.width() - PAD * 2, self.height() - PAD - BODY_TOP)
+
+    def _draws_art(self) -> bool:
+        """外壳要不要在产品图那块画东西。
+
+        默认判据是"没有 body"：挂了滑条 / 读数就把整块让给子控件。极客版样式
+        是例外——右半给了按钮，左半仍然要产品图，所以这里再判一次"够不够宽"
+        （1×1 没有"左半"，整条都是按钮）。
+        """
+        if self._style.body == BODY_GEEK:
+            return not self.state.card.gangs and self._geek_wide()
+        return not self._style.has_body
+
+    def _art_rect(self) -> QRect:
+        """产品图的落点。默认整个内容带；极客版样式只占左半。
+
+        **先问样式，再问宽不宽。** 这个类同时承载标准样式（墙上所有非摄像头
+        设备都是它），直接按宽度分栏会把 1×1 标准卡的产品图落点清成空矩形——
+        2026-11-16 就这样让整面墙的产品图消失过一次，而 ``_draws_art()`` 仍返回
+        True，只查"画不画"根本查不出来。回归在 ``verify_card_style.py``。
+        """
+        area = self._body_rect()
+        if self._style.body != BODY_GEEK:
+            return area
+        if not self._geek_wide():
+            return QRect()
+        left = (area.width() - self.GEEK_GAP) // 2
+        return QRect(area.x(), area.y(), left, area.height())
+
+    def _power_rect(self) -> QRect:
+        return QRect(self.width() - PAD - POWER_D, POWER_TOP, POWER_D, POWER_D)
+
+    def _gang_rects(self) -> list[QRectF]:
+        """多键的按键矩形。
+
+        * **1–3 键：竖条。** 等宽等高、铺满内容带、彼此留 GANG_GAP，像一块被
+          分成几格的实体开关面板；单开就是一块满宽的按键。2 键以上文字竖排
+          （见 ``paint_vertical_label``），单开只有一块，横排更好读。
+        * **4 键及以上：胶囊网格。** 竖条会被压到 28px 宽，竖排文字排不开；
+          1–2 键一行反而更宽松（3 键时"排风扇"会被截成"排…"，所以 3–4 键走 2×2）。
+        """
+        gangs = self._gangs()
+        if not gangs:
+            return []
+        area = self._body_rect()
+        n = len(gangs)
+        if use_bars(n):
+            cw = (area.width() - GANG_GAP * (n - 1)) / n
+            return [
+                QRectF(area.x() + i * (cw + GANG_GAP), area.y(), cw, area.height())
+                for i in range(n)
+            ]
+        if n <= 2:
+            rows, cols = 1, n
+        elif n <= 4:
+            rows, cols = 2, 2
+        else:
+            rows, cols = 2, 3
+        cw = (area.width() - GANG_GAP * (cols - 1)) / cols
+        ch = min(GANG_H, (area.height() - GANG_GAP * (rows - 1)) / rows)
+        total_h = ch * rows + GANG_GAP * (rows - 1)
+        y0 = area.y() + (area.height() - total_h) / 2
+        out: list[QRectF] = []
+        for i in range(min(n, rows * cols)):
+            r, c = divmod(i, cols)
+            # 末行不满时整行居中，避免最后一个孤零零贴在左边
+            filled = min(cols, n - r * cols)
+            row_w = filled * cw + GANG_GAP * (filled - 1)
+            x = area.x() + (area.width() - row_w) / 2 + c * (cw + GANG_GAP)
+            out.append(QRectF(x, y0 + r * (ch + GANG_GAP), cw, ch))
+        return out
+
+    def _paint_art(self, p: QPainter) -> None:
+        """产品图：在自己的落点里居中，不染色、不加圆底。"""
+        st = self.state
+        pal = self._p
+        area = self._art_rect()
+        size = min(ART, area.height(), area.width())
+        x = area.x() + (area.width() - size) // 2
+        y = area.y() + (area.height() - size) // 2
+        pix = self._icons.scaled(st.node.model, size)
+        if pix is None:
+            # 图还没到 / 这类设备本来就没有官方图：画个淡圆占位，别让内容带空着
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(pal.bg_soft))
+            d = min(size, 56)
+            p.drawEllipse(QRectF(area.center().x() - d / 2, area.center().y() - d / 2, d, d))
+            return
+        pos = QPoint(x + (size - pix.width()) // 2, y + (size - pix.height()) // 2)
+        if pal.is_dark:
+            # 官方产品图是白底实拍，直接贴在深色卡片上会刺眼，压一点亮度
+            op = p.opacity()
+            p.setOpacity(op * 0.88)
+            p.drawPixmap(pos, pix)
+            p.setOpacity(op)
+        else:
+            p.drawPixmap(pos, pix)
+
+    def _paint_power(self, p: QPainter, base: str, on: bool, pal: theme.Palette) -> None:
+        st = self.state
+        if st.card.control("power") is None:
+            return
+        # 右上角，和标题同一行起——1×1 和 2×1 位置完全一致。
+        rect = QRectF(self._power_rect())
+        # 关闭时是一枚"半透明中性圆"，开启时实心品类色——都不描边，
+        # 描边会让一排电源键看起来像一圈圈网格。
+        p.setPen(Qt.NoPen)
+        if on:
+            p.setBrush(QColor(base))
+        else:
+            p.setBrush(QColor(theme.blend(pal.card, pal.text, 0.08)))
+        p.drawEllipse(rect)
+        self._paint_power_glyph(p, rect, "#FFFFFF" if on else pal.text_soft)
+
+    @staticmethod
+    def _paint_power_glyph(p: QPainter, rect: QRectF, color: str) -> None:
+        """电源符号 ⏻：缺口朝上的一段圆环，中间一竖穿过缺口。
+
+        两个尺寸必须一起调，否则会出现"圆圈加一根棍子"而不是电源符号：
+
+        * **缺口要比竖线宽得多。** 缺口在正上方，竖线正好从中间穿过去，所以肉眼
+          看到的是"缺口弦宽 - 竖线宽"这点缝。原来缺口 40°（弦宽 4.4px）减掉 1.8px
+          笔宽后两边各剩 1.3px，等于没有缺口。现在 76°，弦宽 8.3px，两边各 3px。
+        * **竖线不能比圆环还长。** 原来从 1.7r 画到 0.2r，长 1.5r ≈ 圆的 3/4，
+          看着像根天线；而且弧的矩形容器还整体偏下 0.1r，竖线和环不同心，更显长。
+          现在同心，从 1.18r 画到圆心，长度等于半径——和 iOS / 米家的符号同比例。
+        """
+        c = rect.center()
+        r = rect.width() * 0.21
+        p.setPen(QPen(QColor(color), 1.7, Qt.SolidLine, Qt.RoundCap))
+        p.setBrush(Qt.NoBrush)
+        # 90° 在正上方；缺口 76° → 从右侧 128° 起、逆时针画 284°
+        p.drawArc(QRectF(c.x() - r, c.y() - r, r * 2, r * 2), 128 * 16, 284 * 16)
+        p.drawLine(round(c.x()), round(c.y() - r * 1.18), round(c.x()), round(c.y()))
+
+    def _paint_gangs(self, p: QPainter, base: str, bg: str) -> None:
+        gangs = self._gangs()
+        rects = self._gang_rects()
+        if not gangs:
+            return
+        pal = self._p
+        # 关闭态从**卡片当前底色**推一档（和右上角电源键同一套算法）。
+        # 原来固定用 pal.bg_soft，可是卡片一旦有键开着就染了淡品类色，
+        # 浅色下 bg_soft(#F7F8FA) 反而比染色后的卡底(#F2F4F7)更亮，
+        # 关闭的键看着像"浮起来"，和开启的键分不清主次。
+        off = theme.blend(bg, pal.text, 0.08)
+        bars = use_bars(len(gangs))
+        # 竖排只在"并排好几块"时才有意义：单开只有一块 138 宽的按键，
+        # 把"按键1"竖着码反而别扭
+        vertical = bars and len(gangs) > 1
+        size, line_h = self._gang_label_metrics(gangs, rects[0].height()) if vertical else (0, 0.0)
+        for g, rect in zip(gangs, rects):
+            wireless = self._wireless(g)
+            on = bool(self.state.values.get(g.power.key))
+            hot = self._hot == ("gang", g.siid) and not wireless
+            if wireless:
+                # 转无线的路：**虚线 + 平平的底 + 右上角无线标记**。
+                # 不填品类色——填了会和"开着、可以关"的键混成一样；
+                # 也不画电源符号，因为这一路本来就没有可切换的负载。
+                p.setPen(QPen(QColor(pal.text_mute), 1, Qt.DashLine))
+                p.setBrush(QColor(theme.blend(bg, pal.text, 0.03)))
+            elif on:
+                p.setPen(Qt.NoPen)
+                p.setBrush(QColor(base if not hot else theme.blend(base, "#FFFFFF", 0.12)))
+            else:
+                p.setPen(Qt.NoPen)
+                p.setBrush(QColor(off if not hot else theme.blend(off, pal.text, 0.06)))
+            radius = GANG_BAR_RADIUS if bars else theme.RADIUS_SMALL
+            p.drawRoundedRect(rect, radius, radius)
+            if wireless:
+                self._paint_wireless_badge(p, rect, pal.text_mute)
+            color = pal.text_mute if wireless else ("#FFFFFF" if on else pal.text_soft)
+            if vertical:
+                paint_vertical_label(p, rect, g.label, color, size, line_h)
+            else:
+                draw_text(
+                    p,
+                    rect.adjusted(8, 0, -8, 0).toRect(),
+                    g.label,
+                    size=12,
+                    color=color,
+                    weight=QFont.Medium,
+                    align=Qt.AlignCenter,
+                )
+
+    @staticmethod
+    def _paint_wireless_badge(p: QPainter, rect: QRectF, color: str) -> None:
+        """在按键右上角画一枚极小的无线符号：两层弧 + 一个点。
+
+        只有 10px 见方，所以弧用 1.2px 笔宽、圆心放在**底边中点**——三层同心弧从
+        圆心往上张开，看起来才是"信号在发射"。画在右上角而不是正中：竖排标签占
+        的是中间那一列，正中间会压字。
+        """
+        d = 10.0
+        x = rect.right() - d - 5
+        y = rect.top() + 5
+        c = QPointF(x + d / 2, y + d)
+        p.setPen(QPen(QColor(color), 1.2, Qt.SolidLine, Qt.RoundCap))
+        p.setBrush(Qt.NoBrush)
+        for r in (d * 0.28, d * 0.55, d * 0.82):
+            p.drawArc(QRectF(c.x() - r, c.y() - r, r * 2, r * 2), 45 * 16, 90 * 16)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(color))
+        p.drawEllipse(QPointF(c.x(), c.y() - 1.2), 1.1, 1.1)
+
+    @staticmethod
+    def _gang_label_metrics(gangs, bar_h: float) -> tuple[int, float]:
+        """挑一个**整张卡统一**的竖排字号：从 12 往小试，装得下最长的标签就停。
+
+        逐键各算各的会让"左键"(2 字) 用 12px、"餐厅吊灯"(4 字) 用 10px，
+        并排一看就是三个大小不一的标签。
+        """
+        inner = bar_h - VERT_PAD * 2
+        labels = [g.label for g in gangs] or [""]
+        for size in range(GANG_LABEL_PX, GANG_LABEL_MIN_PX - 1, -1):
+            if max(label_extent(x, size) for x in labels) <= inner:
+                return size, label_line_h(size)
+        return GANG_LABEL_MIN_PX, label_line_h(GANG_LABEL_MIN_PX)
+
+    # -- 交互 ------------------------------------------------------------
+    def _hit(self, pos: QPoint) -> tuple[str, int] | None:
+        st = self.state
+        gangs = self._gangs()
+        if gangs:
+            pt = QPointF(pos)
+            for g, rect in zip(gangs, self._gang_rects()):
+                if rect.contains(pt):
+                    return ("gang", g.siid)
+            return None
+        if st.card.control("power") is None:
+            return None
+        # 命中区放大 8px，鼠标不用瞄准
+        if self._power_rect().adjusted(-8, -8, 8, 8).contains(pos):
+            return ("power", 0)
+        return None
+
+    def interactive_at(self, pos: QPoint) -> bool:
+        """这个点是不是电源键 / 多键——落在上面时不要开始拖动。"""
+        return self._hit(pos) is not None
+
+    def set_drag_placeholder(self, on: bool) -> None:
+        """拖动排序时把自己画成占位框，同时把内容藏起来。"""
+        on = bool(on)
+        if self._placeholder == on:
+            return
+        self._placeholder = on
+        if self._body is not None:
+            self._body.setVisible(not on)
+        if self._geek is not None:
+            self._geek.setVisible(not on)
+        self.update()
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802
+        self._press_on_control = False
+        if event.button() == Qt.LeftButton:
+            pos = event.position().toPoint()
+            hit = self._hit(pos)
+            if hit is not None:
+                self._press_on_control = True
+                st = self.state
+                if hit[0] == "power":
+                    ctl = st.card.control("power")
+                    if ctl and ctl.prop:
+                        self.toggled.emit(st.did, ctl.prop.siid, ctl.prop.piid)
+                else:
+                    gang = self._gang_for(hit[1])
+                    if gang and not self._wireless(gang):
+                        self.toggled.emit(st.did, gang.power.siid, gang.power.piid)
+                    # 转无线的键不发写请求，也不弹提示：解释已经挂在悬停提示上
+                    # （见 ``_tip_text``）。这里只 accept，避免松手被当成长按卡片。
+                event.accept()
+                return
+            # 第二道闸：这点落在内容带的控件上时，这次点击就算控件消费掉了。
+            # 控件自己已经会 accept（``CardControl.mousePressEvent``），正常情况
+            # 走不到这里；但"禁用态早退""新控件忘了 override"这类遗漏一旦发生，
+            # 松手就会被当成长按卡片、打开详情页——操控失灵比点了没反应严重。
+            if self._control_at(pos) is not None:
+                self._press_on_control = True
+                event.accept()
+                return
+            # 卡片主体不再在按下时打开详情：先让墙面的拖动排序有机会接管。
+        super().mousePressEvent(event)
+
+    def _control_at(self, pos: QPoint) -> QWidget | None:
+        """这一点落在内容带的哪个控件上（含控件的子控件，如开关里的滑块）。
+
+        ``childAt`` 只给最深的那层，所以要沿父链往上找 ``CardControl``：
+        ``ToggleSwitch`` 是 ``CardToggle`` 的子控件，直接判类型会漏。
+        """
+        w = self.childAt(pos)
+        while w is not None and w is not self:
+            if isinstance(w, CardControl):
+                return w
+            w = w.parentWidget()
+        return None
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802
+        if event.button() == Qt.LeftButton:
+            if self._press_on_control:
+                self._press_on_control = False
+                event.accept()
+                return
+            # 按下在卡片上、松开仍在卡片内才算一次点击；拖出去松手是取消
+            if not self._placeholder and self.rect().contains(event.position().toPoint()):
+                self.clicked.emit(self.state.did)
+                event.accept()
+                return
+        super().mouseReleaseEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:  # noqa: N802
+        hit = self._hit(event.position().toPoint())
+        if hit != self._hot:
+            self._hot = hit
+            self.update()
+        # 转无线那一路照旧吃下按下事件（免得变成"点一下开详情"），但不是可点的东西，
+        # 光标留在箭头，别给"按得动"的暗示
+        gang = self._gang_for(hit[1]) if hit and hit[0] == "gang" else None
+        clickable = hit is not None and not (gang is not None and self._wireless(gang))
+        self.setCursor(Qt.PointingHandCursor if clickable else Qt.ArrowCursor)
+
+    def contextMenuEvent(self, event) -> None:  # noqa: N802
+        # 右键菜单由墙面统一弹（隐藏 / 取消隐藏 / 打开详情）
+        self.menu_requested.emit(self.state.did, event.globalPos())
+
+    def enterEvent(self, event) -> None:  # noqa: N802
+        self._hover = True
+        self.update()
+
+    def leaveEvent(self, event) -> None:  # noqa: N802
+        # 鼠标从卡片移到 body 里的滑条时，父卡片**也会**收到 leave。光标其实
+        # 还在卡片矩形内，这时保持 hover 底色，别在滑条边缘来回闪一下。
+        self._hot = None
+        if self._body is not None and self.rect().contains(
+            self.mapFromGlobal(QCursor.pos())
+        ):
+            self.update()
+            return
+        self._hover = False
+        self.update()
+
+
+def card_for(state: DeviceState, icons: IconProvider, palette: theme.Palette) -> DeviceCard:
+    return DeviceCard(state, icons, palette)
+
+
+__all__ = ["DeviceCard", "card_for"]

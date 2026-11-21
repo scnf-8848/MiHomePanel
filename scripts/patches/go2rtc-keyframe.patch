@@ -1,0 +1,34 @@
+--- a/pkg/xiaomi/miss/producer.go
++++ b/pkg/xiaomi/miss/producer.go
+@@ -26,17 +26,29 @@
+ 	u, _ := url.Parse(rawURL)
+ 	query := u.Query()
+ 
+-	err = client.StartMedia(query.Get("channel"), query.Get("subtype"), query.Get("audio"))
++	channel, subtype, audio := query.Get("channel"), query.Get("subtype"), query.Get("audio")
++
++	err = client.StartMedia(channel, subtype, audio)
+ 	if err != nil {
+ 		_ = client.Close()
+ 		return nil, err
+ 	}
+ 
+-	medias, err := probe(client, query.Get("audio") != "0")
++	medias, err := probe(client, audio != "0")
+ 	if err != nil {
+ 		_ = client.Close()
+ 		return nil, err
+ 	}
++
++	// 摄像头每次 video start 都会从 IDR 开头，而 probe 为了拿到 VPS/SPS/PPS
++	// 把那一包读走了（切片和参数集在同一个 access unit 里），消费者于是要等
++	// 满一个 GOP 才有可解码的帧。重起一次流，让新的一轮从 IDR 开始。
++	_ = client.StopMedia()
++	time.Sleep(150 * time.Millisecond)
++	if err = client.StartMedia(channel, subtype, audio); err != nil {
++		_ = client.Close()
++		return nil, err
++	}
+ 
+ 	return &Producer{
+ 		Connection: core.Connection{

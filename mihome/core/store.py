@@ -1,0 +1,1502 @@
+"""运行时状态机：把"云端读数"变成"界面能直接画的卡片状态"。
+
+这一层是界面和控制之间唯一的桥，负责四件事：
+
+**1. 只轮询卡片上真的会显示的属性。**
+全量读 1403 条可读属性要 5 个请求、约 2 秒；卡片属性只有约 150 条，一个请求
+0.4 秒就够。所以轮询集合是 ``card.controls + card.metrics + gangs``，不是规格全集。
+规格里剩下的一千多条（固件版本、故障码、各种内部开关）只在详情页打开时按需读。
+
+**2. 乐观 UI + 版本号。**
+点开关先改本地值让界面立刻响应，再发请求。失败回滚。同一个属性被连续操作时，
+只有最后一次的回调有权改状态（``gen`` 版本号），否则会出现"快速点两下又弹回去"。
+
+**3. 写入静默期。**
+``api.Client`` 在写成功后会让该属性 3 秒内的回读失效。这一层配合保留乐观值，
+避免滑块松手后弹回旧位置。
+
+**4. 离线不轮询。**
+``DeviceNode.online`` 为假的设备直接跳过，既省请求也避免"离线一次就记成不支持"。
+
+状态存在 ``DeviceState.values`` 里，键是 ``(siid, piid)``——和 ``catalog.summary_line``
+的接口对齐，渲染卡片时不用再做一次映射。
+"""
+
+from __future__ import annotations
+
+import time
+from dataclasses import dataclass, field
+from typing import Any, Callable, Iterable, Mapping, Sequence
+
+from .api import Client, HomeNode, PropRef, ReadValue, Topology, classify, explain
+from .catalog import CardSpec, build_card, summary_line
+from .geek import Entry as GeekEntry
+from .geek import GeekError
+from .geek import candidates as geek_candidates
+from .geek import fetch as fetch_geek_entry
+from .geek import probe as geek_probe
+from .geek import remember as geek_remember
+from .jobs import PRIORITY_CONTROL, PRIORITY_DATA, SerialWorker
+from .prefs import HIDDEN_ROOM, HIDDEN_ROOM_ID, Prefs
+from .spec import DeviceSpec, PropertySpec, SpecRepository, localize
+from .tree import (
+    UNASSIGNED_ROOM_ID,
+    UNASSIGNED_ROOM_LABEL,
+    DeviceNode,
+)
+
+# 轮询的**频率**不在这里：它由"谁在看"决定（`ui/main_window.py` 的 `POLL_MS` /
+# `POLL_HIDDEN_MS`），Store 只负责"该发的时候发、上一轮没回来就跳过"。
+# 曾经这里还放着 POLL_INTERVAL_OK/FAST 两个数值常量，没有任何人读——留着等于第二份
+# 事实来源，改频率时容易只改一处。删掉（2026-11-10）。
+POLL_BACKOFF = 6.0  # 连续失败后的退避基数
+
+#: 两轮全量读之间至少隔这么久。写入确认的"全量读"会和 3 秒 tick 撞车：如果刚有
+#: 一轮 tick 读过（或上一轮确认读过），再来一次只是把同一批属性读两遍，既浪费
+#: 也可能拿到同一份缓存。跳过这一轮就够了，不需要调整 tick 的相位。
+FULL_READ_MIN_GAP = 1.0
+
+
+def _default_mute() -> float:
+    """``Client.write`` 在 ``mute=None`` 时实际用的静默期，用于给界面算确认延迟。"""
+    from .api import DEFAULT_MUTE
+
+    return DEFAULT_MUTE
+
+
+@dataclass
+class DeviceState:
+    """一台真机的运行时状态。"""
+
+    node: DeviceNode
+    spec: DeviceSpec | None
+    card: CardSpec
+    values: dict[tuple[int, int], Any] = field(default_factory=dict)
+    keys: dict[tuple[int, int], PropRef] = field(default_factory=dict)
+    optimistic: dict[tuple[int, int], Any] = field(default_factory=dict)
+    #: 每个属性**值最后一次变化**的云端时间戳（epoch 秒，来自 ``updateTime``）。
+    #: 只用于详情页"N 天未更新"的提示（判据见 ``core/freshness.py``），不参与取值逻辑；
+    #: 没有这个字段的属性（静态元数据）不会进来，界面据此不提示。
+    stamps: dict[tuple[int, int], int] = field(default_factory=dict)
+    gen: int = 0
+    updated_at: float = 0.0  # 本地最后一次成功读到数据的时间
+    error: str = ""
+    missing: int = 0  # 连续轮询失败次数
+
+    # -- 便捷查询 --------------------------------------------------------
+    @property
+    def did(self) -> str:
+        return self.node.did
+
+    @property
+    def name(self) -> str:
+        return self.node.name
+
+    @property
+    def online(self) -> bool:
+        return self.node.online
+
+    @property
+    def room(self) -> str:
+        return self.node.room
+
+    def get(self, siid: int, piid: int) -> Any:
+        return self.values.get((siid, piid))
+
+    def get_prop(self, prop: Any) -> Any:
+        if prop is None:
+            return None
+        return self.values.get((prop.siid, prop.piid))
+
+    def mode_active_value(self) -> Any:
+        """型号适配后的"模式激活值"；没适配（或还没读到）返回 ``None``。
+
+        界面判断模式高亮统一走这里：``None`` 表示该走默认路径（用 ``mode``
+        自己的值），不要自己拼 siid/piid 去 ``values`` 里查。
+        """
+        return self.get_prop(self.card.mode_active)
+
+    @property
+    def power(self) -> bool | None:
+        """卡片主开关的状态。None = 这台设备没有开关。"""
+        card = self.card
+        for c in card.controls:
+            if c.slot == "power" and c.prop is not None:
+                v = self.values.get(c.prop.key)
+                return bool(v) if v is not None else None
+        for g in card.gangs:
+            if g.is_wireless(self.values):
+                # 转无线的路继电器恒通，但那是"给灯供电"，不是"这盏灯开着"：
+                # 拿它算"已开启"，整块面板会永远显示开着，房间标题的台数也虚高。
+                continue
+            v = self.values.get(g.power.key)
+            if v:
+                return True
+        return False if card.gangs else None
+
+    @property
+    def any_on(self) -> bool:
+        if self.card.gangs:
+            # 全部转无线的面板没有可切换的负载，不该被算成"开着"
+            return any(
+                self.values.get(g.power.key)
+                for g in self.card.gangs
+                if not g.is_wireless(self.values)
+            )
+        return bool(self.power)
+
+    @property
+    def home_id(self) -> str:
+        return self.node.home_id
+
+    @property
+    def room_id(self) -> str:
+        # 没分到房间的设备统一落在这个占位值上：排序、分组、显示都靠它对齐，
+        # 不能用 "" / 0 冒充云端 id。
+        return self.node.room_id or UNASSIGNED_ROOM_ID
+
+    @property
+    def subtitle(self) -> str:
+        return summary_line(self.card, self.values)
+
+    @property
+    def age(self) -> float:
+        return time.monotonic() - self.updated_at if self.updated_at else 1e9
+
+
+@dataclass
+class RoomView:
+    """一个房间的展示数据。``home`` / ``room`` 都是云端 id，显示用 label。"""
+
+    home: str
+    home_label: str
+    room: str
+    devices: list[DeviceState] = field(default_factory=list)
+    #: ``"room"`` 普通房间 / ``"lost"`` 未分组 / ``"hidden"`` 已隐藏设备分组
+    kind: str = "room"
+    room_label: str = ""
+
+    @property
+    def display_room(self) -> str:
+        return self.room_label
+
+
+class Store:
+    """卡片状态仓库。所有方法都在主线程调用。"""
+
+    def __init__(
+        self,
+        client: Client,
+        worker: SerialWorker,
+        repo: SpecRepository | None = None,
+        prefs: Prefs | None = None,
+    ) -> None:
+        self.client = client
+        self.worker = worker
+        self.repo = repo or SpecRepository()
+        self.prefs = prefs or Prefs()
+        self.topology = Topology()
+        self.devices: dict[str, DeviceState] = {}
+        self.scenes: list[dict[str, Any]] = []
+        self.scenes_by_home: dict[str, list[dict[str, Any]]] = {}
+        self.home_id = ""
+        self.active_home = ""  # 当前正在看的家庭 id（首页只有这一个家庭）
+        self.loading = False
+        self.polling = False
+        self.last_poll = 0.0
+        self.last_error = ""
+        self.on_changed: Callable[[set[str]], None] | None = None
+        self.on_loaded: Callable[[], None] | None = None
+        self.on_status: Callable[[str], None] | None = None
+        self.on_layout_changed: Callable[[], None] | None = None
+        # 只影响顶部家庭标签外观的偏好（排列方式 / 激活样式）。单独一个回调，
+        # 免得改个字号就把整面卡片墙重建一遍。
+        self.on_tabs_changed: Callable[[], None] | None = None
+        # 每轮轮询结束后回调一次（主线程），参数是 `PollHealth.snapshot()`。
+        # 界面拿它决定要不要弹提醒——Store 自己不判断"该不该打扰用户"。
+        self.on_poll_health: Callable[[dict[str, Any]], None] | None = None
+        # 某台设备的「有没有极客版」探出来了（参数是 did）。界面拿它刷菜单提示，
+        # Store 自己不改界面。
+        self.on_geek_ability: Callable[[str], None] | None = None
+        #: 一条写请求**回包并确认成功**之后回调（主线程）：``(did, 期望值, mute 秒数)``。
+        #:
+        #: 界面拿它安排"写入确认"：写入是乐观的，屏幕上显示的就是目标值，真正要确认
+        #: 的是设备有没有照做。mute 从回包时刻起算，所以这里传的是同一个窗口值；
+        #: 动作没有 mute 条目，传 ``None``，由界面自己取一个延迟。
+        #: 期望值是 ``{(siid, piid): 值}``；动作没有目标值，传空字典。
+        #: 放在这里而不是各个 UI 入口：写入口有卡片、详情页、场景、批量好几处，
+        #: 逐处接线一定会漏。
+        self.on_write_done: (
+            Callable[[str, dict[tuple[int, int], Any], float | None], None] | None
+        ) = None
+        #: 没有单一目标设备的写（场景、音箱文本指令）成功之后的回调。
+        #:
+        #: 它们改到的设备是"哪几台说不好"，所以不按设备定向确认，而是让界面在
+        #: 回包后按几个固定时点做全量读（见 ``MainWindow._start_command_confirm``）。
+        self.on_command_done: Callable[[], None] | None = None
+        #: 上一轮**全量读**（tick 或确认读）的提交时刻，用来给确认读做 1 秒去重。
+        self._last_full_at = 0.0
+        self._poll_generation = 0
+        self._last_topology_change: set[str] = set()
+        # (URN, 型号) → (源规格, 套了型号级文案的规格)。规格对象换了就重算；
+        # 没换就复用同一个对象，否则 ``prev.spec is not spec`` 每次都为真，
+        # 一次拓扑刷新会把所有卡片重建成一遍。
+        self._text_specs: dict[tuple[str, str], tuple[DeviceSpec, DeviceSpec]] = {}
+        self._fail_streak = 0
+        self._next_poll_at = 0.0
+        #: 有一轮在线状态刷新已经派出去、还没回来（别堆叠）
+        self._online_pending = False
+        #: 本轮已经派出去、还没回来的能力探测（同一台别重复提交）
+        self._geek_pending: set[str] = set()
+
+    # -- 加载 ------------------------------------------------------------
+    def clear(self) -> None:
+        """退出登录时把内存里的家庭 / 设备 / 场景全丢掉。
+
+        不碰磁盘上的偏好（排序、隐藏设备还是用户的），下次登录回来顺序照旧。
+        """
+        self.devices.clear()
+        self.topology = Topology()
+        self.scenes = []
+        self.scenes_by_home = {}
+        self.active_home = ""
+        self.home_id = ""
+        self.loading = False
+        self.last_error = ""
+        self._geek_pending.clear()
+        if self.on_layout_changed:
+            self.on_layout_changed()
+
+    def load(self) -> None:
+        """后台拉拓扑 + 规格 + 建卡片，完成后回调 ``on_loaded``。"""
+        if self.loading:
+            return
+        self.loading = True
+        self._status("正在连接米家…")
+        self.worker.submit(self._load_job, priority=PRIORITY_CONTROL, label="load",
+                           callback=self._on_loaded)
+
+    def _load_job(self) -> tuple[Topology, dict[str, DeviceSpec], dict[str, list[dict[str, Any]]]]:
+        topo = self.client.load_topology()
+        urns = [d.spec_type for d in topo.real_devices()]
+        specs = self.repo.get_many(urns, workers=4)
+        # 场景是按家庭分开存的。两个家庭就是两次请求，启动时一起拿完，
+        # 切家庭时就不用再等一次网络。
+        scenes: dict[str, list[dict[str, Any]]] = {}
+        for home in topo.homes:
+            scenes[home.id] = self.client.scenes(home.id)
+        return topo, specs, scenes
+
+    def _on_loaded(self, result: Any, error: BaseException | None) -> None:
+        self.loading = False
+        if error is not None or result is None:
+            self.last_error = f"加载失败：{error}"
+            self._status(self.last_error)
+            return
+        topo, specs, scenes = result
+        self.scenes_by_home = scenes
+        self.home_id = topo.homes[0].id if topo.homes else ""
+        self.apply_topology(topo, specs)
+        ids = [h.id for h in self.homes()]
+        if self.active_home not in ids:
+            self.active_home = ids[0] if ids else ""
+        self.scenes = self.scenes_for(self.active_home)
+        self._status(f"已连接 · {len(self.devices)} 台设备")
+        if self.on_loaded:
+            self.on_loaded()
+        # 设备表齐了才谈得上"给谁探能力"。放在 on_loaded 之后：先把界面铺出来，
+        # 探测走低优先级队列，不和首屏抢带宽。
+        self.scan_geek_abilities()
+
+    def _text_spec(self, node: DeviceNode, specs: Mapping[str, DeviceSpec]) -> DeviceSpec | None:
+        """这台设备的规格，套上**型号级**文案覆盖；没登记就是原对象。
+
+        类别级文案在解析期就进了短名（URN 自带 category，缓存天然隔离），只有型号级
+        要在这里补：规格缓存按 URN 共享，而 URN 里的型号段（``yeelink-lamp22``）和
+        ``DeviceNode.model``（``yeelink.light.lamp22``）不是一个东西。
+
+        结果按 (URN, 型号) 记住：源规格没换就复用同一个对象，``apply_topology`` 里
+        ``prev.spec is not spec`` 才不会每次都为真（否则一次拓扑刷新会把所有卡片重建）。
+        """
+        spec = specs.get(node.spec_type) if node.spec_type else None
+        if spec is None:
+            return None
+        key = (node.spec_type or "", node.model or "")
+        cached = self._text_specs.get(key)
+        if cached is not None and cached[0] is spec:
+            return cached[1]
+        localized = localize(spec, node.model)
+        self._text_specs[key] = (spec, localized)
+        return localized
+
+    def apply_topology(self, topo: Topology, specs: Mapping[str, DeviceSpec]) -> None:
+        """用新拓扑重建设备表，尽量保留旧读数避免界面闪白。"""
+        old = self.devices
+        # 复用原来的 DeviceState 时，``prev.node`` 会被换成新节点；变更检测必须
+        # 拿**换之前**的值来比，否则就是在和刚写进去的自己比，永远相等。
+        before = {
+            did: (st.node.online, st.node.name, st.node.room) for did, st in old.items()
+        }
+        self.topology = topo
+        devices: dict[str, DeviceState] = {}
+        for node in topo.devices:
+            spec = self._text_spec(node, specs)
+            prev = old.get(node.did)
+            # 设备集合没变时复用同一个 DeviceState，界面就不用重建卡片
+            if prev is not None and prev.node.spec_type == node.spec_type:
+                prev.node = node
+                if spec is not None and prev.spec is not spec:
+                    prev.spec = spec
+                    prev.card = build_card(
+                        spec, did=node.did, model=node.model,
+                        gang_names=node.gang_names, gang_rooms=node.gang_rooms
+                    )
+                _register_keys(prev, node.did)
+                devices[node.did] = prev
+                continue
+            card = (
+                build_card(
+                    spec, did=node.did, model=node.model,
+                    gang_names=node.gang_names, gang_rooms=node.gang_rooms
+                )
+                if spec
+                else build_card_empty(node)
+            )
+            st = DeviceState(node=node, spec=spec, card=card)
+            if prev is not None:
+                st.values = {k: v for k, v in prev.values.items() if k in _card_keys(card)}
+                st.keys = prev.keys
+                # 时间戳**不过滤**：耗材页订阅的属性不属于卡片，按卡键筛会把它们的
+                # "上次读到是哪天的数"丢掉，离线后卡片就再也说不出读数有多旧。
+                # 这里只存读过的属性，不会随规格膨胀
+                st.stamps = dict(prev.stamps)
+                st.updated_at = prev.updated_at
+            # 预先登记卡片属性的完整寻址
+            _register_keys(st, node.did)
+            devices[node.did] = st
+        # 结构变化（增删设备）+ 状态变化（在线/改名）都要让界面知道
+        changed = set(old) ^ set(devices)
+        for did, st in devices.items():
+            prev = before.get(did)
+            if prev is not None and (
+                prev[0] != st.node.online
+                or prev[1] != st.node.name
+                or prev[2] != st.node.room
+            ):
+                changed.add(did)
+        self.devices = devices
+        self.sync_capability_fingerprints()
+        self.client.capabilities.save()
+        self._last_topology_change = changed
+
+    # -- 视图 ------------------------------------------------------------
+    def homes(self) -> list[HomeNode]:
+        """按用户偏好排过序的家庭。界面上的家庭切换栏直接用这个顺序。"""
+        by_id = {h.id: h for h in self.topology.homes if h.id}
+        return [by_id[hid] for hid in self.prefs.order_homes(list(by_id))]
+
+    def home_label(self, home_id: str) -> str:
+        for h in self.topology.homes:
+            if h.id == home_id:
+                return h.display_name
+        return home_id or "我的家"
+
+    def _home_id_of(self, state: DeviceState) -> str:
+        """设备归属的家庭 id。个别共享设备的 home_id 是空的，归到第一个家庭。"""
+        if state.node.home_id:
+            return state.node.home_id
+        return self.topology.homes[0].id if self.topology.homes else ""
+
+    def device_room(self, did: str) -> tuple[str, str] | None:
+        """设备所在的 (家庭 id, 房间 id)；没有房间的设备用稳定占位值。
+
+        隐藏 / 恢复时要把 did 追加到**它自己的房间**末尾，``Prefs`` 不知道
+        设备归属，只能由这里解析。设备还没加载出来时返回 ``None``。
+        """
+        st = self.devices.get(did)
+        if st is None:
+            return None
+        room_id = st.room_id
+        return self._home_id_of(st), room_id
+
+    def rooms(self, home_id: str | None = None) -> list[RoomView]:
+        """输出某个家庭的 房间 → 设备，顺序是"用户排过的在前，其余跟云端"。
+
+        ``hidden`` 分组的设备不会出现在自己的房间里，而是集中到末尾一组，
+        这样卡片墙只留真正会去点的东西。
+        """
+        homes = self.homes()
+        if home_id:
+            homes = [h for h in homes if h.id == home_id]
+        views: list[RoomView] = []
+        for h in homes:
+            by_id = {r.id: r for r in h.rooms}
+            for room_id in self.prefs.order_rooms(h.id, list(by_id)):
+                room_label = by_id[room_id].name
+                items = [
+                    d for d in self.devices.values()
+                    if d.room_id == room_id
+                    and self._home_id_of(d) == h.id
+                    and d.did not in self.prefs.hidden_set
+                ]
+                items = self._ordered_devices(h.id, room_id, items)
+                if items:
+                    views.append(
+                        RoomView(h.id, h.display_name, room_id, items, room_label=room_label)
+                    )
+            lost = [
+                d for d in self.devices.values()
+                if d.room_id == UNASSIGNED_ROOM_ID
+                and self._home_id_of(d) == h.id
+                and d.did not in self.prefs.hidden_set
+            ]
+            if lost:
+                views.append(
+                    RoomView(
+                        h.id,
+                        h.display_name,
+                        UNASSIGNED_ROOM_ID,
+                        self._ordered_devices(h.id, UNASSIGNED_ROOM_ID, lost),
+                        "lost",
+                        UNASSIGNED_ROOM_LABEL,
+                    )
+                )
+            hidden = self._hidden_devices(h.id)
+            if hidden:
+                views.append(
+                    RoomView(
+                        h.id, h.display_name, HIDDEN_ROOM_ID, hidden, "hidden", HIDDEN_ROOM,
+                    )
+                )
+        return views
+
+    def _ordered_devices(
+        self, home_id: str, room_id: str, items: list[DeviceState],
+    ) -> list[DeviceState]:
+        order = self.prefs.order_devices(home_id, room_id, [d.did for d in items])
+        by_did = {d.did: d for d in items}
+        return [by_did[did] for did in order]
+
+    def _hidden_devices(self, home_id: str) -> list[DeviceState]:
+        items = [
+            d for d in self.devices.values()
+            if d.did in self.prefs.hidden_set and self._home_id_of(d) == home_id
+        ]
+        order = self.prefs.order_hidden([d.did for d in items])
+        by_did = {d.did: d for d in items}
+        return [by_did[did] for did in order]
+
+    def room_entries(self, home_id: str) -> list[tuple[str, str]]:
+        """配置页用：这个家庭下所有房间 (id, 显示名)，含空房间与「未分组」。"""
+        node = next((h for h in self.topology.homes if h.id == home_id), None)
+        entries = [(r.id, r.name) for r in node.rooms] if node else []
+        if any(
+            self._home_id_of(d) == home_id
+            and d.room_id == UNASSIGNED_ROOM_ID
+            for d in self.devices.values()
+        ):
+            entries.append((UNASSIGNED_ROOM_ID, UNASSIGNED_ROOM_LABEL))
+        by_id = dict(entries)
+        ordered = self.prefs.order_rooms(home_id, [room_id for room_id, _ in entries])
+        return [(room_id, by_id[room_id]) for room_id in ordered]
+
+    def room_ids(self, home_id: str) -> list[str]:
+        return [room_id for room_id, _ in self.room_entries(home_id)]
+
+    def device_states(self, home_id: str, room_id: str) -> list[DeviceState]:
+        """配置页用：房间内全部设备（含被隐藏的），按当前顺序。"""
+        items = [
+            d for d in self.devices.values()
+            if self._home_id_of(d) == home_id and d.room_id == room_id
+        ]
+        return self._ordered_devices(home_id, room_id, items)
+
+    def home_devices(self, home_id: str) -> list[DeviceState]:
+        items = [d for d in self.devices.values() if self._home_id_of(d) == home_id]
+        return sorted(items, key=lambda d: (d.room_id, d.name))
+
+    def scenes_for(self, home_id: str, *, include_hidden: bool = False) -> list[dict[str, Any]]:
+        """按用户偏好排过的场景列表。未知的新场景追加在末尾。
+
+        默认滤掉被隐藏的场景（首页那排胶囊用）；设置页要 ``include_hidden=True``，
+        否则一旦隐藏就再也找不回来。
+        """
+        raw = self.scenes_by_home.get(home_id) or []
+        order = self.prefs.order_scenes(
+            home_id, [str(s.get("scene_id") or "") for s in raw],
+        )
+        by_id = {str(s.get("scene_id") or ""): s for s in raw}
+        hidden = self.prefs.hidden_scene_set
+        out = []
+        for sid in order:
+            scene = by_id.get(sid)
+            if scene is None:
+                continue
+            if not include_hidden and sid in hidden:
+                continue
+            out.append(scene)
+        return out
+
+    def home_ids(self) -> list[str]:
+        return [h.id for h in self.homes()]
+
+    def home_names(self) -> list[str]:
+        return [h.name for h in self.homes()]
+
+    # -- 顶部家庭标签的排列 / 激活样式 -----------------------------------
+    @property
+    def home_placement(self) -> str:
+        return self.prefs.home_placement
+
+    @property
+    def home_active_style(self) -> str:
+        return self.prefs.home_active_style
+
+    # -- 摄像头取流方式 --------------------------------------------------
+    @property
+    def camera_network(self) -> str:
+        return self.prefs.camera_network
+
+    def set_camera_network(self, value: str) -> bool:
+        return self.prefs.set_camera_network(value)
+
+    def set_home_layout(self, placement: str = "", style: str = "") -> None:
+        """改的是"怎么显示"，不是"什么顺序"——设定顺序始终留在 ``prefs.home_order``。"""
+        changed = False
+        if placement:
+            changed |= self.prefs.set_home_placement(placement)
+        if style:
+            changed |= self.prefs.set_home_active_style(style)
+        if changed and self.on_tabs_changed:
+            self.on_tabs_changed()
+
+    # -- 卡片外观 --------------------------------------------------------
+    def set_card_style(self, did: str, style_id: str | None = None) -> bool:
+        """右键菜单改卡片样式（宽度随样式一起换）：只落盘，**不重建整面墙**。
+
+        ``None`` 表示回默认，偏好里那条记录会被删掉。"默认"是哪一项由**品类**
+        决定（``CardSpec.default_style``，存在传感器指向状态卡），所以要把
+        ``default_id`` 一起交给 ``prefs``：在默认=标准的品类上点「标准」等于
+        删记录，而在默认=状态的设备上点「标准」是一条真实偏好，必须存下来。
+
+        设备集合和顺序都没变，走 ``_layout_changed()`` 会让滚动位置、鼠标悬停、
+        正在拖动的滑条全部丢掉。调用方拿返回值按 did 局部刷新那一张卡即可
+        （见 ``WallView.apply_card_style``）。
+        """
+        st = self.devices.get(did)
+        return self.prefs.set_card_style(
+            did, style_id, default_id=st.card.default_style if st is not None else None
+        )
+
+    # -- 排序与隐藏 ------------------------------------------------------
+    def set_home_order(self, home_ids: Sequence[str]) -> None:
+        self.prefs.set_home_order(home_ids)
+        self._layout_changed()
+
+    def set_room_order(self, home_id: str, room_ids: Sequence[str]) -> None:
+        self.prefs.set_room_order(home_id, room_ids)
+        self._layout_changed()
+
+    def set_device_order(
+        self, home_id: str, room_id: str, dids: Sequence[str], *, notify: bool = True
+    ) -> None:
+        """写入房间内的卡片顺序（只含可见设备）。
+
+        主界面拖动排序时传 ``notify=False``：布局项已经当场挪好了，再广播一次
+        ``on_layout_changed`` 会把整面墙重建，滚动位置和刚放下的卡片都会跳。
+        隐藏设备不在顺序表里，这一点由 ``Prefs`` 的写入口统一保证。
+        """
+        self.prefs.set_device_order(home_id, room_id, dids)
+        if notify:
+            self._layout_changed()
+
+    def set_scene_order(self, home_id: str, scene_ids: Sequence[str]) -> None:
+        self.prefs.set_scene_order(home_id, scene_ids)
+        self._layout_changed()
+
+    def set_hidden(self, did: str, hidden: bool) -> None:
+        # 恢复显示时要把 did 追加回它所在房间的末尾；隐藏时 Prefs 会把它
+        # 从顺序表里剔除，保证「顺序表 = 可见设备」。
+        slot = self.device_room(did) if not hidden else None
+        home, room = slot if slot is not None else ("", "")
+        if not self.prefs.set_hidden(did, hidden, home=home, room=room):
+            return
+        self._status("设备已隐藏，可在「设置 → 隐藏」里恢复" if hidden else "设备已恢复显示")
+        self._layout_changed()
+
+    def clear_hidden(self) -> None:
+        hidden = list(self.prefs.hidden)
+        if not self.prefs.clear_hidden():
+            return
+        # 全部恢复显示：逐台追加到各自房间末尾（与单台恢复同一口径）。
+        slots: list[tuple[str, str, str]] = []
+        for did in hidden:
+            slot = self.device_room(did)
+            if slot is not None:
+                slots.append((slot[0], slot[1], did))
+        if slots:
+            self.prefs.append_device_orders(slots)
+        self._status("已恢复全部隐藏设备")
+        self._layout_changed()
+
+    def set_scene_hidden(self, scene_id: str, hidden: bool) -> None:
+        if not self.prefs.set_scene_hidden(scene_id, hidden):
+            return
+        self._status("场景已隐藏，可在「设置 → 隐藏」里恢复" if hidden else "场景已恢复显示")
+        self._layout_changed()
+
+    # -- 设备配置重置 ----------------------------------------------------
+    def sync_capability_fingerprints(self) -> list[str]:
+        """按规格指纹校验能力账本：只清指纹变了的设备，**不发任何请求**。
+
+        没有规格的设备整个跳过——缺规格时清账会把"这台机型认不认"的结论误删。
+        正常启动（指纹全没变）除了内存比对什么都不做。
+        """
+        fingerprints = {
+            did: st.spec.urn
+            for did, st in self.devices.items()
+            if st.spec is not None and st.spec.urn
+        }
+        cleared = self.client.capabilities.sync_devices(fingerprints)
+        self.client.capabilities.save()  # 没脏就是空操作；首次登记要落盘
+        return cleared
+
+    def device_config_counts(self, did: str) -> dict[str, int]:
+        """这台设备当前有哪些本地配置（只统计，不改动），给确认窗报数。"""
+        return {
+            "style": 1 if self.prefs.card_style(did) else 0,
+            "hidden": 1 if self.prefs.is_hidden(did) else 0,
+            "order": self.prefs.device_order_hits(did),
+            "caps": self.client.capabilities.count_for(did),
+        }
+
+    def all_device_config_counts(self) -> dict[str, int]:
+        """所有设备的本地配置统计，口径与 ``device_config_counts`` 相同。"""
+        devices: set[str] = set(self.prefs.card_styles) | set(self.prefs.hidden)
+        for dids in self.prefs.device_order.values():
+            devices.update(dids)
+        return {
+            "devices": len(devices),
+            "style": len(self.prefs.card_styles),
+            "hidden": len(self.prefs.hidden),
+            "order": sum(len(dids) for dids in self.prefs.device_order.values()),
+            "caps": len(self.client.capabilities),
+        }
+
+    def reset_device_config(self, did: str) -> dict[str, int]:
+        """清掉一台设备的全部本地配置：能力缓存 + 样式 + 隐藏 + 房间内排序。
+
+        返回实际清掉的条数。不动凭据、也不向云端写任何东西。
+        """
+        counts = self.prefs.reset_device(did)
+        counts["caps"] = self.client.capabilities.forget_device(did)
+        self.client.capabilities.save()
+        if counts["style"] or counts["hidden"] or counts["order"]:
+            self._layout_changed()
+        return counts
+
+    def reset_all_device_config(self) -> dict[str, int]:
+        """清掉所有设备的本地配置，口径与 :meth:`reset_device_config` 相同。"""
+        counts = self.prefs.reset_all_devices()
+        counts["caps"] = self.client.capabilities.clear()
+        self.client.capabilities.save()
+        if counts["style"] or counts["hidden"] or counts["order"]:
+            self._layout_changed()
+        return counts
+
+    def apply_order_snapshot(
+        self,
+        *,
+        homes: Sequence[str] | None = None,
+        rooms: dict[str, Sequence[str]] | None = None,
+        devices: dict[tuple[str, str], Sequence[str]] | None = None,
+        scenes: dict[str, Sequence[str]] | None = None,
+    ) -> None:
+        """设置页拖完树之后一次性提交：只落一次盘、只重建一次界面。"""
+        self.prefs.set_orders(
+            home_order=homes, room_orders=rooms, device_orders=devices, scene_orders=scenes
+        )
+        self._layout_changed()
+
+    def _layout_changed(self) -> None:
+        if self.on_layout_changed:
+            self.on_layout_changed()
+
+    def refresh_layout(self) -> None:
+        """外部直接改了 ``prefs``（例如"恢复默认顺序"）后，通知界面重建。"""
+        self._layout_changed()
+
+
+    def counts(self, devices: Iterable[DeviceState] | None = None) -> dict[str, int]:
+        items = list(devices if devices is not None else self.devices.values())
+        return {
+            "total": len(items),
+            "on": sum(1 for d in items if d.any_on),
+            "offline": sum(1 for d in items if not d.online),
+        }
+
+    # -- 轮询 ------------------------------------------------------------
+    def poll_refs(self) -> list[PropRef]:
+        """这一轮要读的属性：**卡片用到的** + **耗材页订阅的**。
+
+        耗材属性常常不在卡片上（滤芯寿命、洗衣液余量这类只读量），只按
+        ``_card_keys`` 永远读不到；这里按用户订阅的清单补一遍，走同一套
+        3 秒 / 15 秒轮询，不另开定时器（2026-11-18 用户定的口径：耗材跟着
+        现有节奏刷新，别再造一套低频轮询）。代价是每轮多一条 ref，同一台设备的
+        属性在客户端那边是合并成一次请求的，所以不是"多一台设备的轮询"。
+        """
+        refs: list[PropRef] = []
+        seen: set[tuple[str, int, int]] = set()
+
+        def take(st: DeviceState, key: tuple[int, int]) -> None:
+            mark = (st.did, key[0], key[1])
+            if mark in seen:
+                return
+            ref = st.keys.get(key)
+            if ref is not None:
+                seen.add(mark)
+                refs.append(ref)
+
+        for st in self.devices.values():
+            if not st.online or st.spec is None:
+                continue
+            for key in _card_keys(st.card):
+                take(st, key)
+        for item in self.prefs.consumables:
+            if not item.is_configured:
+                continue    # 空壳（还没选属性）没有可读的东西
+            st = self.devices.get(item.did)
+            if st is None or not st.online or st.spec is None:
+                continue
+            take(st, (item.siid, item.piid))
+        return refs
+
+    def poll(self) -> None:
+        """发起一轮读取。上一轮没回来就跳过，避免请求堆积。"""
+        if self.polling or self.loading or not self.devices:
+            return
+        # 连续失败后指数退避：网络抖动时不要每 3 秒空打一次请求
+        if time.monotonic() < self._next_poll_at:
+            return
+        refs = self.poll_refs()
+        if not refs:
+            return
+        self.polling = True
+        self._last_full_at = time.monotonic()
+        gen = self._poll_generation
+        self.worker.submit(
+            self.client.read,
+            (refs,),
+            # 只有属性轮询进健康账本；写后补读、详情页按需读不传 source
+            kwargs={"source": "poll"},
+            priority=PRIORITY_DATA,
+            label="poll",
+            callback=lambda res, err: self._on_polled(gen, res, err),
+        )
+
+    def _on_polled(self, gen: int, result: Any, error: BaseException | None) -> None:
+        self.polling = False
+        if gen != self._poll_generation:  # 拓扑已重建，这批结果作废
+            return
+        self.last_poll = time.monotonic()
+        try:
+            self._apply_poll(result, error)
+        finally:
+            # 每轮结束都把健康快照交给界面。放 finally 里，失败分支也不会漏。
+            if self.on_poll_health is not None:
+                self.on_poll_health(self.client.health.snapshot())
+
+    def _apply_poll(self, result: Any, error: BaseException | None) -> None:
+        # 判据是"这轮到底读回来东西没有"，不是"返回值是不是 Mapping"：
+        # 整轮网络失败时 ``read`` 返回的是空 dict，那也是 Mapping，以前会被判成功，
+        # 于是退避永远不触发、界面还显示"已重新连接"。空读（没有可读属性 /
+        # 全部确认不支持）由 ``Client.last_poll_ok`` 区分为正常。
+        if (
+            error is not None
+            or not isinstance(result, Mapping)
+            or self.client.last_poll_ok is False
+        ):
+            self._fail_streak += 1
+            backoff = min(POLL_BACKOFF * self._fail_streak, 30.0)
+            self._next_poll_at = time.monotonic() + backoff
+            reason = error or self.client.last_error or "本轮没有读回任何属性"
+            self.last_error = f"轮询失败：{reason}"
+            # 退避的起始时间与当前间隔一并记进健康账本（不改变退避本身的计算）
+            self.client.health.backoff(streak=self._fail_streak, seconds=backoff)
+            if self._fail_streak == 1:
+                self._status(f"连接不稳定，{int(backoff)} 秒后重试…")
+            return
+        if self._fail_streak:
+            self._fail_streak = 0
+            self._next_poll_at = 0.0
+            self.client.health.backoff(streak=0, seconds=0.0)
+            self._status("已重新连接")
+        self._apply_values(result)
+
+    def _apply_values(self, result: Mapping[Any, Any]) -> None:
+        """把一批读回的值写进 ``DeviceState``（不做健康账本）。
+
+        轮询和"写入确认"共用这一段：后者只关心值到没到，不该因为一台设备读慢了
+        就影响全局的失败计数与退避。
+        """
+        changed: set[str] = set()
+        now = time.monotonic()
+        for ref, rv in result.items():  # type: ignore[union-attr]
+            if not isinstance(rv, ReadValue):
+                continue
+            st = self.devices.get(ref.did)
+            if st is None:
+                continue
+            key = (ref.siid, ref.piid)
+            if not rv.ok:
+                if rv.unsupported:
+                    st.missing += 1
+                continue
+            st.updated_at = now
+            st.missing = 0
+            if rv.update_time:
+                st.stamps[key] = rv.update_time
+            if key in st.optimistic:
+                # 静默期的双保险：api 层已过滤，这里再挡一次
+                continue
+            if st.values.get(key) != rv.value:
+                st.values[key] = rv.value
+                changed.add(ref.did)
+        if changed:
+            self._changed(changed)
+
+    # -- 在线状态 --------------------------------------------------------
+    def refresh_online(self) -> None:
+        """把云端设备清单里的 ``isOnline`` 同步到 ``DeviceState.online``。
+
+        **为什么不在 ``poll`` 里顺手做**：属性轮询拿到的是云缓存，离线设备照样
+        回 ``code=0``（见 ``Client.device_online``），判不出在线；唯一来源是设备
+        清单，而它要逐家庭请求，比一轮属性读贵。所以这里只提供"刷新一次"的能力，
+        **什么时候刷由界面决定**——它挂在既有的轮询 tick 上，不另起定时器。
+        """
+        if self._online_pending or self.loading or not self.devices:
+            return
+        self._online_pending = True
+        self.worker.submit(
+            self.client.device_online,
+            priority=PRIORITY_DATA,
+            label="online",
+            callback=self._on_online,
+        )
+
+    def _on_online(self, result: Any, error: BaseException | None) -> None:
+        self._online_pending = False
+        if error is not None or not isinstance(result, Mapping):
+            return
+        changed: set[str] = set()
+        for did, online in result.items():
+            st = self.devices.get(did)
+            if st is None:
+                continue
+            online = bool(online)
+            if st.node.online == online:
+                continue
+            st.node.online = online
+            changed.add(did)
+        if changed:
+            # 只通知真的变了的设备：卡片、顶栏离线数、音箱候选都跟着这张表走；
+            # 变回在线的设备下一轮 ``poll_refs`` 会自动重新纳入
+            self._changed(changed)
+
+    def card_refs(self, did: str) -> list[Any]:
+        """这台设备卡片上展示的属性引用（写入确认只读这些）。"""
+        st = self.devices.get(did)
+        if st is None or not st.online:
+            return []
+        return [st.keys[k] for k in _card_keys(st.card) if k in st.keys]
+
+    def confirm_read(
+        self,
+        did: str,
+        refs: Sequence[Any],
+        done: Callable[[dict[Any, Any] | None, BaseException | None], None],
+    ) -> None:
+        """写入确认用的定向读：回填界面，但**不进轮询健康账本**。
+
+        失败不加 ``_fail_streak``、也不清它——否则一次确认失败会把全局轮询推进
+        退避，或者把正在退避的状态误判成"已恢复"。
+        """
+        self.worker.submit(
+            self.client.read,
+            (refs,),
+            priority=PRIORITY_DATA,
+            label="confirm",
+            callback=lambda res, err: self._on_confirm_read(res, err, done),
+        )
+
+    def _on_confirm_read(
+        self,
+        result: Any,
+        error: BaseException | None,
+        done: Callable[[dict[Any, Any] | None, BaseException | None], None],
+    ) -> None:
+        if error is None and isinstance(result, Mapping):
+            self._apply_values(result)
+        done(result if isinstance(result, Mapping) else None, error)
+
+    def confirm_full(
+        self,
+        done: Callable[[Mapping[Any, Any] | None, BaseException | None], None],
+    ) -> None:
+        """确认用的**全量**读（在线设备的卡片属性）。
+
+        和 tick 完全解耦：不碰 ``_poll_timer``、不改它的相位、也不取消它，只是往
+        同一条串行队列里塞一个一次性 job。距离上一轮全量读不足 ``FULL_READ_MIN_GAP``
+        时直接跳过（``done(None, None)``），避免和刚跑过的 tick 读同一批。
+
+        不做"值有没有变化"的判断：签名覆盖全部设备，温湿度/PM2.5/人体存在这类
+        常变属性会让它必然为真，拿它做早停等于没有早停。需要比对期望值的只有
+        目标写确认的最后一轮，它自己看 ``result``。
+        """
+        if time.monotonic() - self._last_full_at < FULL_READ_MIN_GAP:
+            done(None, None)
+            return
+        refs = self.poll_refs()
+        if not refs:
+            done(None, None)
+            return
+        self._last_full_at = time.monotonic()
+        self.worker.submit(
+            self.client.read,
+            (refs,),
+            priority=PRIORITY_DATA,
+            label="confirm-full",
+            callback=lambda res, err: self._on_confirm_full(res, err, done),
+        )
+
+    def _on_confirm_full(
+        self,
+        result: Any,
+        error: BaseException | None,
+        done: Callable[[Mapping[Any, Any] | None, BaseException | None], None],
+    ) -> None:
+        if error is not None or not isinstance(result, Mapping):
+            done(None, error)
+            return
+        self._apply_values(result)
+        done(result, None)
+
+    def read_props(
+        self,
+        did: str,
+        props: Iterable[PropertySpec],
+        done: Callable[[dict[tuple[int, int], ReadValue], str], None],
+    ) -> None:
+        """按需读一批不在轮询里的属性（详情页「更多功能」）。
+
+        这些属性平时不参与轮询：设备多的时候全量读一次要两秒。只有用户真的展开
+        「更多功能」才发这一批请求，读完照常回填 ``values`` 并通知界面刷新。
+        ``done`` 在主线程回调：(读取结果, 错误文案)；请求本身没出错时错误文案为空，
+        单项失败由界面按 ``ReadValue.ok`` 自己统计。
+        """
+        st = self.devices.get(did)
+        if st is None or not st.online:
+            done({}, "设备离线")
+            return
+        refs: list[PropRef] = []
+        seen: set[tuple[int, int]] = set()
+        for prop in props:
+            key = (prop.siid, prop.piid)
+            ref = st.keys.get(key)
+            if ref is not None and key not in seen:
+                seen.add(key)
+                refs.append(ref)
+        if not refs:
+            done({}, "没有可读取的属性")
+            return
+
+        def finish(res: Any, err: BaseException | None) -> None:
+            if err is not None or not isinstance(res, Mapping):
+                done({}, f"读取失败：{err or '无返回'}")
+                return
+            out: dict[tuple[int, int], ReadValue] = {}
+            changed = False
+            now = time.monotonic()
+            for ref, rv in res.items():
+                if not isinstance(rv, ReadValue):
+                    continue
+                key = (ref.siid, ref.piid)
+                out[key] = rv
+                if not rv.ok or key in st.optimistic:
+                    continue
+                st.updated_at = now
+                if rv.update_time:
+                    st.stamps[key] = rv.update_time
+                if st.values.get(key) != rv.value:
+                    st.values[key] = rv.value
+                    changed = True
+            if changed:
+                self._changed({did})
+            done(out, "")
+
+        self.worker.submit(
+            self.client.read,
+            (refs,),
+            priority=PRIORITY_DATA,
+            label="detail",
+            callback=finish,
+        )
+
+    def refresh_capabilities(
+        self,
+        did: str,
+        done: Callable[[int, int, str], None],
+    ) -> None:
+        """清掉这台设备的「已确认不支持」记录，并立刻重查它全部可读属性。
+
+        ``done(成功项数, 失败项数, 错误文案)`` 在主线程回调。**先清后读**：
+        即使设备离线、这次重查失败，旧结论也已经作废，下次上线会重新学。
+
+        清掉多少条旧记录**只写控制台日志**：界面上只说刷新结果，
+        "能力账本""记录"这些是内部说法，用户不该看到。
+        """
+        st = self.devices.get(did)
+        removed = self.client.capabilities.forget_device(did)
+        self.client.capabilities.save()
+        if removed:
+            print(f"[caps] 强制刷新 {did}：清掉 {removed} 条已确认不支持的记录")
+        if st is None:
+            done(0, 0, "设备不在当前家庭")
+            return
+        if st.spec is None:
+            done(0, 0, "这台设备缺少规格，无法重查")
+            return
+        props = [p for p in st.spec.properties if p.readable]
+        if not props:
+            done(0, 0, "没有可读取的属性")
+            return
+
+        total = len(props)
+
+        def finish(res: Any, err: str) -> None:
+            values = res or {}
+            ok = sum(1 for v in values.values() if getattr(v, "ok", True))
+            failed = sum(1 for v in values.values() if not getattr(v, "ok", True))
+            if not values:
+                # 一个都没回来：整批失败，按总项数算
+                failed = total
+            if failed or err:
+                print(
+                    f"[caps] 强制刷新 {did}：{failed}/{total} 项未读到"
+                    + (f"，原因：{err}" if err else "")
+                )
+            done(ok, failed, err)
+
+        self.read_props(did, props, finish)
+
+    # -- 写入 ------------------------------------------------------------
+    def set_value(self, did: str, key: tuple[int, int], value: Any, *, mute: float | None = None) -> bool:
+        """乐观写入。返回 False 表示这台设备当前不可控。"""
+        st = self.devices.get(did)
+        if st is None or not st.node.spec_type:
+            return False
+        ref = st.keys.get(key)
+        if ref is None:
+            return False
+
+        old = st.values.get(key)
+        st.gen += 1
+        gen = st.gen
+        st.values[key] = value
+        st.optimistic[key] = value
+        self._changed({did})
+
+        def done(res: Any, err: BaseException | None) -> None:
+            if self._on_written(did, key, old, gen, res, err, mute):
+                window = mute if mute is not None else _default_mute()
+                self._notify_write_done(did, {key: value}, window)
+
+        self.worker.submit(
+            self.client.write,
+            ([(ref, value)],),
+            kwargs={"mute": mute},
+            priority=PRIORITY_CONTROL,
+            label="write",
+            callback=done,
+        )
+        return True
+
+    def _notify_write_done(
+        self,
+        did: str,
+        expected: dict[tuple[int, int], Any],
+        mute: float | None,
+    ) -> None:
+        """告诉界面"这台设备的写已经回包成功"，由界面安排写入确认。"""
+        cb = self.on_write_done
+        if cb is None:
+            return
+        try:
+            cb(did, expected, mute)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def schedule_confirm(self) -> None:
+        """动作执行完，让界面那串 1 / 2.5 / 4 秒的全量读跑起来。
+
+        **只有"效果落在别的设备上"的动作需要**（目前是音箱的「执行文本指令」：
+        "打开客厅灯"这类指令经极客版 / 米家自动化去动别的设备，只能靠全量读看到
+        结果）。唤醒、播报文字、发送虚拟事件都不改变任何可读属性，回读只是把同一批
+        属性白读三遍，还占着串行队列给后面的动作添堵——判据在
+        ``automation.action_catalog.Feature.refreshes``，别在调用处写 ``if``。
+        """
+        self._notify_command_done()
+
+    def _notify_command_done(self) -> None:
+        """场景 / 音箱指令：没有目标设备，由界面按几个时点做全量读。"""
+        cb = self.on_command_done
+        if cb is None:
+            return
+        try:
+            cb()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _on_written(
+        self,
+        did: str,
+        key: tuple[int, int],
+        old: Any,
+        gen: int,
+        result: Any,
+        error: BaseException | None,
+        mute: float | None,
+    ) -> bool:
+        st = self.devices.get(did)
+        if st is None:
+            return False
+        ok = False
+        if error is None and isinstance(result, Mapping):
+            from .api import classify
+
+            ok = all(classify(int(c)) == "ok" for c in result.values()) if result else False
+        if gen != st.gen:
+            # 期间用户又操作了同一台设备，交给最后一次回调决定
+            return False
+        st.optimistic.pop(key, None)
+        if not ok:
+            st.values[key] = old
+            st.error = "操作失败，已还原"
+            self._changed({did})
+            return False
+        st.error = ""
+        self._changed({did})
+        return True
+
+    def set_power_for_devices(self, dids: Sequence[str], value: Any) -> int:
+        """把一组设备的电源键一次性写到同一个值，返回实际下发的属性条数。
+
+        界面上的「房间全开 / 全关」已经去掉了（一个房间品类太杂，一刀切没有意义），
+        这里留着是因为"批量关一组设备"仍是自动化动作的基础能力，并且有
+        ``scripts/verify_batch.py`` 覆盖着——一次请求打多条属性、失败逐条回滚。
+        """
+        targets: list[tuple[str, tuple[int, int]]] = []
+        for did in dids:
+            st = self.devices.get(did)
+            if st is None:
+                continue
+            for ctl in st.card.controls:
+                if ctl.slot == "power" and ctl.prop is not None:
+                    targets.append((did, ctl.prop.key))
+            for g in st.card.gangs:
+                if g.is_wireless(st.values):
+                    # 转无线那一路写 on/off 没有意义（固件不认），批量关灯时跳过
+                    continue
+                targets.append((did, g.power.key))
+        return self.set_many(targets, value, mute=2.0)
+
+    def set_many(
+        self,
+        targets: Sequence[tuple[str, tuple[int, int]]],
+        value: Any,
+        *,
+        mute: float | None = 2.0,
+    ) -> int:
+        """一次请求写多条属性（乐观 UI 仍然逐条记版本号）。"""
+        pairs: list[tuple[PropRef, Any]] = []
+        plan: list[tuple[str, tuple[int, int], Any, int]] = []
+        pending: set[str] = set()
+        for did, key in targets:
+            st = self.devices.get(did)
+            if st is None or not st.online or not st.node.spec_type:
+                continue
+            ref = st.keys.get(key)
+            if ref is None:
+                continue
+            old = st.values.get(key)
+            if old == value:
+                continue
+            st.gen += 1
+            st.values[key] = value
+            st.optimistic[key] = value
+            plan.append((did, key, old, st.gen))
+            pairs.append((ref, value))
+            pending.add(did)
+        if not pairs:
+            return 0
+        self._changed(pending)
+
+        def done(result: Any, error: BaseException | None) -> None:
+            ok = (
+                error is None
+                and isinstance(result, Mapping)
+                and bool(result)
+                and all(classify(int(c)) == "ok" for c in result.values())
+            )
+            touched: set[str] = set()
+            expected: dict[str, dict[tuple[int, int], Any]] = {}
+            for did, key, old, gen in plan:
+                st = self.devices.get(did)
+                if st is None or gen != st.gen:
+                    continue
+                st.optimistic.pop(key, None)
+                if not ok:
+                    st.values[key] = old
+                    st.error = "操作失败，已还原"
+                else:
+                    expected.setdefault(did, {})[key] = value
+                touched.add(did)
+            self._changed(touched)
+            self._status(
+                f"已{'开启' if value else '关闭'} {len(pairs)} 项"
+                if ok
+                else "批量操作失败，已还原"
+            )
+            if ok:
+                window = mute if mute is not None else _default_mute()
+                for did, exp in expected.items():
+                    self._notify_write_done(did, exp, window)
+
+        self.worker.submit(
+            self.client.write,
+            (pairs,),
+            kwargs={"mute": mute},
+            priority=PRIORITY_CONTROL,
+            label="write-many",
+            callback=done,
+        )
+        return len(pairs)
+
+    def toggle(self, did: str, siid: int, piid: int) -> None:
+        st = self.devices.get(did)
+        if st is None:
+            return
+        cur = st.values.get((siid, piid))
+        self.set_value(did, (siid, piid), not bool(cur), mute=2.0)
+
+    def run_action(
+        self,
+        did: str,
+        siid: int,
+        aiid: int,
+        value: Sequence[Any] | None = None,
+        *,
+        on_done: Callable[[int, str], None] | None = None,
+        untargeted: bool = False,
+    ) -> None:
+        """执行一次设备方法。``on_done`` 收到 ``(错误码, 失败原因)``，0 表示成功。
+
+        码与原因都是 ``Client.run_action`` 的既有契约（云端非 0 码会原样返回，
+        异常统一 -1 并在 ``last_error`` 里留一句话），这里只做搬运。
+
+        ``untargeted=True`` 用于"影响面不在这个 did 上"的动作（目前是音箱文本指令）：
+        不按这台设备做定向确认，改走场景那条"几个时点全量读"的序列。
+        """
+
+        def done(res: Any, err: BaseException | None) -> None:
+            if err is not None:
+                st = self.devices.get(did)
+                if st:
+                    st.error = f"动作失败：{err}"
+                    self._changed({did})
+                code = -1
+                reason = str(err)
+            else:
+                code = int(res) if isinstance(res, int) else 0
+                reason = "" if code == 0 else (self.client.last_error or explain(code))
+                if code == 0:
+                    # 动作没有目标值，也没有 mute 条目：只让界面按 card 属性回读几次。
+                    # 音箱文本指令影响的是别的设备，走"全量读"那条序列。
+                    if untargeted:
+                        self._notify_command_done()
+                    else:
+                        self._notify_write_done(did, {}, None)
+            if on_done is not None:
+                on_done(code, reason)
+
+        self.worker.submit(
+            self.client.run_action,
+            ((did, siid, aiid), value),
+            priority=PRIORITY_CONTROL,
+            label="action",
+            callback=done,
+        )
+
+    # -- 极客版能力探测 ----------------------------------------------------
+    #: 一次启动最多探几台。**探的已经不是全屋设备**（只探 gateway / router /
+    #: screen / central-control，见 ``geek.candidates``），正常家庭 1~3 台就够；
+    #: 这里留 8 是给"某户装了一排中控屏"封顶，别让探测挤在正常轮询前面。
+    GEEK_SCAN_LIMIT = 8
+
+    def scan_geek_abilities(self) -> None:
+        """给**还没登记的**中枢类设备各发一条不耗码的探测，判定它有没有极客版。
+
+        判据的主路径是**型号白名单**（``adapters`` 台账里的 ``geek=True``，
+        见 ``geek.declared``）：登记过的型号零请求直接显示入口，连这一步都不会走。
+        探测只用来"捡漏"——用户新添了一台没登记的中枢设备时，不至于永远看不到
+        入口。
+
+        成本上限：只探中枢类品类，每台**一次**请求，结论落盘
+        （``geek_ability.json``）；"不支持"的结论 7 天后才重探一次；共享家庭
+        整户跳过（那是另一户人家，不替他们发请求），离线设备也跳过。
+
+        为什么不再全屋扫（2026-11-16 改）：实测 43 条探测只换来 1 台设备显示入口，
+        38 个型号判否且每周重探——拿几十条请求去赌一个本该写死的型号事实。
+        """
+        shared = {h.name for h in self.topology.homes if h.shared}
+        nodes = [st.node for st in self.devices.values() if st.node.did not in self._geek_pending]
+        for node in geek_candidates(nodes, shared, limit=self.GEEK_SCAN_LIMIT):
+            self._geek_pending.add(node.did)
+            self.worker.submit(
+                geek_probe,
+                (self.client.raw(), node.did),
+                priority=PRIORITY_DATA,
+                label="geek-probe",
+                callback=lambda result, error, d=node.did, m=node.model: self._on_ability(
+                    d, m, result, error
+                ),
+            )
+
+    def _on_ability(
+        self, did: str, model: str, result: Any, error: BaseException | None
+    ) -> None:
+        self._geek_pending.discard(did)
+        if error is not None:
+            # 工作线程层面就抛了（不是"设备说没有"）：当没探过，下次启动再来
+            return
+        geek_remember(did, model, bool(result))
+        if self.on_geek_ability:
+            self.on_geek_ability(did)
+
+    def fetch_geek_passcode(
+        self,
+        did: str,
+        on_done: Callable[[GeekEntry | None, str, str], None],
+    ) -> None:
+        """取一枚极客版登录码。``on_done(entry, 错误原因, 可用地址)``。
+
+        成功时 ``entry`` 有值（``url`` + ``code``）；失败时 ``entry`` 为 ``None``、
+        第二个参数是一句人话，第三个参数有值表示地址已经拿到、网页还能打开。
+
+        **一次调用 = 消耗一枚码**（取新码会让旧码立即失效），所以这里没有缓存、
+        没有重试、也没有自动刷新——只由用户点按钮触发。
+        """
+
+        def done(result: Any, error: BaseException | None) -> None:
+            if error is None and isinstance(result, GeekEntry):
+                on_done(result, "", "")
+                return
+            url = error.url if isinstance(error, GeekError) else ""
+            on_done(None, str(error) if error is not None else "取码失败", url)
+
+        self.worker.submit(
+            fetch_geek_entry,
+            (self.client.raw(), did),
+            priority=PRIORITY_CONTROL,
+            label="geek",
+            callback=done,
+        )
+
+    def run_scene(self, scene_id: str, home_id: str = "") -> None:
+        self.worker.submit(
+            self.client.run_scene,
+            (scene_id, home_id or self.home_id),
+            priority=PRIORITY_CONTROL,
+            label="scene",
+            callback=self._on_scene_done,
+        )
+
+    def _on_scene_done(self, result: Any, error: BaseException | None) -> None:
+        ok = error is None and result is not False
+        self._status("场景执行失败" if not ok else "场景已执行")
+        if ok:
+            # 场景改到哪几台说不准：不按设备确认，交给界面的固定时点全量读序列
+            self._notify_command_done()
+
+    # -- 杂务 ------------------------------------------------------------
+    @property
+    def topology_changed(self) -> set[str]:
+        """上一次加载中增删或状态变了的设备。空集说明只需要局部刷新卡片。"""
+        return self._last_topology_change
+
+    def rebuild(self) -> None:
+        """拓扑变了（新增/删除设备）后重新加载规格并换代。"""
+        self._poll_generation += 1
+        self.polling = False
+        self.load()
+
+    def _changed(self, dids: set[str]) -> None:
+        if self.on_changed and dids:
+            self.on_changed(dids)
+
+    def _status(self, text: str) -> None:
+        if self.on_status:
+            self.on_status(text)
+
+
+# ---------------------------------------------------------------------------
+# 卡片属性的收集
+# ---------------------------------------------------------------------------
+
+
+def _card_props(card: CardSpec) -> list[tuple[tuple[int, int], Any]]:
+    out: list[tuple[tuple[int, int], Any]] = []
+    for c in card.controls:
+        if c.prop is not None:
+            out.append((c.prop.key, c.prop))
+    for m in card.metrics:
+        if m.prop is not None:
+            out.append((m.prop.key, m.prop))
+    for g in card.gangs:
+        out.append((g.power.key, g.power))
+        # 每一路的"有线 / 转无线"必须跟着轮询走：它决定这一路能不能点。
+        # 单独读 mode 的属性名和 on 同服务，寻址不冲突（(siid,2) vs (siid,1)）。
+        if g.mode is not None and g.wireless_value is not None:
+            out.append((g.mode.key, g.mode))
+    # 型号级轮询扩展（CardSpec.extra）：只读状态，不渲染，但要跟着轮询走。
+    # 未适配的机型这里是空列表，所以轮询集合完全不变。
+    for p in card.extra:
+        out.append((p.key, p))
+    return out
+
+
+def _register_keys(st: DeviceState, did: str) -> None:
+    """登记卡片各属性的完整寻址。
+
+    controls / metrics / gangs / extra 参与轮询；advanced 不参与轮询（展开详情页
+    才按需读），但也要登记——不然「更多功能」里的控件连写都写不出去
+    （``set_value`` 查不到 ref）。
+    """
+    for key, prop in _card_props(st.card):
+        st.keys[key] = PropRef(did, prop.siid, prop.piid)
+    for prop in st.card.advanced:
+        st.keys[(prop.siid, prop.piid)] = PropRef(did, prop.siid, prop.piid)
+
+
+def _card_keys(card: CardSpec) -> set[tuple[int, int]]:
+    return {key for key, _ in _card_props(card)}
+
+
+def build_card_empty(node: DeviceNode) -> CardSpec:
+    """没有 spec_type 的设备（如手环）：只展示，不给控件。"""
+    from .catalog import GENERIC
+
+    return CardSpec(category="unknown", profile=GENERIC, did=node.did, model=node.model)
+
+
+__all__ = ["DeviceState", "RoomView", "Store", "build_card_empty"]
