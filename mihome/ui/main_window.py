@@ -1169,10 +1169,10 @@ class MainWindow(QMainWindow):
         # 规则按家庭隔离：停在自动化页时切家庭，列表要跟着换成新家的
         if self.pages.currentIndex() == self._zone_pages["automation"]:
             self.automation_page.refresh()
-        # 耗材页也是按家庭分的：换家要换成本家的监控项，侧栏圆点跟着变。
-        # 这次重建保留滚动位置——用户只是切了个家，不是要求回到列表开头。
-        self.consumables_page.refresh(preserve_scroll=True)
-        # 监控页的选源栏也只列当前家庭的摄像头；页面不显示时重建没有副作用
+        # 耗材页**不跟着切家庭**（2026-11-21 起按全部家庭统计，见 consumables_page）：
+        # 这里不再重建。重建一次内容也不会变，只是白丢焦点。侧栏那两颗圆点同理，
+        # 它们现在也是全家庭计数，不随这个动作变化。
+        # 监控页的选源栏只列当前家庭的摄像头；页面不显示时重建没有副作用
         self.monitor_page.refresh()
         self.store.poll()
 
@@ -1197,7 +1197,12 @@ class MainWindow(QMainWindow):
         self._refresh_speakers()
 
     def _on_consumable_counts(self, warn: int, crit: int) -> None:
-        """把「N 项轻提醒 / M 项重提醒」画到侧栏「耗材」入口后面。"""
+        """把「N 项轻提醒 / M 项重提醒」画到侧栏「耗材」入口和挂件右下角。
+
+        2026-11-21 起耗材页跨家庭统计，所以这两个数**本身就是全部家庭的合计**，
+        两个消费者拿同一份数、不会再出现"挂件说 3 项、侧栏说 0 项"。以后若有人
+        想把侧栏改回单家庭，必须同时给挂件单独算一份——别只改这一边。
+        """
         self.nav.set_zone_badges("consumables", warn, crit)
         self.widget_panel.set_badges(warn, crit)
 

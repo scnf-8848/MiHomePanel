@@ -235,7 +235,12 @@ class DesktopWidget(QWidget):
         self.update()
 
     def set_badges(self, warn: int, crit: int) -> None:
-        """耗材圆点。由主窗口转发 ``consumables_page.counts_changed``。"""
+        """耗材圆点。由主窗口转发 ``consumables_page.counts_changed``。
+
+        这两个数是**全部家庭的合计**（2026-11-21 起耗材页跨家庭）：挂件本身跨家庭，
+        页脚左边那句「N 台设备 · M 台离线」也是全量，两边口径一致才对得上。
+        不要把这里改成"当前家庭"——那会让同一个页脚里出现两种统计范围。
+        """
         warn, crit = int(warn), int(crit)
         if (warn, crit) != (self._badge_warn, self._badge_crit):
             self._badge_warn, self._badge_crit = warn, crit

@@ -253,9 +253,10 @@ def main() -> int:
     page.refresh()
     app.processEvents()
     check("按房间分组：客厅（净化器）在阳台（洗衣机）之前",
-          [r.room for r in page._rows], ["客厅", "阳台"])
+          [r.place_text for r in page._rows], ["我的家 · 客厅", "我的家 · 阳台"])
     headers = [lab.text() for lab in page.findChildren(type(page.lbl_hint), "RoomHeader")]
-    check("分组头按房间画出来", headers, ["客厅", "阳台"])
+    check("分组头是「家庭 · 房间」（跨家庭靠这个区分，不是只写房间名）",
+          headers, ["我的家 · 客厅", "我的家 · 阳台"])
 
     store.prefs.set_consumable_sort("level")
     page.refresh()
@@ -572,11 +573,14 @@ def main() -> int:
     dialog = ConsumableDialog(store2, theme.LIGHT)
     tree = dialog.tree_device
     tops = [tree.topLevelItem(i) for i in range(tree.topLevelItemCount())]
-    check("顶层就是房间，不再有家庭那一层", [t.text(0) for t in tops], ["客厅", "阳台"])
-    rooms = tops
+    # 2026-11-21 起选设备树跨家庭（和挂件管理窗一致）：顶层是家庭
+    check("顶层是家庭，跨全部家庭", [t.text(0) for t in tops], ["我的家", "老家"])
+    my_home = tops[0]
     check("只有开关属性的灯泡被滤掉，客厅只剩净化器",
-          [rooms[0].child(i).text(0) for i in range(rooms[0].childCount())], ["净化器"])
-    check("树只列当前家庭（老家那台不在里面）", sorted(dialog._device_items), ["d1", "d2"])
+          [my_home.child(i).text(0) for i in range(my_home.childCount())],
+          ["客厅", "阳台"])
+    check("树列出全部家庭（老家那台也在）",
+          sorted(dialog._device_items), ["d1", "d2", "d4"])
     check("第一步不再留「设备」这一列标签",
           [w.text() for w in dialog.findChildren(QLabel) if w.objectName() == "FieldLabel"], [])
     check("默认选中第一台设备", dialog._selected_did, "d1")
@@ -586,20 +590,22 @@ def main() -> int:
     dialog._on_next()
     check("点「下一步」把设备交出去", dialog.selected_did, "d1")
 
-    rooms[0].setExpanded(True)
-    dialog._on_device_clicked(rooms[0], 0)
+    living = my_home.child(0)          # 我的家 → 客厅
+    living.setExpanded(True)
+    dialog._on_device_clicked(living, 0)
     check("点房间行只折角，不把已选设备清掉", dialog._selected_did, "d1")
-    check("点房间行确实折起来了", rooms[0].isExpanded(), False)
+    check("点房间行确实折起来了", living.isExpanded(), False)
     check_true("这棵树只能选行、不能拖动",
-               not tree._can_drag(rooms[1].child(0), QPoint(5, 5)))
+               not tree._can_drag(living.child(0), QPoint(5, 5)))
 
+    # 树不跟顶栏家庭走：换家后还是那两个家庭（页面已经不跟家庭了）
     store2.active_home = "h2"
     other = ConsumableDialog(store2, theme.LIGHT)
-    check("切到另一个家庭：树里只剩那家的房间和设备",
+    check("换顶栏家庭不影响选设备树",
           ([other.tree_device.topLevelItem(i).text(0)
             for i in range(other.tree_device.topLevelItemCount())],
            sorted(other._device_items)),
-          (["厨房"], ["d4"]))
+          (["我的家", "老家"], ["d1", "d2", "d4"]))
     store2.active_home = "h1"
 
     print("\n8) 空卡：只记设备，属性等点开再配")
@@ -644,19 +650,20 @@ def main() -> int:
     check("空卡在墙上、写「未设置」而不是「—」",
           [(r.name, r.value_text) for r in page2._rows if r.is_shell],
           [("洗衣机", "未设置")])
-    check("别的家庭的监控项不上这面墙",
-          "净水器" in [r.device for r in page2._rows], False)
+    check("别的家庭的监控项也在这面墙上（跨家庭）",
+          "净水器" in [r.device for r in page2._rows], True)
     check("空卡按余量排序垫底", page2._rows[-1].is_shell, True)
     check("空卡不进提醒计数", page2.counts(), (1, 0))
     check("空卡不进轮询（没有可读的东西）",
           ("d2", 0, 0) in {(r.did, r.siid, r.piid) for r in store2.poll_refs()}, False)
 
+    before = [(r.item.id, r.device, r.place_text) for r in page2._rows]
     store2.active_home = "h2"
     page2.refresh()
     app.processEvents()
-    check("切到另一个家庭：这面墙只剩那家的项",
-          [r.device for r in page2._rows], ["净水器"])
-    check("侧栏圆点跟着当前家庭走", page2.counts(), (0, 0))
+    check("换顶栏家庭不影响这面墙（同一批监控项、同一个顺序）",
+          [(r.item.id, r.device, r.place_text) for r in page2._rows], before)
+    check("侧栏圆点是全家庭计数，不随切家庭归零", page2.counts(), (1, 0))
     store2.active_home = "h1"
 
     empty_store = Store(_Client(), None)  # type: ignore[arg-type]
@@ -667,7 +674,7 @@ def main() -> int:
     empty_dialog = ConsumableDialog(empty_store, theme.LIGHT)
     check("一台能监控的都没有时给一行说明，不是空白框",
           [empty_dialog.tree_device.topLevelItem(0).text(0)],
-          ["这个家庭没有可监控的设备"])
+          ["没有可监控的设备"])
     check("没有可选设备时「下一步」是灰的", empty_dialog.btn_next.isEnabled(), False)
 
     print("\n9) 属性可以反复改；同名的两块电池要能分清")
@@ -748,12 +755,35 @@ def main() -> int:
     check("卡片墙上的两张电池卡也分得清（没自定义名字的那张自动带服务名）",
           sorted(r.name for r in wall._rows),
           sorted(["门锁电量", "电池电量 · 干电池"]))
-    check("卡片副标题是「房间 | 属性名」",
-          wall._rows[0].subtitle, "客厅 | 电池电量 · 干电池")
+    check("卡片副标题是「家庭 · 房间 | 属性名」",
+          wall._rows[0].subtitle, "我的家 · 客厅 | 电池电量 · 干电池")
     probe = Row(item=model.unset("d5"), name="滤芯", device="净化器", room="",
                 percent=None, level=model.LEVEL_NONE, value_text="—")
     check("房间为空（设备已不存在之类）时不留一根孤零零的竖线",
           probe.subtitle, "滤芯")
+    check("有家没房时写「家庭 · 未分房间」，不只写个家庭名",
+          Row(item=model.unset("d5"), name="滤芯", device="净化器", room="",
+              percent=None, level=model.LEVEL_NONE, value_text="—",
+              home="示例家庭", home_id="h9", room_id="r9").place_text,
+          "示例家庭 · 未分房间")
+
+    # 跨家庭后副标题多了「家庭 · 房间」前缀，把宽度实测固化成断言：
+    # 以后改字号 / 卡片尺寸会在这里红，而不是上线后才发现被截成「示例家庭 · 客厅 | 滤芯剩…」。
+    # 代表串取"4 字家庭 + 2 字房间 + 6 字属性"，比常见情况长一档。
+    from PySide6.QtGui import QFont, QFontMetrics  # noqa: PLC0415
+
+    def _advance(text: str, size: int) -> int:
+        font = QFont(QApplication.font())
+        font.setPixelSize(size)
+        return QFontMetrics(font).horizontalAdvance(text)
+
+    wide = "示例家庭 · 客厅 | 滤芯剩余寿命"
+    wide_px = _advance(wide, 12)
+    check(f"横卡副标题放得下（12px 实测 {wide_px}px / 可用 {CARD_W - PAD * 2}px）",
+          wide_px <= CARD_W - PAD * 2, True)
+    ring_px = _advance("示例家庭 · 客厅 | 滤芯", 10)
+    check(f"环卡副标题放得下（10px 实测 {ring_px}px / 方卡可用 {RING_CARD - PAD * 2}px）",
+          ring_px <= RING_CARD - PAD * 2, True)
 
     print("\n10) 离线设备的读数：右下角标更新时间，一天没更新算不新鲜")
     import time as clock  # noqa: PLC0415

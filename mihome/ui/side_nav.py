@@ -11,18 +11,19 @@
 底色和右边的卡片墙**不是同一个色**（``theme.nav_bg``）：栏是机身、卡片墙是台面。
 两边同色时只能靠一条 1px 竖线分隔，整块界面看起来是连着的。
 
-最下面固定一块「功能区」+ 一个「设置」入口：前者是全屋级页面的入口（四个按钮
-——耗材 / 监控 / 电脑自动化 / 挂件），后者收纳主题、排序、隐藏设备这些不常改的东西。
-点击功能区统一发 ``zone_requested(key)``；前三个入口都接了页面（「耗材」「监控」
-目前是明确的「尚未开放」占位页），页面切换由主窗口的 ``QStackedWidget`` 完成
-（`docs/dev/ui.md`「主界面页面宿主」）。「挂件」不是页面，是开关：点一下弹出桌面
-挂件、再点一下收起（用户 2026-11-20 定，原来开关只藏在设置页里，没人找得到）；
-它的高亮跟着挂件**实际是否可见**走，不跟功能区页面选中态走。
-其余页面入口的选中态：底色同房间
-选中行，左侧一条 accent 竖条；此时房间行不高亮。点任一房间会清掉选中态、回到
-卡片墙，所以 ``build()``（切家庭 / 排序变化）**不重置**页面入口的选中态。
-两条分隔线把底部切出语义：房间列表 + 功能区都是「这个家」的内容，
-「设置」是「这个程序」的配置，所以功能区上下各一条线，设置单独成一组。
+最下面固定一块「功能区」+ 一块「跨家庭 / 程序级」：前者是全屋级页面（监控室 /
+电脑自动化），后者是**不跟顶栏家庭走**的三行——耗材（页面）、桌面挂件（开关）、
+设置（对话框）。点击功能区与耗材统一发 ``zone_requested(key)``，页面切换由主窗口的
+``QStackedWidget`` 完成（`docs/dev/ui.md`「主界面页面宿主」）。「挂件」不是页面：
+点一下弹出桌面挂件、再点一下收起（用户 2026-11-20 定，原来开关只藏在设置页里）；
+它的高亮跟着挂件**实际是否可见**走，不跟页面选中态走。
+其余页面入口的选中态：底色同房间选中行，左侧一条 accent 竖条；此时房间行不高亮。
+点任一房间会清掉选中态、回到卡片墙，所以 ``build()``（切家庭 / 排序变化）
+**不重置**页面入口的选中态。
+两条分隔线把底部切出语义：房间列表 + 功能区都是「这个家」的内容；
+分隔线下面是**跨家庭**的东西——耗材（2026-11-21 起按全部家庭统计，见
+``consumables_page``）、桌面挂件（槽位跨家庭）、设置（程序本身）。三条线以上都是
+家庭级，别把跨家庭入口挪回去。
 "已隐藏设备"分组排在房间列表末尾，图标上和普通房间区分开——它是收纳箱，不是房间。
 """
 
@@ -43,9 +44,6 @@ from .widgets import draw_text
 ITEM_H = 36
 PAD_X = 18
 TOP = 30
-#: 底部「程序级」两行（桌面挂件 / 设置）的总高：上下留白 + 两行 32 + 行距 2。
-#: 分隔线在它上面，功能区在再上面。
-FOOT_H = 80
 #: 功能区：占位按钮 + 上下留白。按钮数由 ``ZONE_ITEMS`` 决定，别把数量写死——
 #: 加一条「电脑自动化」时就是漏了这里，底部会压掉最后一条并盖住分隔线。
 ZONE_BTN_H = 32
@@ -53,15 +51,30 @@ ZONE_GAP = 2
 ZONE_PAD_TOP = 7
 ZONE_PAD_BOTTOM = 6
 #: (按钮文字, 图标类型)，顺序即从上到下的绘制顺序。
-#: 这里只放**单个家庭内**的页面；跨家庭的入口（桌面挂件）在分隔线下方。
-ZONE_ITEMS = (("耗材", "battery"), ("监控室", "camera"), ("电脑自动化", "pc"))
+#: 这里只放**单个家庭内**的页面；跨家庭的入口（耗材 / 桌面挂件 / 设置）在分隔线下方。
+ZONE_ITEMS = (("监控室", "camera"), ("电脑自动化", "pc"))
 #: 与 ``ZONE_ITEMS`` 一一对应的稳定 key。信号带 key 而不是索引：以后在中间插一个
 #: 入口，主窗口的接线不会因为下标挪动而点错页面。
-ZONE_KEYS = ("consumables", "monitor", "automation")
-#: 是页面的入口（挂件是开关，不在这里）
-PAGE_ZONE_KEYS = ("consumables", "monitor", "automation")
-#: 分隔线下方、和「设置」同组的那一行「桌面挂件」开关的 key
+ZONE_KEYS = ("monitor", "automation")
+#: 分割线下方那三行的 key 与文字（从上到下）。耗材是**页面**（有选中态、有圆点），
+#: 挂件是开关，设置弹对话框——三者的交互不同，但都属于"跨家庭 / 程序级"。
+FOOT_CONSUMABLES = "consumables"
 FOOT_WIDGET = "widget"
+FOOT_SETTINGS = "settings"
+FOOT_ITEMS = (
+    (FOOT_CONSUMABLES, "耗材", "battery"),
+    (FOOT_WIDGET, "桌面挂件", "widget"),
+    (FOOT_SETTINGS, "设置", "gear"),
+)
+#: 是页面的入口（三个都有 ``_zone_pages`` 条目；挂件与设置不是页面）
+PAGE_ZONE_KEYS = ("consumables", "monitor", "automation")
+FOOT_ROW_H = 32
+FOOT_ROW_GAP = 2
+FOOT_PAD_TOP = 7
+#: 底部程序级几行 + 上下留白。三行 32 + 行距 2 + 上 7 + 下 7 = 114。
+#: 按钮数由 ``FOOT_ITEMS`` 算，别写死数字。
+FOOT_H = (FOOT_PAD_TOP + FOOT_ROW_H * len(FOOT_ITEMS)
+          + FOOT_ROW_GAP * (len(FOOT_ITEMS) - 1) + 7)
 ZONE_H = (ZONE_PAD_TOP + ZONE_BTN_H * len(ZONE_ITEMS)
           + ZONE_GAP * (len(ZONE_ITEMS) - 1) + ZONE_PAD_BOTTOM)
 #: 底部固定区总高；房间列表的可见区域与滚动上限都按它算。
@@ -100,8 +113,8 @@ class SideNav(QWidget):
         #: 「桌面挂件」入口的开关态：跟挂件**实际是否可见**走（不是页面选中态）
         self._widget_on = False
         self._hover = -1
-        self._settings_hover = False
-        self._widget_hover = False
+        #: 分隔线下方那三行里，鼠标停在第几行（``-1`` = 都不在）
+        self._foot_hover = -1
         self._zone_hover = -1
         self._offset = 0
         self._content_h = 0
@@ -155,10 +168,11 @@ class SideNav(QWidget):
             self.update()
 
     def set_zone_badges(self, key: str, warn: int, crit: int) -> None:
-        """在功能区入口的文字后面画两个计数圆点（灰=轻提醒 / 红=重提醒）。
+        """在入口的文字后面画两个计数圆点（灰=轻提醒 / 红=重提醒）。
 
         为什么挂在这里而不是页面里：它是**入口级**信息——用户停在卡片墙上也要
         知道"有几项耗材该换了"。0 的两档都不画，避免一排 0 变成噪声。
+        现在只登记 ``FOOT_CONSUMABLES`` 一个 key（耗材已挪到分隔线下方）。
         """
         target = (max(0, int(warn)), max(0, int(crit)))
         if target == (0, 0):
@@ -182,11 +196,17 @@ class SideNav(QWidget):
         return QRect(0, TOP - 6, self.width(),
                      max(0, self.height() - TOP + 6 - BOTTOM_H))
 
-    def _settings_rect(self) -> QRect:
-        return QRect(8, self.height() - FOOT_H + 7 + 32 + 2, self.width() - 16, 32)
+    def _foot_rect(self, index: int) -> QRect:
+        """分隔线下方第 ``index`` 行（顺序同 ``FOOT_ITEMS``）。"""
+        top = self.height() - FOOT_H + FOOT_PAD_TOP
+        return QRect(8, top + index * (FOOT_ROW_H + FOOT_ROW_GAP),
+                     self.width() - 16, FOOT_ROW_H)
 
-    def _widget_rect(self) -> QRect:
-        return QRect(8, self.height() - FOOT_H + 7, self.width() - 16, 32)
+    def _foot_index_at_point(self, pos: QPoint) -> int:
+        for i in range(len(FOOT_ITEMS)):
+            if self._foot_rect(i).contains(pos):
+                return i
+        return -1
 
     def _zone_rect(self, index: int) -> QRect:
         top = self.height() - BOTTOM_H + ZONE_PAD_TOP
@@ -283,34 +303,41 @@ class SideNav(QWidget):
             if badges:
                 self._paint_zone_badges(p, zrect, label, badges, active)
 
-        # 家庭级入口到此为止。下面两行是**跨家庭 / 程序级**的东西：桌面挂件挂在
-        # 所有家庭之上（不随当前家庭切换），设置是程序本身——它们和功能区不是一组，
-        # 所以放在分隔线下面（用户 2026-11-20 定）。
+        # 家庭级入口到此为止。下面是**跨家庭 / 程序级**的三行：耗材按全部家庭统计
+        # （2026-11-21 起，页面本身跨家庭）、桌面挂件挂在所有家庭之上（槽位跨家庭）、
+        # 设置是程序本身。它们和功能区不是一组，所以放在分隔线下面。
         p.setPen(QPen(theme.nav_line(pal), 1))
         p.drawLine(12, self.height() - FOOT_H, self.width() - 12, self.height() - FOOT_H)
 
-        self._paint_foot_row(
-            p, self._widget_rect(), "widget", "桌面挂件", self._widget_on,
-            self._widget_hover, hover, pal,
-        )
-        self._paint_foot_row(
-            p, self._settings_rect(), "settings", "设置", False,
-            self._settings_hover, hover, pal,
-        )
+        for i, (kind, label, icon) in enumerate(FOOT_ITEMS):
+            active = (
+                (self._active_zone == kind) if kind == FOOT_CONSUMABLES
+                else (self._widget_on if kind == FOOT_WIDGET else False)
+            )
+            self._paint_foot_row(
+                p, self._foot_rect(i), kind, label, icon, active,
+                i == self._foot_hover, hover, pal,
+            )
         p.end()
 
     def _paint_foot_row(
-        self, p: QPainter, rect: QRect, kind: str, label: str, active: bool,
-        hot: bool, hover: QColor, pal: theme.Palette,
+        self, p: QPainter, rect: QRect, kind: str, label: str, icon: str,
+        active: bool, hot: bool, hover: QColor, pal: theme.Palette,
     ) -> None:
-        """分隔线下方的一行：桌面挂件（开关，亮 = 挂件此刻在屏幕上）/ 设置。
+        """分隔线下方的一行：耗材（页面）/ 桌面挂件（开关）/ 设置。
 
-        挂件行的"开"**只由标签右侧那个主色圆点表示**（用户 2026-11-21 定）：
-        不画左侧 accent 竖条、不铺选中底色、文字也不提亮加粗——它是个开关，
-        不是"当前所在页面"，用功能区那套选中态会读成"你正在挂件页"。
-        鼠标悬停仍给底色，那是可点的提示，与开关状态无关。
+        三种交互不同，所以"亮"的含义也不同：
+
+        - **耗材**是页面入口，走功能区那套**选中态**（左侧 accent 竖条 + 底色 +
+          半粗），和「监控室」等入口完全一致；
+        - **桌面挂件**是开关，"开"**只由标签右侧那个主色圆点表示**（用户
+          2026-11-21 定）：不画左侧 accent 竖条、不铺选中底色、文字也不提亮加粗——
+          用页面选中态会读成"你正在挂件页"；
+        - **设置**弹对话框，没有持续状态，只有悬停底色。
+
+        鼠标悬停一律给底色，那是可点的提示，与状态无关。
         """
-        emph = active and kind != "widget"
+        emph = active and kind != FOOT_WIDGET
         if hot or emph:
             p.setPen(Qt.NoPen)
             p.setBrush(theme.nav_row_fill(pal) if emph else hover)
@@ -321,15 +348,19 @@ class SideNav(QWidget):
             p.drawRoundedRect(QRect(rect.x(), rect.y() + 8, 3, rect.height() - 16), 1.5, 1.5)
         color = pal.text if (hot or emph) else pal.text_soft
         center = QPoint(rect.x() + 16, rect.center().y())
-        if kind == "widget":
-            self._paint_zone_icon(p, center, "widget", color)
-        else:
+        if icon == "gear":
             self._paint_gear(p, center, 6, color)
+        else:
+            self._paint_zone_icon(p, center, icon, color)
         text_rect = QRect(rect.x() + 32, rect.y(), rect.width() - 32, rect.height())
         draw_text(p, text_rect, label, size=13, color=color,
                   weight=QFont.DemiBold if emph else QFont.Normal)
-        if kind == "widget" and active:
+        if kind == FOOT_WIDGET and active:
             self._paint_widget_dot(p, text_rect, label)
+        if kind == FOOT_CONSUMABLES:
+            badges = self._zone_badges.get(FOOT_CONSUMABLES)
+            if badges:
+                self._paint_zone_badges(p, rect, label, badges, emph)
 
     def _paint_widget_dot(self, p: QPainter, text_rect: QRect, label: str) -> None:
         """挂件启用时在标签右侧点一个小圆点。
@@ -453,23 +484,20 @@ class SideNav(QWidget):
     def mouseMoveEvent(self, event) -> None:  # noqa: N802
         pos = event.position().toPoint()
         idx = self._row_index_at_point(pos)
-        over_settings = self._settings_rect().contains(pos)
-        over_widget = self._widget_rect().contains(pos)
+        fidx = self._foot_index_at_point(pos)
         zidx = self._zone_index_at_point(pos)
-        if (idx != self._hover or over_settings != self._settings_hover
-                or over_widget != self._widget_hover or zidx != self._zone_hover):
+        if (idx != self._hover or fidx != self._foot_hover
+                or zidx != self._zone_hover):
             self._hover = idx
-            self._settings_hover = over_settings
-            self._widget_hover = over_widget
+            self._foot_hover = fidx
             self._zone_hover = zidx
-            pointing = idx >= 0 or over_settings or over_widget or zidx >= 0
+            pointing = idx >= 0 or fidx >= 0 or zidx >= 0
             self.setCursor(Qt.PointingHandCursor if pointing else Qt.ArrowCursor)
             self.update()
 
     def leaveEvent(self, event) -> None:  # noqa: N802
         self._hover = -1
-        self._settings_hover = False
-        self._widget_hover = False
+        self._foot_hover = -1
         self._zone_hover = -1
         self.update()
 
@@ -477,9 +505,19 @@ class SideNav(QWidget):
         if event.button() != Qt.LeftButton:
             return
         pos = event.position().toPoint()
-        if self._widget_rect().contains(pos):
-            # 开关：不切页面、不改页面选中态，主窗口负责显隐并回写 _widget_on
-            self.zone_requested.emit(FOOT_WIDGET)
+        fidx = self._foot_index_at_point(pos)
+        if fidx >= 0:
+            key = FOOT_ITEMS[fidx][0]
+            if key == FOOT_WIDGET:
+                # 开关：不切页面、不改页面选中态，主窗口负责显隐并回写 _widget_on
+                self.zone_requested.emit(FOOT_WIDGET)
+            elif key == FOOT_CONSUMABLES:
+                # 页面入口：选中态先就地生效，主窗口随后切页
+                self._active_zone = key
+                self.update()
+                self.zone_requested.emit(key)
+            else:
+                self.settings_requested.emit()
             return
         zidx = self._zone_index_at_point(pos)
         if zidx >= 0:
@@ -488,9 +526,6 @@ class SideNav(QWidget):
             self._active_zone = key
             self.update()
             self.zone_requested.emit(key)
-            return
-        if self._settings_rect().contains(pos):
-            self.settings_requested.emit()
             return
         idx = self._row_index_at_point(pos)
         if idx < 0:
@@ -512,5 +547,6 @@ class SideNav(QWidget):
 
 
 __all__ = [
-    "FOOT_WIDGET", "SideNav", "PAGE_ZONE_KEYS", "ZONE_ITEMS", "ZONE_KEYS",
+    "FOOT_CONSUMABLES", "FOOT_ITEMS", "FOOT_WIDGET", "PAGE_ZONE_KEYS",
+    "SideNav", "ZONE_ITEMS", "ZONE_KEYS",
 ]

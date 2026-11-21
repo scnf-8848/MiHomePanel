@@ -57,7 +57,7 @@ from mihome.ui import automation_list as AL  # noqa: E402
 from mihome.ui import automation_log as AG  # noqa: E402
 from mihome.ui import automation_trash as AT  # noqa: E402
 from mihome.ui import theme  # noqa: E402
-from mihome.ui.side_nav import ZONE_KEYS, SideNav  # noqa: E402
+from mihome.ui.side_nav import FOOT_ITEMS, PAGE_ZONE_KEYS, ZONE_KEYS, SideNav  # noqa: E402
 from mihome.ui.widgets import ToggleSwitch  # noqa: E402
 
 app = QApplication.instance() or QApplication([])
@@ -2033,16 +2033,32 @@ nav = SideNav(theme.LIGHT)
 nav.resize(176, 700)
 got: list[str] = []
 nav.zone_requested.connect(got.append)
-check("功能区三个入口 key 稳定",
-      ZONE_KEYS == ("consumables", "monitor", "automation"))
+# 家庭级功能区只剩两个：耗材已挪到分隔线下方（它按**全部家庭**统计，2026-11-21 起）
+check("功能区两个入口 key 稳定", ZONE_KEYS == ("monitor", "automation"))
+check("耗材不在功能区里", "consumables" not in ZONE_KEYS)
+check("页面入口仍是三个（含分隔线下的耗材）",
+      PAGE_ZONE_KEYS == ("consumables", "monitor", "automation"))
 for i, key in enumerate(ZONE_KEYS):
     QTest.mouseClick(nav, Qt.LeftButton, Qt.NoModifier,
                      QPoint(nav._zone_rect(i).center()))
-check("三个入口各发一次信号", got == list(ZONE_KEYS), str(got))
-# 「桌面挂件」在分隔线下方、和设置同组的独立一行：它是开关不是页面
+check("两个入口各发一次信号", got == list(ZONE_KEYS), str(got))
+# 分隔线下方三行：耗材（页面入口）/ 桌面挂件（开关）/ 设置（settings_requested）
+foot_rects = [nav._foot_rect(i) for i in range(len(FOOT_ITEMS))]
+check("分隔线下正好三行", len(foot_rects) == 3)
+check("三行互不重叠且都在窗口内",
+      all(foot_rects[i].bottom() < foot_rects[i + 1].top() for i in range(2))
+      and foot_rects[-1].bottom() <= nav.height())
 QTest.mouseClick(nav, Qt.LeftButton, Qt.NoModifier,
-                 QPoint(nav._widget_rect().center()))
-check("分隔线下「桌面挂件」也发信号", got == list(ZONE_KEYS) + ["widget"], str(got))
+                 QPoint(nav._foot_rect(0).center()))
+check("分隔线下「耗材」发 zone_requested",
+      got == list(ZONE_KEYS) + ["consumables"], str(got))
+check("点耗材顺手给出页面选中态", nav._active_zone == "consumables")
+# 「桌面挂件」是开关不是页面：不夺页面选中态
+QTest.mouseClick(nav, Qt.LeftButton, Qt.NoModifier,
+                 QPoint(nav._foot_rect(1).center()))
+check("分隔线下「桌面挂件」也发信号",
+      got == list(ZONE_KEYS) + ["consumables", "widget"], str(got))
+check("点挂件不改页面选中态", nav._active_zone == "consumables")
 nav.set_active_zone("monitor")
 nav.set_widget_on(True)
 check("「挂件」入口点亮跟可见状态走（不夺页面选中态）",

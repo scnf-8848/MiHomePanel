@@ -195,7 +195,7 @@ class ConsumableDialog(QDialog):
         box.addWidget(self.tree_device)
         tip = QLabel(
             "选一台设备，墙上会先落一张空卡；点那张卡再挑属性和阈值。"
-            "只列这个家庭里有可监控数值属性的设备，离线设备也能选。",
+            "按家庭列出所有含可监控数值属性的设备，离线设备也能选。",
             body,
         )
         tip.setObjectName("Hint")
@@ -228,47 +228,53 @@ class ConsumableDialog(QDialog):
         self.selected_did = self._selected_did
         self.accept()
 
-    def _active_home(self) -> str:
-        """当前家庭。顶栏切了家，这里跟着切——耗材页是按家庭分的。"""
-        home = self.store.active_home
-        if home:
-            return home
-        homes = self.store.homes()
-        return homes[0].id if homes else ""
-
     def _fill_devices(self) -> None:
-        """房间 → 设备，**只当前家庭**。
+        """家庭 → 房间 → 设备，**全部家庭**（2026-11-21 起，和桌面挂件的选设备树一致）。
 
-        不再画家庭那一层：这一步的范围已经被顶栏定死了，多一层根节点只会让人以为
-        还能在这里换家。空房间、没有数值属性的设备都不进树。
+        为什么不再只列当前家庭：耗材页本身已经跨家庭统计了（见
+        ``consumables_page._rows_from_store``）。树若还锁在当前家庭，就会出现
+        "页面显示两个家的耗材，却只能往当前这家加"的不对称。
+
+        空家庭、空房间、没有数值属性的设备都不进树；一个都没有时给一句空态，
+        不留一片空白。家庭节点默认展开（一共就两三个家，不需要先点一下）。
         """
         tree = self.tree_device
         # 先清映射再清树：clear() 会发 currentItemChanged(None)，
         # 那时字典里若还剩已删除的 item，回调会拿它去 setCurrentItem 而崩
         self._device_items.clear()
         tree.clear()
-        home = self._active_home()
-        for room_id, room_name in self.store.room_entries(home):
-            states = [
-                st for st in self.store.device_states(home, room_id)
-                if _numeric_props(st)
-            ]
-            if not states:
+        for home in self.store.homes():
+            home_id = home.id
+            rooms: list[tuple[QTreeWidgetItem, list]] = []
+            for room_id, room_name in self.store.room_entries(home_id):
+                states = [
+                    st for st in self.store.device_states(home_id, room_id)
+                    if _numeric_props(st)
+                ]
+                if states:
+                    rooms.append((room_id, room_name, states))
+            if not rooms:
                 continue
-            r_item = tree.add_row(
-                None, room_name,
-                {"kind": "room", "home": home, "room": room_id},
-                suffix=f"{len(states)} 台",
+            h_item = tree.add_row(
+                None, self.store.home_label(home_id),
+                {"kind": "home", "home": home_id, "room": "", "id": home_id},
+                suffix=f"{sum(len(s) for _, _, s in rooms)} 台",
             )
-            for st in states:
-                item = tree.add_row(
-                    r_item, st.name,
-                    {"kind": "device", "home": home, "room": room_id, "id": st.did},
-                    suffix="" if st.online else "已离线",
+            for room_id, room_name, states in rooms:
+                r_item = tree.add_row(
+                    h_item, room_name,
+                    {"kind": "room", "home": home_id, "room": room_id},
+                    suffix=f"{len(states)} 台",
                 )
-                self._device_items[st.did] = item
+                for st in states:
+                    item = tree.add_row(
+                        r_item, st.name,
+                        {"kind": "device", "home": home_id, "room": room_id, "id": st.did},
+                        suffix="" if st.online else "已离线",
+                    )
+                    self._device_items[st.did] = item
         if not self._device_items:
-            tree.add_row(None, "这个家庭没有可监控的设备", {"kind": "empty"})
+            tree.add_row(None, "没有可监控的设备", {"kind": "empty"})
         tree.restore_expanded(None)
 
     def _select_first_device(self) -> None:

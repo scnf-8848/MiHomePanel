@@ -140,6 +140,32 @@ class Row:
     updated: str = ""
     #: 上面那个读数超过一天没更新 → 右下角换警示色，提醒"这个数可能已经不准了"。
     stale: bool = False
+    #: 家庭显示名 / 家庭 id / 房间 id。**分组与排序认 id，显示认名字**：两个家
+    #: 都可能有"客厅"，按名字分组会把它们并成一组（2026-11-21 跨家庭改造）。
+    home: str = ""
+    home_id: str = ""
+    room_id: str = ""
+
+    @property
+    def place_text(self) -> str:
+        """「家庭 · 房间」。跨家庭后这是卡片副标题、分组头、tooltip 的统一前缀。
+
+        - 有家有房 → ``示例家庭 · 客厅``
+        - 有家没房（设备没分配房间）→ ``示例家庭 · 未分房间``，别只写个家庭名让人
+          以为这间房就叫"示例家庭"
+        - 都没有（设备已不存在）→ 空串，调用方各自写「设备已不存在」
+
+        分隔符用 `` · `` 而不是 ``-``：房间名本身可能带连字符，而项目里「·」已经
+        是"并列项"的固定写法（挂件页脚「8 台设备 · 2 台离线」）。
+        """
+        if self.home:
+            return f"{self.home} · {self.room or '未分房间'}"
+        return self.room
+
+    @property
+    def place_key(self) -> tuple[str, str]:
+        """分组用的键：``(家庭 id, 房间 id)``。房间改名不影响分组。"""
+        return (self.home_id, self.room_id)
 
     @property
     def color(self) -> str:
@@ -147,12 +173,12 @@ class Row:
 
     @property
     def subtitle(self) -> str:
-        """卡片第二行：「房间 | 属性名」。
+        """卡片第二行：「家庭 · 房间 | 属性名」。
 
-        房间为空的条目（设备已不存在 / 设备没分房间）就只写属性名，别留一根
-        孤零零的竖线。
+        位置为空（设备已不存在 / 设备没分房间）就只写属性名，别留一根孤零零的竖线。
         """
-        return f"{self.room} | {self.name}" if self.room else self.name
+        place = self.place_text
+        return f"{place} | {self.name}" if place else self.name
 
     @property
     def is_shell(self) -> bool:
@@ -213,12 +239,14 @@ class ConsumableCard(QWidget):
         """
         row = self._row
         if row.is_shell:
-            parts = [row.device] + ([row.room] if row.room else [])
+            parts = [row.device] + ([row.place_text] if row.place_text else [])
             parts.append("点击设置要监控的属性")
             self.setToolTip("｜".join(parts))
             return
+        # 卡片上写不下的部分在悬停时给全：设备 / 位置 / 属性三段用同一个分隔符
+        # （副标题那条里 ``|`` 只隔位置和属性名，混进 tooltip 会有两种竖线）
+        tip = "｜".join(p for p in (row.device, row.place_text, row.name) if p)
         # 卡片右下角只写「3 天前更新」，悬停补一句说清是哪个数
-        tip = f"{row.device}｜{row.subtitle}"
         if row.updated:
             tip += f"｜读数：{row.updated}"
         self.setToolTip(tip)
@@ -308,13 +336,17 @@ class ConsumableCard(QWidget):
             p.restore()
 
         if row.style == model.STYLE_RING:
-            # 方形卡按结构图走：设备名 / 房间|属性 置顶两行，下面整块留给环。
+            # 方形卡按结构图走：设备名 / 家庭·房间|属性 置顶两行，下面整块留给环。
             # **不画右上角原始读数**——那两个值是横卡时代的布局，这里圆心百分比
             # 就是这页要读的那个数；带单位的值仍在 tooltip 里，没丢。
             draw_text(p, QRect(PAD, 12, self.width() - PAD * 2, 20), row.device,
                       size=13, color=self._p.text, weight=QFont.DemiBold)
+            # 副标题从 11 降到 10：方卡只有 180 宽（可用 148），
+            # 「示例家庭 · 客厅 | 滤芯」在 11px 下要 154px 会被截成"示例家庭 · 客厅 | 滤…"，
+            # 10px 是 140px。横卡保持 12px（可用 236，同一句只要 168px）。
+            # 实测见 scripts/out/measure_subtitle.py。
             draw_text(p, QRect(PAD, 32, self.width() - PAD * 2, 16), row.subtitle,
-                      size=11, color=self._p.text_soft)
+                      size=10, color=self._p.text_soft)
         else:
             # 第一行：**设备名** + 右侧读数（读数用档位色，扫一眼就知道哪张红了）。
             # 主副标题的分工是 2026-11-18 用户定的：同一台设备的两块电池并排时，
@@ -324,7 +356,7 @@ class ConsumableCard(QWidget):
             draw_text(p, QRect(self.width() - PAD - 60, 12, 60, 20), row.value_text,
                       size=14, color=row.color, weight=QFont.DemiBold,
                       align=Qt.AlignRight | Qt.AlignVCenter)
-            # 第二行：房间 | 属性名（房间为空的条目就只有属性名）
+            # 第二行：家庭 · 房间 | 属性名（位置为空的条目就只有属性名）
             draw_text(p, QRect(PAD, 34, self.width() - PAD * 2, 18), row.subtitle,
                       size=12, color=self._p.text_soft)
 
@@ -368,8 +400,9 @@ class ConsumableCard(QWidget):
         draw_text(p, QRect(self.width() - PAD - 60, 12, 60, 20), row.value_text,
                   size=12, color=self._p.text_mute,
                   align=Qt.AlignRight | Qt.AlignVCenter)
-        # 还没有属性名可写，第二行沿用引导语；房间照旧放在前面
-        hint = "点击设置属性" if not row.room else f"{row.room} | 点击设置属性"
+        # 还没有属性名可写，第二行沿用引导语；位置照旧放在前面
+        place = row.place_text
+        hint = f"{place} | 点击设置属性" if place else "点击设置属性"
         draw_text(p, QRect(PAD, 34, inner, 18), hint,
                   size=12, color=self._p.text_soft)
 
@@ -610,14 +643,20 @@ class ConsumablesPage(QWidget):
     def _rows_from_store(self) -> list[Row]:
         """把监控项翻译成界面行。顺序 = ``prefs.consumables`` 的顺序。
 
-        **只取当前家庭的**：这一页跟着顶栏的家庭走，不跨家混排——不然两个家的
-        "滤芯"会挨在一起，谁也看不出是哪一套房的。
+        **跨全部家庭**（2026-11-21 用户定，推翻 11-18 的"只取当前家庭"）：
+        这一页已经不跟顶栏家庭走了，因为耗材是"整栋房子的东西该换了"，不是
+        "这一套房的东西该换了"。两个家的"客厅"靠 ``Row.place_text`` 的
+        「家庭 · 房间」前缀区分，靠 ``place_key`` 的 id 对分组，不会串。
+
+        连带效果：``counts()`` 自动变成全家庭计数，侧栏圆点与桌面挂件角标
+        从此同源（见 ``_on_consumable_counts``）。
         """
         rows: list[Row] = []
-        home = self.store.active_home
         style = self.store.prefs.consumable_style
         #: did → (siid.piid) → 界面名。同一台设备可能有多条监控项，算一次就够
         name_cache: dict[str, dict[tuple[int, int], str]] = {}
+        #: 家庭 id → 显示名。``store.home_label`` 每次都要遍历拓扑，这里缓存一份
+        home_names: dict[str, str] = {}
         for item in self.store.prefs.consumables:
             st = self.store.devices.get(item.did)
             if st is None:
@@ -637,9 +676,12 @@ class ConsumablesPage(QWidget):
                     )
                 )
                 continue
+            # 设备还在就一定能解析出归属（``device_room`` 只在这种情况返回 None）
             loc = self.store.device_room(item.did)
-            if home and loc is not None and loc[0] != home:
-                continue
+            home_id, room_id = loc if loc is not None else ("", st.room_id)
+            home = home_names.get(home_id)
+            if home is None:
+                home = home_names[home_id] = self.store.home_label(home_id)
             if not item.is_configured:
                 # 空卡：只记了设备，属性还没挑。点它才进配置，别在这里替用户猜
                 rows.append(
@@ -652,6 +694,9 @@ class ConsumablesPage(QWidget):
                         level=model.LEVEL_NONE,
                         value_text="未设置",
                         style=style,
+                        home=home,
+                        home_id=home_id,
+                        room_id=room_id,
                     )
                 )
                 continue
@@ -685,6 +730,9 @@ class ConsumablesPage(QWidget):
                     style=style,
                     updated=note,
                     stale=stale,
+                    home=home,
+                    home_id=home_id,
+                    room_id=room_id,
                 )
             )
         return rows
@@ -695,21 +743,26 @@ class ConsumablesPage(QWidget):
             return sorted(rows, key=lambda r: (r.sort_key, r.name))
         if mode == "room":
             order = self._room_order()
-            return sorted(rows, key=lambda r: (order.get(r.room, 999), r.sort_key, r.name))
+            return sorted(rows, key=lambda r: (order.get(r.place_key, 999), r.sort_key, r.name))
         return rows
 
-    def _room_order(self) -> dict[str, int]:
-        """房间名 → 序号（按侧栏那套用户顺序）。
+    def _room_order(self) -> dict[tuple[str, str], int]:
+        """``(家庭 id, 房间 id)`` → 序号，顺序 = 家庭顺序 → 家内房间顺序。
 
-        只看**当前家庭**：两个家都可能有一间"客厅"，把两套房间混进同一张表会让
-        分组顺序互相串。取不到就都排后面，别抛。
+        用 ``store.rooms()`` **不传参**：它返回全部家庭，而且已经按
+        ``prefs.order_homes`` + 每家的 ``prefs.order_rooms`` 排过——和顶栏、侧栏
+        是同一套顺序，不用自己拼。
+
+        键必须是 id 对，不能是房间名：两个家都可能有"客厅"，按名字分组会把它们
+        并成一组（2026-11-21 前就是按名字）。
+
+        注意 ``rooms()`` 只返回**有设备**的房间（且过滤了隐藏设备），所以被隐藏
+        设备的耗材在这里查不到 → 落到 999 排最后。这是既有行为，不是这次引入的。
         """
-        order: dict[str, int] = {}
-        home = self.store.active_home
+        order: dict[tuple[str, str], int] = {}
         try:
-            rooms = self.store.rooms(home) if home else self.store.rooms()
-            for index, room in enumerate(rooms):
-                order.setdefault(room.room_label, index)
+            for index, room in enumerate(self.store.rooms()):
+                order.setdefault((room.home, room.room), index)
         except Exception:  # 拓扑还没加载完：分组退化成"同序"，不影响显示
             return {}
         return order
@@ -721,11 +774,15 @@ class ConsumablesPage(QWidget):
 
     # -- 刷新 ------------------------------------------------------------
     def refresh(self, *, preserve_scroll: bool = False) -> None:
-        """全量重建：监控项增删、排序方式变了、切家庭 / 房间顺序变了都走这里。
+        """全量重建：监控项增删、排序方式变了、换样式改了卡片尺寸都走这里。
 
-        ``preserve_scroll=True`` 只给**切家庭**用：那次重建不是用户想回到顶部，
-        只是内容换了；把滚动值原样带过去，新家卡片多就停在相应位置、少就夹到末尾。
-        其余刷新（加 / 删监控项、拓扑重建）仍按原样回顶部——那种时候回到开头才对。
+        ``preserve_scroll=True`` 只给**换卡片样式**用（圆环是方卡，尺寸一变整页
+        重排）：那次重建不是用户想回到顶部，只是卡片换了画法；把滚动值原样带过去，
+        新布局更长就停在相应位置、更短就夹到末尾。其余刷新（加 / 删监控项、拓扑
+        重建）仍按原样回顶部——那种时候回到开头才对。
+
+        2026-11-21 起**切家庭不再调这里**：这一页按全部家庭统计，内容跟顶栏家庭
+        无关（见 ``_rows_from_store``）。
         """
         keep = self.scroll.verticalScrollBar().value() if preserve_scroll else None
         rows = self._rows_from_store()
@@ -810,7 +867,13 @@ class ConsumablesPage(QWidget):
             return "还没添加监控项"
         shells = sum(1 for r in self._rows if r.is_shell)
         warn, crit = self.counts()
-        parts = [f"共 {total} 项"]
+        # 跨家庭后这句要说明范围：用户切顶栏家庭时这一页纹丝不动，
+        # 「共 N 项 · M 个家庭」是唯一能解释"为什么没变"的地方。
+        homes = {r.home_id for r in self._rows if r.home_id}
+        head = f"共 {total} 项"
+        if len(homes) > 1:
+            head += f" · {len(homes)} 个家庭"
+        parts = [head]
         if shells:
             parts.append(f"{shells} 项待设置")
         if crit:
@@ -860,13 +923,14 @@ class ConsumablesPage(QWidget):
         #: 拖动只在自定义排序开放；按余量 / 按房间的顺序是算出来的，搬一张卡
         #: 没有稳定落点（下一轮刷新就会被排序规则塞回去）。
         draggable = mode == "custom"
-        last_room = None
+        last_key: tuple[str, str] | None = None
         row_index = 0
         col_index = 0
         for row in self._rows:
-            if mode == "room" and row.room != last_room:
-                last_room = row.room
-                header = QLabel(row.room or "未分房间", self._canvas)
+            # 分组认 id 对：两个家都可能有"客厅"，按名字比会把两组并成一组
+            if mode == "room" and row.place_key != last_key:
+                last_key = row.place_key
+                header = QLabel(row.place_text or "设备已不存在", self._canvas)
                 header.setObjectName("RoomHeader")
                 if col_index:
                     row_index += 1
