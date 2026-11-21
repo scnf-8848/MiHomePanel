@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 from PySide6.QtCore import QPoint, QRect, QRectF, Qt, QTimer, Signal
@@ -74,9 +75,9 @@ STYLE_LABELS = (
 BAR_H = 6
 BAR_BOTTOM = 20
 
-#: 圆环样式是**方形卡**（用户 2026-11-18 给的结构图）：上两行写"这是谁 / 什么属性"，
-#: 中间一个占主体的大环，圆心放百分比，右下角仍是读数时间。整页一个样式（见下拉），
-#: 所以一页里不会出现方形卡和横卡混排。
+#: 圆环样式是**方形卡**（用户 2026-11-18 给的结构图）：上面两行写"这是谁 / 在哪"，
+#: 中间一个占主体的大环，环心是百分比 + 属性名，右下角仍是读数时间。整页一个样式
+#: （见下拉），所以一页里不会出现方形卡和横卡混排。
 #: 2026-11-18 用户嫌 240 太大，缩到 3/4 = 180。环 / 线宽 / 圆心字同比缩，
 #: 但标题字号不做 0.75 倍（那会小到读不清），只收 1~2px。
 RING_CARD = 180
@@ -88,6 +89,29 @@ RING_GAP = 7
 RING_X = (RING_CARD - RING_D) // 2
 RING_Y = 52
 RING_CENTER_SIZE = 18
+#: 环心那两行：百分比上抬 ``RING_CENTER_LIFT``，属性名再往下 ``RING_LABEL_DY``。
+#: **为什么要上抬**：名字要占一行，两行整体压在环心上会让下半圆显得空；上抬后
+#: 数字那行的窗口（83–107）与名字那行（109–123）在直径 108 的环里上下留白均匀。
+#: 名字以前写在第二行副标题里，跨家庭后前面还要挤「家庭 · 房间」（180 方卡只剩
+#: 148px，实测 11px 要 154px 会被截），搬进环里之后副标题只写位置，字号能回到 11。
+RING_CENTER_LIFT = 11
+RING_LABEL_DY = 11
+RING_LABEL_H = 14
+RING_LABEL_SIZE = 10
+
+
+def _ring_chord(dy: float) -> float:
+    """环**内缘**在离圆心 ``dy`` 像素处能放文字的宽度（弦长）。
+
+    名字写在环里，越往下圆越窄：按环心那条线算宽度，长名字（「电池电量 · 干电池」
+    10px = 78px）会压到环线上。调用方按标签**下沿**那一层取宽度。
+    """
+    inner = RING_D / 2 - RING_W / 2
+    if dy <= 0:
+        return inner * 2
+    if dy >= inner:
+        return 0.0
+    return 2 * math.sqrt(inner * inner - dy * dy)
 
 
 def card_size(style: str) -> tuple[int, int]:
@@ -336,17 +360,15 @@ class ConsumableCard(QWidget):
             p.restore()
 
         if row.style == model.STYLE_RING:
-            # 方形卡按结构图走：设备名 / 家庭·房间|属性 置顶两行，下面整块留给环。
-            # **不画右上角原始读数**——那两个值是横卡时代的布局，这里圆心百分比
-            # 就是这页要读的那个数；带单位的值仍在 tooltip 里，没丢。
+            # 方形卡按结构图走：设备名 / 位置置顶两行，下面整块留给环，属性名在环里
+            # （见 ``_paint_ring``）。**不画右上角原始读数**——那两个值是横卡时代的
+            # 布局，这里圆心百分比就是这页要读的那个数；带单位的值仍在 tooltip 里。
             draw_text(p, QRect(PAD, 12, self.width() - PAD * 2, 20), row.device,
                       size=13, color=self._p.text, weight=QFont.DemiBold)
-            # 副标题从 11 降到 10：方卡只有 180 宽（可用 148），
-            # 「示例家庭 · 客厅 | 滤芯」在 11px 下要 154px 会被截成"示例家庭 · 客厅 | 滤…"，
-            # 10px 是 140px。横卡保持 12px（可用 236，同一句只要 168px）。
-            # 实测见 scripts/out/measure_subtitle.py。
-            draw_text(p, QRect(PAD, 32, self.width() - PAD * 2, 16), row.subtitle,
-                      size=10, color=self._p.text_soft)
+            # 第二行只写位置：属性名搬进环里后这里不用再挤「位置 | 属性」，字号从
+            # 10 回到 11（实测「示例家庭 · 客厅」11px = 75px / 方卡可用 148px）。
+            draw_text(p, QRect(PAD, 32, self.width() - PAD * 2, 16), row.place_text,
+                      size=11, color=self._p.text_soft)
         else:
             # 第一行：**设备名** + 右侧读数（读数用档位色，扫一眼就知道哪张红了）。
             # 主副标题的分工是 2026-11-18 用户定的：同一台设备的两块电池并排时，
@@ -428,15 +450,20 @@ class ConsumableCard(QWidget):
         p.drawRoundedRect(fill, BAR_H / 2, BAR_H / 2)
 
     def _paint_ring(self, p: QPainter, ratio: float, row: Row) -> None:
-        """圆环进度：方形卡居中大环、12 点留开口、圆心放百分比。
+        """圆环进度：方形卡居中大环、12 点留开口、环心两行（百分比 + 属性名）。
 
         结构由用户 2026-11-18 给的图定：环占卡片主体，粗线宽，顶部一道缺口——
         满格也**不补成整圆**，那道口是这类环的视觉惯例，不是没画完。
         百分比按 ``fill_percent`` 折算成 0–100；带单位的原始读数不画在卡上
         （结构图里没有），仍在悬停提示里。
 
-        轨道永远画满，前景弧按 ratio 走；读不到值时只画空轨道 + 圆心破折号，
+        轨道永远画满，前景弧按 ratio 走；读不到值时只画空轨道 + 环心破折号，
         不假装成 0%。开口同时绕开了 Qt 把 ``drawArc`` 的 360° 当空弧的坑。
+
+        属性名 2026-11-21 从第二行副标题搬进环里、写在数字**下方**：跨家庭后副标题
+        前面还要挤「家庭 · 房间」，180 方卡只剩 148px，同一句 11px 要 154px 必截；
+        搬进来之后副标题只写位置，字号回到 11，名字的可用宽度反而从 148 变成
+        环内弦长（数字那行 96、名字那行 ~90），长名字还有余量。
         """
         outer = QRectF(RING_X, RING_Y, RING_D, RING_D)
         track = outer.adjusted(RING_W / 2, RING_W / 2, -RING_W / 2, -RING_W / 2)
@@ -454,11 +481,24 @@ class ConsumableCard(QWidget):
         if row.percent is not None and ratio > 0:
             p.setPen(QPen(QColor(row.color), RING_W, Qt.SolidLine, Qt.FlatCap))
             p.drawArc(track, start * 16, int(span * 16 * ratio))
+
+        # 环心两行：百分比在上、属性名在下，整体相对环心上抬（见 RING_CENTER_LIFT）。
+        cx = outer.center().x()
+        cy = outer.center().y()
         text = "—" if row.percent is None else f"{row.percent:.0f}%"
-        draw_text(p, outer, text,
+        draw_text(p, QRect(int(cx) - 60, int(cy - RING_CENTER_LIFT) - 12, 120, 24), text,
                   size=RING_CENTER_SIZE,
                   color=(self._p.text_mute if row.percent is None else row.color),
                   weight=QFont.DemiBold, align=Qt.AlignCenter, elide=False)
+        if row.name:
+            # 宽度取标签**下沿**那一层的弦长再留 4px：环越往下越窄，按中线算会把
+            # 长名字（「电池电量 · 干电池」10px = 78px）压到环线上。
+            dy = RING_LABEL_DY + RING_LABEL_H / 2
+            half = int(_ring_chord(dy)) - 2
+            name_top = int(cy + RING_LABEL_DY - RING_LABEL_H / 2)
+            draw_text(p, QRect(int(cx) - half, name_top, half * 2, RING_LABEL_H),
+                      row.name, size=RING_LABEL_SIZE, color=self._p.text_soft,
+                      align=Qt.AlignCenter)
 
     def set_drag_placeholder(self, on: bool) -> None:
         """拖动中把自己画成虚线占位框（和主页 ``DeviceCard`` 同一语义）。"""

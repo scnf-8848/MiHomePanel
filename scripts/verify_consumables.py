@@ -50,14 +50,19 @@ from mihome.ui.consumables_page import (  # noqa: E402
     CARD_W,
     PAD,
     RING_CARD,
+    RING_CENTER_LIFT,
     RING_CENTER_SIZE,
     RING_D,
     RING_GAP,
+    RING_LABEL_DY,
+    RING_LABEL_H,
+    RING_LABEL_SIZE,
     RING_W,
     RING_X,
     RING_Y,
     ConsumablesPage,
     Row,
+    _ring_chord,
     card_size,
 )
 from mihome.ui.side_nav import SideNav  # noqa: E402
@@ -781,9 +786,27 @@ def main() -> int:
     wide_px = _advance(wide, 12)
     check(f"横卡副标题放得下（12px 实测 {wide_px}px / 可用 {CARD_W - PAD * 2}px）",
           wide_px <= CARD_W - PAD * 2, True)
-    ring_px = _advance("示例家庭 · 客厅 | 滤芯", 10)
-    check(f"环卡副标题放得下（10px 实测 {ring_px}px / 方卡可用 {RING_CARD - PAD * 2}px）",
-          ring_px <= RING_CARD - PAD * 2, True)
+    # 环卡：属性名搬进环里后，第二行只写位置，字号回到 11；环里的名字按**弦长**卡宽度。
+    # 注意这里量的是 offscreen 的回退字体，比真实雅黑**宽约三成**，所以当"下限"用：
+    # 6 字名字在这一关都放得下，真机上（雅黑 10px = 60px）必然更宽松。真实字体的样张在
+    # `scripts/out/shot_ring_real.py`。
+    place_px = _advance("示例家庭 · 客厅", 11)
+    check(f"环卡第二行只写位置，放得下（11px 实测 {place_px}px / 方卡可用 "
+          f"{RING_CARD - PAD * 2}px）", place_px <= RING_CARD - PAD * 2, True)
+    label_px = _advance("滤芯剩余寿命", RING_LABEL_SIZE)
+    avail = int(_ring_chord(RING_LABEL_DY + RING_LABEL_H / 2)) - 4
+    check(f"环内属性名按弦长放得下（{RING_LABEL_SIZE}px 六字实测 {label_px}px / "
+          f"环内可用 {avail}px）", label_px <= avail, True)
+    check("弦长按圆心算就是环内径",
+          (_ring_chord(0), _ring_chord(RING_D / 2 - RING_W / 2)), (RING_D - RING_W, 0.0))
+    check("越往下环越窄（名字按行下沿取宽度才有意义）",
+          _ring_chord(10) > _ring_chord(23) > _ring_chord(40), True)
+    check_true("环内名字那一行整行都在环里（下沿不越内缘）",
+               RING_LABEL_DY + RING_LABEL_H / 2 < RING_D / 2 - RING_W / 2,
+               f"{RING_LABEL_DY + RING_LABEL_H / 2} vs {RING_D / 2 - RING_W / 2}")
+    check_true("环心数字上抬后仍在内缘之内",
+               RING_CENTER_LIFT + RING_CENTER_SIZE / 2 < RING_D / 2 - RING_W / 2,
+               f"{RING_CENTER_LIFT + RING_CENTER_SIZE / 2} vs {RING_D / 2 - RING_W / 2}")
 
     print("\n10) 离线设备的读数：右下角标更新时间，一天没更新算不新鲜")
     import time as clock  # noqa: PLC0415
