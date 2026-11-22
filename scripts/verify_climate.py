@@ -214,8 +214,8 @@ def test_strip() -> int:
     check("胶囊宽度跟着文字走",
           strip.hum.width() < strip.temp.width(), True)
 
-    # 图标真的画出来了（不是只占位）：把两颗都画进一张透明图上数非透明像素
-    for kind in ("thermometer", "droplet"):
+    # 图标真的画出来了（不是只占位）：三种都画进一张透明图上数非透明像素
+    for kind in ("house", "thermometer", "droplet"):
         img = QImage(20, 26, QImage.Format_ARGB32)
         img.fill(QColor(0, 0, 0, 0))
         painter = QPainter(img)
@@ -234,6 +234,10 @@ def test_strip() -> int:
     check("图标真的占掉一段宽度（不是白画的）",
           iconed.width() - bare.width(), CHIP_GLYPH_W + CHIP_GLYPH_GAP)
     check_true("给了图标就不再画那个绿点", not iconed._dot)  # noqa: SLF001
+    check("在线设备那颗也换成房子图标（顶栏三颗同一套长相）",
+          (StatusChip("9 台设备 · 6 台开启", theme.LIGHT, icon="house")._icon,  # noqa: SLF001
+           StatusChip("9 台设备 · 6 台开启", theme.LIGHT, icon="house")._dot),  # noqa: SLF001
+          ("house", False))
 
     strip.set_climate(C.collect([device("d1", "空调", "客厅", category="air-conditioner",
                                         temp=21.5)], "h1"))
@@ -408,6 +412,16 @@ def test_settings() -> None:
         check("发信号给主窗口，参数是关掉的那一块", seen, ["humidity"])
         check("样式展示不跟着藏（关掉也要看得见它长什么样）",
               dlg._chip_previews[2].chip.text(), "46-51%")  # noqa: SLF001
+        check("样式展示就是胶囊本身的大小（四周不多留背景）",
+              [(pv.width() - pv.chip.width(), pv.height() - pv.chip.height())
+               for pv in dlg._chip_previews],  # noqa: SLF001
+              [(0, 0), (0, 0), (0, 0)])
+        check("同色底上靠胶囊自己的描边分辨边界",
+              [pv.chip._outline for pv in dlg._chip_previews],  # noqa: SLF001
+              [True, True, True])
+        check("三颗预览都带图标（房子 / 温度计 / 水滴）",
+              [pv.chip._icon for pv in dlg._chip_previews],  # noqa: SLF001
+              ["house", "thermometer", "droplet"])
         sw.set_on(True)
         sw.toggled.emit(True)
         check("再打开也写回偏好", win.store.prefs.shows_header("humidity"), True)

@@ -300,8 +300,10 @@ class MainWindow(QMainWindow):
         head.addSpacing(20)
 
         # 状态做成米家那种深蓝黑胶囊，而不是一行灰字：它是一眼扫的信息块，
-        # 落在顶栏右侧时比长句子安静。
-        self.status = StatusChip("正在连接…", self.palette_ref)
+        # 落在顶栏右侧时比长句子安静。左边挂一枚房子图标（和温湿度那两颗一致）：
+        # 原来那个绿点在这套界面里表示"开着 / 在线"，压在一句"6 台开启"前面
+        # 容易被读成"这一栏在线"，而它其实说的是"这是设备"。
+        self.status = StatusChip("正在连接…", self.palette_ref, icon="house")
         tooltip.watch(self.status, self.status.text)
         head.addWidget(self.status)
         # 全屋温湿度紧跟着设备计数（同一个范围 = 当前家庭）。没数据时整块隐藏，

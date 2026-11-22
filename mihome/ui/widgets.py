@@ -295,16 +295,40 @@ CHIP_GLYPH_GAP = 6
 
 
 def paint_chip_glyph(p: QPainter, box: QRectF, kind: str, color: QColor) -> None:
-    """在 ``box`` 里画一枚胶囊小图标：``"thermometer"`` 温度计 / ``"droplet"`` 水滴。
+    """在 ``box`` 里画一枚胶囊小图标。
+
+    ``kind`` 三选一：``"house"`` 房子（在线设备）/ ``"thermometer"`` 温度计 /
+    ``"droplet"`` 水滴。
 
     为什么自己画、不用 emoji 或图标字体：胶囊是自绘的，混进来的字形带着自己的
     颜色和基线，深浅两个主题里对不齐，颜色也不会跟着 ``theme.chip_text`` 变。
     这里只用线条和路径，``color`` 由调用方给（跟随主题）。
 
-    温度计 = 一根圆头竖管 + 底端空心圆泡 + 泡心的实心水银；水滴 = 顶尖锐、底端圆
-    的闭合路径、整块实心。两者都刻意留一点上下留白：贴到 13px 边上的曲线在 100%
-    缩放下会糊成一条竖线。
+    房子 = 尖顶 + 两面坡 + 两堵墙 + 平地的**描边**五边形；温度计 = 一根圆头竖管 +
+    底端空心圆泡 + 泡心的实心水银；水滴 = 顶尖锐、底端圆的闭合路径、整块实心。
+    三者都刻意留一点上下留白：贴到 13px 边上的曲线在 100% 缩放下会糊成一条竖线。
+    房子只描边不填：10px 宽里填实了就是一块墨点，认不出是房子。
     """
+    if kind == "house":
+        # 边距 0.9 = 线宽 1.4 的一半，整条描边才落在框内不被裁；坡顶比墙顶高
+        # 5.3px、墙高 6.1px，是这个尺寸下"看得出是房子"的最短比例
+        left = box.left() + 0.9
+        right = box.right() - 0.9
+        base = box.bottom() - 0.9
+        eave = box.top() + 6.2
+        cx = box.center().x()
+        roof = QPainterPath()
+        # 坡顶留 1.0：0.7 时 1.4px 的线宽正好把尖顶顶到框外，100% 缩放下尖头被切平
+        roof.moveTo(cx, box.top() + 1.0)
+        roof.lineTo(left, eave)
+        roof.lineTo(left, base)
+        roof.lineTo(right, base)
+        roof.lineTo(right, eave)
+        roof.closeSubpath()
+        p.setPen(QPen(color, 1.4, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+        p.setBrush(Qt.NoBrush)
+        p.drawPath(roof)
+        return
     if kind == "thermometer":
         cx = box.center().x()
         bulb_r = 2.7
@@ -346,8 +370,10 @@ class StatusChip(QWidget):
     深色主题下深色胶囊和背景几乎同色，切主题看不出变化。所以这里把它做成一张
     **缩小的卡片**——底色取 ``palette.card``、文字取次级色，深浅两套各一档。
 
-    左边可以放一枚小图标（``icon``，见 :func:`paint_chip_glyph`）：温湿度那两颗
-    靠它回答"这个数是什么"——``"48%"`` 单看只有百分号，分不出湿度还是占空比。
+    左边可以放一枚小图标（``icon``，见 :func:`paint_chip_glyph`）：三颗胶囊各挂
+    一枚——房子是设备、温度计是室温、水滴是湿度。``"48%"`` 单看只有百分号，
+    分不出湿度还是占空比；``"9 台设备 · 6 台开启"`` 前面那个绿点亮着时又容易被
+    读成"这一栏在线"，换成房子说的才是"这是设备"。
     """
 
     H = 30
@@ -369,6 +395,9 @@ class StatusChip(QWidget):
         # 一颗胶囊同时挂两个既挤又含混。给了图标就默认不带圆点
         self._dot = not icon
         self._icon = icon
+        # 描边默认关：真顶栏上胶囊压在背景 / 色带上，本来就有色差；只有垫在
+        # 同色底上的场合（设置页的样式展示）才需要一条轮廓（见 ``set_outline``）
+        self._outline = False
         self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         self.setFixedHeight(self.H)
         self._apply_width()
@@ -387,6 +416,17 @@ class StatusChip(QWidget):
         if on != self._dot:
             self._dot = on
             self._apply_width()
+            self.update()
+
+    def set_outline(self, on: bool) -> None:
+        """沿自己的圆角描一条 1px 的 ``border``。
+
+        只给"胶囊和底同色"的场合用（设置页的样式展示）：同尺寸同色的垫底会被
+        胶囊 100% 盖住，垫大一圈又会在四周漏出多余的一圈。描边由胶囊自己画，
+        所以和它的圆角逐像素重合，不会多出一分。
+        """
+        if on != self._outline:
+            self._outline = on
             self.update()
 
     def set_palette(self, palette: theme.Palette) -> None:
@@ -415,6 +455,10 @@ class StatusChip(QWidget):
         # 它是"一张缩小的卡片"，所以和卡片一样跟着 card_alpha 一起透（见 theme.card_fill）
         p.setBrush(theme.card_fill(theme.chip_bg(self._p), self._p))
         p.drawRoundedRect(r, theme.RADIUS_PILL, theme.RADIUS_PILL)
+        if self._outline:
+            p.setPen(QPen(QColor(self._p.border), 1))
+            p.setBrush(Qt.NoBrush)
+            p.drawRoundedRect(r, theme.RADIUS_PILL, theme.RADIUS_PILL)
 
         x = self.PAD
         if self._dot:

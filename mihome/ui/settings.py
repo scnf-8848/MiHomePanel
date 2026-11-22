@@ -263,18 +263,18 @@ class _PresetSwatch(QWidget):
 
 
 class _ChipPreview(QWidget):
-    """「顶栏展示」里的样式展示：一条顶栏色带 + 一颗**真的** ``StatusChip``。
+    """「顶栏展示」里的样式展示：一颗**真的** ``StatusChip``。
 
     用真控件而不是画一张示意图：文字宽度、圆角、图标都和顶栏逐像素一致，
     以后改了胶囊长相这里自动跟着变。
 
-    为什么还要垫一条色带：胶囊底色是 ``theme.chip_bg``（= ``p.card``），而设置
-    卡片的底是 ``panel_bg``，浅色下两者都是白的——直接放上去等于没画。色带取
-    ``bg_soft``，和顶栏圆形按钮同一支"压在带子上的块"，层次和真顶栏一致。
+    **尺寸就是胶囊本身**：胶囊底色 ``theme.chip_bg`` 是 ``p.card``，浅色下和设置
+    卡片的 ``panel_bg`` 一样白，直接放上去等于没画。原先在四周各垫了 8×2px 的
+    ``bg_soft`` 色带，胶囊看得见了，但多出来的那圈圆角像一块贴歪的补丁
+    （用户 2026-11-22 的截图）。而"只垫在胶囊底下"同尺寸同色等于 100% 被盖住，
+    垫大一圈又会漏边——所以改成让胶囊自己描一条 1px 轮廓（``set_outline``）：
+    和它的圆角逐像素重合，四周一滴也不多。
     """
-
-    PAD_X = 8
-    PAD_Y = 2
 
     def __init__(self, chip: StatusChip, palette: theme.Palette,
                  parent: QWidget | None = None) -> None:
@@ -282,21 +282,13 @@ class _ChipPreview(QWidget):
         self._p = palette
         self.chip = chip
         chip.setParent(self)
-        chip.move(self.PAD_X, self.PAD_Y)
-        self.setFixedSize(chip.width() + self.PAD_X * 2, chip.height() + self.PAD_Y * 2)
+        chip.set_outline(True)
+        chip.move(0, 0)
+        self.setFixedSize(chip.size())
 
     def set_palette(self, palette: theme.Palette) -> None:
         self._p = palette
         self.chip.set_palette(palette)
-        self.update()
-
-    def paintEvent(self, event) -> None:  # noqa: N802
-        p = QPainter(self)
-        p.setRenderHint(QPainter.Antialiasing)
-        p.setPen(Qt.NoPen)
-        p.setBrush(QColor(self._p.bg_soft))
-        p.drawRoundedRect(QRectF(self.rect()), 9, 9)
-        p.end()
 
 
 class _HeaderShowRow(QWidget):
@@ -541,19 +533,19 @@ class SettingsDialog(QDialog):
         col.addSpacing(8)
         self._section(col, "顶栏展示")
         show = SettingsCard()
-        # 三块各自独立：在线设备那颗带绿点（它是"状态"），温湿度两颗带小图标
-        # （它们是"读数"）。预览里的样例文字写死——设置页没有真实设备数据，
-        # 而这里要展示的是"长什么样"，不是"你现在是多少度"。
+        # 三块各自独立，三颗预览都带图标（房子 / 温度计 / 水滴）：顶栏那三颗现在
+        # 一律带图标，绿点只留给"开关类"控件，预览要和顶栏长得一样。
+        # 预览里的样例文字写死——设置页没有真实设备数据，而这里要展示的是
+        # "长什么样"，不是"你现在是多少度"。
         header_rows = (
-            ("online", "在线设备", "", True, "9 台设备 · 6 台开启"),
-            ("temperature", "温度", "thermometer", False, "21.5-22.8°C"),
-            ("humidity", "湿度", "droplet", False, "46-51%"),
+            ("online", "在线设备", "house", "9 台设备 · 6 台开启"),
+            ("temperature", "温度", "thermometer", "21.5-22.8°C"),
+            ("humidity", "湿度", "droplet", "46-51%"),
         )
         self.header_switches: dict[str, ToggleSwitch] = {}
         self._chip_previews: list[_ChipPreview] = []
-        for key, title, icon, dot, sample in header_rows:
+        for key, title, icon, sample in header_rows:
             chip = StatusChip(sample, self._p, icon=icon)
-            chip.set_dot(dot)
             preview = _ChipPreview(chip, self._p)
             self._chip_previews.append(preview)
             sw = ToggleSwitch(on=self.store.prefs.shows_header(key), palette=self._p, size="sm")
