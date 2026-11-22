@@ -41,6 +41,7 @@ from PySide6.QtWidgets import (
 )
 
 from .. import __version__
+from ..core import climate as climate_mod
 from ..core import speaker
 from ..core.alerts import ERROR, TOAST_COOLDOWN, Alert, AlertPolicy
 from ..core.api import Client, explain
@@ -63,7 +64,7 @@ from .side_nav import SideNav
 from .speaker_bar import SpeakerBar
 from .tray import TrayController
 from .wall import WallView
-from .widgets import HLine, IconProvider, StatusChip
+from .widgets import ClimateStrip, HLine, IconProvider, StatusChip
 
 DRAIN_MS = 16
 POLL_MS = 3000
@@ -303,6 +304,10 @@ class MainWindow(QMainWindow):
         self.status = StatusChip("正在连接…", self.palette_ref)
         tooltip.watch(self.status, self.status.text)
         head.addWidget(self.status)
+        # 全屋温湿度紧跟着设备计数（同一个范围 = 当前家庭）。没数据时整块隐藏，
+        # 连左边那 8px 间距一起消失——间距做在容器内部，不在顶栏上加 addSpacing。
+        self.climate = ClimateStrip(self.palette_ref)
+        head.addWidget(self.climate)
         head.addStretch(1)
 
         self.search = QLineEdit()
@@ -1233,6 +1238,60 @@ class MainWindow(QMainWindow):
         if hidden:
             bits.append(f"{hidden} 台已隐藏")
         self._set_status(" · ".join(bits))
+        self._update_climate(active)
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        # 顶栏余量跟着窗口宽度变：拉宽要把刚才收起的温湿度放回来，收窄要再收
+        self._fit_climate()
+
+    def _update_climate(self, active: str) -> None:
+        """全屋温湿度两颗胶囊（口径见 ``core/climate.py``）。
+
+        跟着顶栏的家庭走，所以每次 ``_update_header`` 都重算——它挂在 ``_on_changed``
+        上，读数每轮轮询回来就会刷一次，不需要另设定时器。
+        """
+        self.climate.set_climate(
+            climate_mod.collect(self.store.devices.values(), active,
+                                is_hidden=self.prefs.is_hidden)
+        )
+        self._fit_climate()
+
+    def _fit_climate(self) -> None:
+        """窄窗口下逐颗收起温湿度胶囊，别让它们把搜索框顶出去。
+
+        ``_update_climate`` 只管"有没有数据"，这里管"放不放得下"——两件事分开，
+        否则要么窄窗口少看一个数、要么顶栏控件互相压住（实测 offscreen 字体下
+        920px 就压上了，真雅黑刚好够，多几个家庭就没了）。
+        顺序：两颗 → 只留温度 → 整颗隐藏。窗口拉宽时同一段代码会按数据重新放出来。
+        """
+        strip = getattr(self, "climate", None)
+        head = getattr(self, "_head", None)
+        if strip is None or head is None:
+            return
+        # 先让数据侧复算一遍可见性：不这样的话"因为窄而收起"会被当成"没有数据"，
+        # 窗口拉宽以后再也放不回来。
+        strip.set_climate(strip.climate())
+        present = [c for c in (strip.temp, strip.hum) if c.text()]
+        if not present:
+            return
+        # 按"没有它"量一次顶栏的最小宽度：其余都是定宽控件，最小即所需
+        strip.setVisible(False)
+        head.invalidate()
+        base = head.minimumSize().width()
+        gap = strip.GAP
+        need_one = base + gap + present[0].width()
+        need_all = need_one + (gap + present[1].width() if len(present) > 1 else 0)
+        if self.width() >= need_all:
+            strip.setVisible(True)
+            strip.temp.setVisible(bool(strip.temp.text()))
+            strip.hum.setVisible(bool(strip.hum.text()))
+        elif self.width() >= need_one:
+            strip.setVisible(True)
+            strip.temp.setVisible(bool(strip.temp.text()))
+            strip.hum.setVisible(False)
+        else:
+            strip.setVisible(False)
 
     def _reload(self) -> None:
         self._set_status("正在刷新设备列表…")
@@ -1644,6 +1703,7 @@ class MainWindow(QMainWindow):
         self.widget_panel.set_palette(pal)
         self._dim.set_palette(pal)
         self.status.set_palette(pal)
+        self.climate.set_palette(pal)
         self.alert_bar.set_palette(pal)
         self.speaker_bar.set_palette(pal)
         tooltip.set_palette(pal)

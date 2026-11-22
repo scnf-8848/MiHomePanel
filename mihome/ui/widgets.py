@@ -17,8 +17,9 @@ from PySide6.QtCore import (
     Signal,
 )
 from PySide6.QtGui import QColor, QFont, QFontMetrics, QPainter, QPainterPath, QPixmap
-from PySide6.QtWidgets import QLabel, QLayout, QSizePolicy, QWidget
+from PySide6.QtWidgets import QHBoxLayout, QLabel, QLayout, QSizePolicy, QWidget
 
+from ..core.climate import SLOTS, Climate
 from ..core.icons import IconCache
 from . import theme, tooltip
 
@@ -346,6 +347,55 @@ class StatusChip(QWidget):
         draw_text(p, QRect(int(x), 0, self.width() - int(x) - 4, self.H), self._text,
                   size=12, color=theme.chip_text(self._p))
         p.end()
+
+
+class ClimateStrip(QWidget):
+    """顶栏那两颗温湿度胶囊（全屋范围，见 ``core/climate.py``）。
+
+    做成一个容器、而不是往顶栏里直接塞两个 ``StatusChip``：没有数据时要**整块
+    消失**，连中间那 8px 间距一起——`addSpacing` 加出来的缝不会跟着胶囊藏。
+
+    两颗都不带那个绿色圆点：圆点在这套界面里表示"开着 / 在线"，温湿度是读数不是
+    状态，点亮会读成"温湿度传感器在线"。悬停给逐台读数（最多 6 台）。
+    """
+
+    #: 胶囊之间（以及和左边状态胶囊之间）的留白。顶栏算余量时要用同一个数。
+    GAP = 8
+
+    def __init__(self, palette: theme.Palette, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._p = palette
+        self._climate = Climate()
+        self.temp = StatusChip("", palette)
+        self.hum = StatusChip("", palette)
+        for chip, slot in zip((self.temp, self.hum), SLOTS, strict=True):
+            chip.set_dot(False)
+            tooltip.watch(chip, lambda slot=slot: self._climate.tooltip(slot))
+        lay = QHBoxLayout(self)
+        # 左边那 8px 留白做在容器里：整块隐藏时它跟着消失；放顶栏上做 addSpacing 会留一条空缝
+        lay.setContentsMargins(self.GAP, 0, 0, 0)
+        lay.setSpacing(self.GAP)
+        lay.addWidget(self.temp)
+        lay.addWidget(self.hum)
+        self.setVisible(False)
+
+    def climate(self) -> Climate:
+        return self._climate
+
+    def set_climate(self, climate: Climate) -> None:
+        """换一份样本：有值就显示、没值就藏。文字与可见性一起变。"""
+        self._climate = climate
+        temp, hum = climate.texts()
+        self.temp.setText(temp)
+        self.temp.setVisible(bool(temp))
+        self.hum.setText(hum)
+        self.hum.setVisible(bool(hum))
+        self.setVisible(bool(temp or hum))
+
+    def set_palette(self, palette: theme.Palette) -> None:
+        self._p = palette
+        self.temp.set_palette(palette)
+        self.hum.set_palette(palette)
 
 
 class HLine(QWidget):
