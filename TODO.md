@@ -88,20 +88,8 @@
   `scripts/build_go2rtc.py` → [摄像头 · 开播补丁](docs/dev/camera.md)
 - **`Store.set_power_for_devices` 大房间限流**：函数现只为自动化动作预留，真接时观察
   云端限流 → 同上「技术债」
-## D. 一次性验证（2 条）+ 已知局限（不做验证）
+## D. 一次性验证（1 条）+ 已知局限（不做验证）
 
-- **普通权限启动的 exe：托盘图标 + 设置/挂件落盘**（2026-11-21，根因已修，等最终确认）：
-  根因**不在代码里**——`E:\Code\MiHomePanel` 带 `Mandatory Label\Low`，产物继承下来，
-  Windows 就以 Low 完整性启动 exe（写不了 `%LOCALAPPDATA%`、发不了消息给 explorer，
-  所以托盘挂不上）。`--self-check` 也写不出报告。管理员启动是 High，所以"管理员那次好好的"。
-  处方来源已查实：另一个 AI 工具为了让它自己的沙箱（Low）能写 `.git`，建议
-  `icacls .git /setintegritylevel (OI)(CI)Low`——同一族命令用在仓库根上的结果。
-  **已处理**：11-21 05:0x 用管理员 `icacls "...\MiHomePanel" /setintegritylevel (OI)(CI)Medium /T /C`
-  修好，全树复查零 Low，重建的 `dist\MiHomePanel\MiHomePanel.exe` 实测 IL=Medium、自检通过。
-  打包侧改成"检测到 Low 只警告、产物恒落 `dist/`"，不再搬去 `%LOCALAPPDATA%`。
-  要验的只剩一条：**从 `dist\MiHomePanel\MiHomePanel.exe` 普通双击**（别用管理员）后
-  ① 托盘里有图标（含 Win11 溢出面板 `^`）② `logs\prefs.log` 里有 `数据目录可写`
-  与 `已保存` ③ 改设置 / 加挂件设备后重启仍在。三条都好就删掉这条。
 - **不自动播之后的首帧等待**（2026-11-19，部分回填）：进页面只预热源与地址，点播放仍要
   等播放器连流 + 等 GOP。**已测（用户，体感、没掐表）**：等预热完成后点第一格，出画约从
   **3 秒降到 2 秒**；省下的是取址那一段，剩下的是连流 + 关键帧，预热管不到。仍没对比的
@@ -124,6 +112,15 @@
 调大或改成"只更新内存、停播时才写盘"。
 
 ## 最近完成（2026-11-15 ~ 11-22）
+
+- **普通权限启动的 exe 三项确认（2026-11-22 用户实测通过）**：从 `dist\MiHomePanel\`
+  普通双击（非管理员）→ 托盘有图标、改配置能保存、`logs\prefs.log` 里有「数据目录可写」。
+  根因**不在代码里**：仓库目录曾被降成 `Mandatory Label\Low`，产物继承后 exe 以 Low
+  启动（写不了 `%LOCALAPPDATA%`、发不了消息给 explorer，所以托盘挂不上）；
+  11-21 05:0x 用管理员 `icacls ... /setintegritylevel (OI)(CI)Medium /T /C` 修好，
+  全树复查零 Low，产物恒落 `dist/`（打包侧改成"检测到 Low 只警告、不再搬去
+  `%LOCALAPPDATA%`"）。**红线**：以后不许再对仓库及其父目录改完整性 / ACL，
+  见 `AGENTS.md` 第七节与 `docs/dev/packaging-release.md`「产物目录的强制完整性标签」。
 
 - **耗材页跨家庭 + 圆环卡属性名进环（2026-11-21 晚）**：耗材问的是"整栋房子该换什么"，
   按当前家庭显示会**漏报**——B 家滤芯归零而用户停在 A 家时，侧栏圆点和挂件角标都不动
