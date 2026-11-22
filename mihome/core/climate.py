@@ -13,14 +13,17 @@
 * **多台怎么聚合** —— **最小-最大范围**，如 ``21.5-22.8°C`` / ``46-51%``；
   只有一台、或取整后两端相同就写单值。不做平均：平均会把"有一间 32 °C"
   这个最该被看见的事实抹掉。
+* **隐藏的设备也算**（2026-11-22 用户定）——"隐藏"是"别在卡片墙上占一格"，
+  不是"这台传感器不在这个房间里"。把藏起来的那台踢出范围，范围就从"全屋"
+  变成"我恰好没藏的那些房间"，而且屏幕上完全看不出来少了谁。
 
-读不到、离线、被隐藏、数值离谱（传感器抽风写 255）的样本一律不参与——
+读不到、离线、数值离谱（传感器抽风写 255）的样本一律不参与——
 宁可显示"暂无"也不要让一颗坏读数把整条范围拉飞。
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 
 #: 参与聚合的两个槽位，顺序即顶栏从左到右的顺序。
@@ -37,6 +40,9 @@ PLAUSIBLE: dict[str, tuple[float, float]] = {
 #: 槽位 → 单位。温度用 ``°C`` 与本项目其它读数（卡片副标题 / 详情页）一致，
 #: 不跟米家 App 的 ``℃`` 走——同一个程序里两种写法比抄得像更重要。
 UNITS: dict[str, str] = {"temperature": "°C", "humidity": "%"}
+
+#: 悬停提示最多列几台。一台一行之后 10 行已经≈170px 高，再多就比窗口还高。
+TOOLTIP_ROWS = 10
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,20 +80,24 @@ class Climate:
         return self.text(first), self.text(second)
 
     def tooltip(self, slot: str) -> str:
-        """悬停提示：「客厅 温湿度计 22.3°C · 主卧 空调 22.8°C」。
+        """悬停提示：**一台一行，数值在前、名字在后**。
 
-        超出 6 台就收尾成「… 等 N 台」——两颗胶囊的提示最多两行，
-        九台空调挨个列出来没人读得完。
+            21.5°C  主卧 空调
+            22.8°C  客厅 温湿度计
+
+        数值放左边是 2026-11-22 用户定的：扫提示时先找的是"范围两头分别是哪台"，
+        名字只是这一行的注脚；挤成 `A 22.3°C · B 22.8°C` 时两眼要在逗号间来回跳。
+        超过 :data:`TOOLTIP_ROWS` 台收尾成「… 等 N 台」。
         """
         rows = self.get(slot)
         if not rows:
             return ""
         unit = UNITS[slot]
         dec = _decimals([s.value for s in rows]) if slot == "temperature" else 0
-        head = [f"{s.where} {s.value:.{dec}f}{unit}" for s in rows[:6]]
-        if len(rows) > 6:
-            head.append(f"… 等 {len(rows)} 台")
-        return " · ".join(head)
+        lines = [f"{s.value:.{dec}f}{unit}  {s.where}" for s in rows[:TOOLTIP_ROWS]]
+        if len(rows) > TOOLTIP_ROWS:
+            lines.append(f"… 等 {len(rows)} 台")
+        return "\n".join(lines)
 
 
 def span_text(samples: Iterable[Sample], slot: str) -> str:
@@ -134,16 +144,15 @@ def _number(value: object, slot: str) -> float | None:
 def collect(
     devices: Iterable[object],
     home: str = "",
-    *,
-    is_hidden: Callable[[str], bool] | None = None,
 ) -> Climate:
     """把当前家庭里所有能报环境温湿度的设备收成一份 :class:`Climate`。
 
     参数是 ``DeviceState`` 的迭代（用 ``Store.devices.values()``），但只用到
     ``node`` / ``online`` / ``card`` / ``values`` 这几样，方便测试塞假对象。
 
-    跳过四类：别的家庭的、离线的、用户隐藏的、以及卡片的指标里没绑上温度/湿度
-    的（README 里"没声明的读数不猜"是同一条原则）。
+    跳过三类：别的家庭的、离线的、以及卡片的指标里没绑上温度/湿度的
+    （README 里"没声明的读数不猜"是同一条原则）。**被用户隐藏的设备照算**，
+    理由见模块文档。
     """
     out: Climate = Climate({s: [] for s in SLOTS})
     seen: set[tuple[str, str]] = set()
@@ -157,8 +166,6 @@ def collect(
         if not getattr(st, "online", False):
             continue
         did = getattr(node, "did", "")
-        if is_hidden is not None and is_hidden(did):
-            continue
         card = getattr(st, "card", None)
         values = getattr(st, "values", None)
         if card is None or not isinstance(values, dict):

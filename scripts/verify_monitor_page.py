@@ -138,7 +138,7 @@ def main() -> int:
           LAYOUT_SPECS["1+2"].col_stretch, (2, 1))
 
     print("\n2) 落盘：布局与格子")
-    check("偏好版本升到 19", PREFS_VERSION, 19)
+    check("偏好版本升到 20", PREFS_VERSION, 20)
     store = make_store(tmp)
     p = store.prefs
     check("默认单窗口", p.monitor_layout, "1x1")

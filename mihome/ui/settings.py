@@ -66,9 +66,9 @@ from .home_tabs import (
     HomeTabs,
 )
 from .radio_dot import RadioDot
-from .settings_rows import SettingsCard, link_button, section_header
+from .settings_rows import ROW_MIN_H, SettingsCard, link_button, section_header
 from .tree import ReorderTree
-from .widgets import ElidedLabel, ToggleSwitch, draw_text
+from .widgets import ElidedLabel, StatusChip, ToggleSwitch, draw_text
 
 PAGE_MARGIN = 26
 #: 下拉框统一宽度。QQ 的右对齐控件也是定宽的，宽窄随文字变会让同一张卡里的
@@ -262,11 +262,93 @@ class _PresetSwatch(QWidget):
             self.picked.emit(self._preset.id)
 
 
+class _ChipPreview(QWidget):
+    """「顶栏展示」里的样式展示：一条顶栏色带 + 一颗**真的** ``StatusChip``。
+
+    用真控件而不是画一张示意图：文字宽度、圆角、图标都和顶栏逐像素一致，
+    以后改了胶囊长相这里自动跟着变。
+
+    为什么还要垫一条色带：胶囊底色是 ``theme.chip_bg``（= ``p.card``），而设置
+    卡片的底是 ``panel_bg``，浅色下两者都是白的——直接放上去等于没画。色带取
+    ``bg_soft``，和顶栏圆形按钮同一支"压在带子上的块"，层次和真顶栏一致。
+    """
+
+    PAD_X = 8
+    PAD_Y = 2
+
+    def __init__(self, chip: StatusChip, palette: theme.Palette,
+                 parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._p = palette
+        self.chip = chip
+        chip.setParent(self)
+        chip.move(self.PAD_X, self.PAD_Y)
+        self.setFixedSize(chip.width() + self.PAD_X * 2, chip.height() + self.PAD_Y * 2)
+
+    def set_palette(self, palette: theme.Palette) -> None:
+        self._p = palette
+        self.chip.set_palette(palette)
+        self.update()
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(self._p.bg_soft))
+        p.drawRoundedRect(QRectF(self.rect()), 9, 9)
+        p.end()
+
+
+class _HeaderShowRow(QWidget):
+    """「顶栏展示」的一行：名字 + 样式展示 + 开关。
+
+    没有直接用 ``SettingsRow``：三行名字长短差一倍（在线设备 / 温度 / 湿度），
+    名字列不定宽的话三枚预览会各起各的头，看着不像一张表。这里名字列写死
+    ``TITLE_W``、预览列左对齐、开关贴右。
+
+    不带副标题：每行都挂一行说明得占两行高，三行下来这一节比上面「背景」还高；
+    "范围是什么范围"这类共性问题写成卡底一条注（见 ``_build_appearance``）。
+    """
+
+    TITLE_W = 76
+
+    def __init__(
+        self,
+        title: str,
+        preview: QWidget,
+        switch: QWidget,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 6, 0, 6)
+        lay.setSpacing(16)
+
+        # 定宽的名字列：标签都带 parent，否则它们自己会变成顶层小窗口（见 settings_rows）
+        head = QWidget(self)
+        head.setFixedWidth(self.TITLE_W)
+        col = QVBoxLayout(head)
+        col.setContentsMargins(0, 0, 0, 0)
+        col.setSpacing(2)
+        self.title = QLabel(title, head)
+        self.title.setObjectName("RowTitle")
+        col.addWidget(self.title)
+
+        lay.addWidget(head, 0, Qt.AlignVCenter)
+        lay.addWidget(preview, 0, Qt.AlignVCenter)
+        lay.addStretch(1)
+        lay.addWidget(switch, 0, Qt.AlignVCenter)
+        self.setMinimumHeight(ROW_MIN_H)
+
+
 class SettingsDialog(QDialog):
     #: 明暗档（"light" / "dark"）。主窗口负责持久化和重绘。
     theme_selected = Signal(str)
     #: 背景预设 id（``theme.PRESET_IDS`` 之一）。同上，选中立即生效。
     preset_selected = Signal(str)
+    #: 顶栏三块胶囊的显隐变了（参数是 ``prefs.HEADER_ITEMS`` 里的一员）。
+    #: 主窗口收到后重算顶栏：少一颗就多出一截余量，温湿度可能因此重新放得下。
+    header_changed = Signal(str)
     #: "logout" = 用户点了退出登录；"login" = 未登录状态下点了扫码登录。
     #: 真正的动作交给主窗口做（登录窗口、清空设备墙都在那边），这里只发信号。
     account_action = Signal(str)
@@ -393,6 +475,9 @@ class SettingsDialog(QDialog):
         preview = getattr(self, "preview", None)
         if preview is not None:
             preview.set_palette(palette)
+        # 「顶栏展示」里的样式展示也是真胶囊，自己画、不吃 QSS，得逐个通知
+        for chip_preview in getattr(self, "_chip_previews", ()):
+            chip_preview.set_palette(palette)
         for btn, mode in ((self.btn_light, "light"), (self.btn_dark, "dark")):
             btn.setChecked((palette.is_dark and mode == "dark")
                            or (not palette.is_dark and mode == "light"))
@@ -436,8 +521,8 @@ class SettingsDialog(QDialog):
         page, col = self._page()
         self._page_head(
             col, "外观",
-            "明暗决定文字与控件的深浅；背景预设只换窗口底和卡片的透明度。"
-            "两者都立即生效，并会记住。",
+            "明暗决定文字与控件的深浅；背景预设只换窗口底和卡片的透明度；"
+            "顶栏展示决定右上角那几颗胶囊画不画。改动都立即生效，并会记住。",
         )
 
         # 「主题」和「背景」合并成一块：上排明暗两档，下面是 24 个背景色块。
@@ -452,6 +537,40 @@ class SettingsDialog(QDialog):
         card.add_unit(self._preset_grid(theme.SOLID_PRESETS, bottom=10))
         card.add_unit(self._preset_grid(theme.GRADIENT_PRESETS, top=10))
         col.addWidget(card)
+
+        col.addSpacing(8)
+        self._section(col, "顶栏展示")
+        show = SettingsCard()
+        # 三块各自独立：在线设备那颗带绿点（它是"状态"），温湿度两颗带小图标
+        # （它们是"读数"）。预览里的样例文字写死——设置页没有真实设备数据，
+        # 而这里要展示的是"长什么样"，不是"你现在是多少度"。
+        header_rows = (
+            ("online", "在线设备", "", True, "9 台设备 · 6 台开启"),
+            ("temperature", "温度", "thermometer", False, "21.5-22.8°C"),
+            ("humidity", "湿度", "droplet", False, "46-51%"),
+        )
+        self.header_switches: dict[str, ToggleSwitch] = {}
+        self._chip_previews: list[_ChipPreview] = []
+        for key, title, icon, dot, sample in header_rows:
+            chip = StatusChip(sample, self._p, icon=icon)
+            chip.set_dot(dot)
+            preview = _ChipPreview(chip, self._p)
+            self._chip_previews.append(preview)
+            sw = ToggleSwitch(on=self.store.prefs.shows_header(key), palette=self._p, size="sm")
+            sw.toggled.connect(lambda on, k=key: self._on_header_show(k, on))
+            self.header_switches[key] = sw
+            show.add_unit(_HeaderShowRow(title, preview, sw))
+        # 三行共用的两句话写在这里，而不是每行挂一条副标题：那样三行各自两行高，
+        # 这一节会比上面「背景」还高，而信息只多一句
+        note = QLabel(
+            "温湿度取当前家庭的全屋范围，被隐藏的设备也算在内；"
+            "窗口太窄时顶栏会先收湿度、再整块收起，拉宽自动回来。"
+        )
+        note.setObjectName("RowSub")
+        note.setWordWrap(True)
+        note.setContentsMargins(0, 4, 0, 4)
+        show.add_unit(note)
+        col.addWidget(show)
 
         col.addSpacing(8)
         self._section(col, "家庭标签")
@@ -643,6 +762,15 @@ class SettingsDialog(QDialog):
         if self._loading:
             return
         self.store.set_camera_network(str(self.cb_camera_network.currentData() or ""))
+
+    def _on_header_show(self, key: str, on: bool) -> None:
+        """顶栏某一块的开关。只写偏好 + 发信号：画不画是主窗口的事，
+        这里连预览都不跟着藏——关掉以后还能看见它长什么样，才好决定要不要开回来。
+        """
+        if self._loading:
+            return
+        if self.store.prefs.set_header_show(key, on):
+            self.header_changed.emit(key)
 
     def _on_mode_picked(self, key: str) -> None:
         """明暗档：保留当前背景预设，只换骨架与对应档的底色。"""

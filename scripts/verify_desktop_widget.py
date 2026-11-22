@@ -193,7 +193,7 @@ def make_widget(tmp: Path, states: dict[str, object] | None = None):
 def test_prefs(tmp: Path) -> None:
     print("prefs v19")
     prefs = Prefs(tmp / "p1.json")
-    check("版本号", PREFS_VERSION, 19)
+    check("版本号", PREFS_VERSION, 20)
     check("默认不开机启用", prefs.widget_autostart, False)
     check("默认布局", prefs.widget_layout, WIDGET_LAYOUT_DEFAULT)
     check("默认槽位", prefs.widget_slots, ["", "", ""])

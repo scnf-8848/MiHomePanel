@@ -49,8 +49,9 @@ from mihome.core.prefs import Prefs  # noqa: E402
 from mihome.core.store import DeviceState, Store, build_card_empty  # noqa: E402
 from mihome.core.tree import DeviceNode  # noqa: E402
 from mihome.ui import theme  # noqa: E402
-from mihome.ui.settings import COMBO_W, SettingsDialog  # noqa: E402
+from mihome.ui.settings import COMBO_W, SettingsDialog, _HeaderShowRow  # noqa: E402
 from mihome.ui.settings_rows import ROW_MIN_H, SettingsRow  # noqa: E402
+from mihome.ui.widgets import StatusChip  # noqa: E402
 from mihome.ui.tree import (  # noqa: E402
     CHEV,
     INDENT,
@@ -743,10 +744,11 @@ def section_panels() -> None:
             for _ in range(3):
                 QApplication.processEvents()
 
-        # 外观页只剩两块（背景 / 家庭标签）：摄像头取流方式 2026-11-18 挪到了
-        # 独立的「设备」页 —— 外观管"长什么样"，取流方式管"怎么连设备"。
-        check(f"{pal.name}：外观页两张卡（背景 / 家庭标签）",
-              len(cards_of(0)) == 2, f"{len(cards_of(0))} 张")
+        # 外观页三块（背景 / 顶栏展示 / 家庭标签）：摄像头取流方式 2026-11-18 挪到了
+        # 独立的「设备」页 —— 外观管"长什么样"，取流方式管"怎么连设备"；
+        # 顶栏展示是 2026-11-22 加的（顶栏三颗胶囊各一个开关）。
+        check(f"{pal.name}：外观页三张卡（背景 / 顶栏展示 / 家庭标签）",
+              len(cards_of(0)) == 3, f"{len(cards_of(0))} 张")
         check(f"{pal.name}：排序页一张卡（两棵树用 tab 切换）", len(cards_of(1)) == 1,
               f"{len(cards_of(1))} 张")
         check(f"{pal.name}：隐藏页一张卡", len(cards_of(2)) == 1, f"{len(cards_of(2))} 张")
@@ -789,10 +791,22 @@ def section_panels() -> None:
               abs(dlg.tree_hidden_devices.height() - dlg.hidden_stack.height()) <= 2,
               f"树 {dlg.tree_hidden_devices.height()} / 栈 {dlg.hidden_stack.height()}")
 
-        # 外观页："家庭标签"卡里两行（排列 / 激活样式）+ 预览；三段 → 两条线。
-        # 卡序：背景 / 家庭标签，别拿第 0 张（背景是色块网格，没有行）
+        # 顶上那块「顶栏展示」：三行（在线设备 / 温度 / 湿度）+ 卡底一条注，
+        # 四个单元 → 三条线；每行一颗真胶囊做样式展示
         show_page(0)
-        tags = cards_of(0)[1]
+        header_card = cards_of(0)[1]
+        check(f"{pal.name}：顶栏展示卡 3 行 + 3 条线",
+              (len(header_card.findChildren(_HeaderShowRow)),
+               len(header_card.findChildren(QFrame, "RowDivider"))) == (3, 3),
+              f"{len(header_card.findChildren(_HeaderShowRow))} 行 / "
+              f"{len(header_card.findChildren(QFrame, 'RowDivider'))} 线")
+        check(f"{pal.name}：三行各有一颗样式展示胶囊",
+              len(header_card.findChildren(StatusChip)) == 3,
+              f"{len(header_card.findChildren(StatusChip))} 颗")
+
+        # 外观页："家庭标签"卡里两行（排列 / 激活样式）+ 预览；三段 → 两条线。
+        # 卡序：背景 / 顶栏展示 / 家庭标签，别拿第 0 张（背景是色块网格，没有行）
+        tags = cards_of(0)[2]
         check(f"{pal.name}：家庭标签卡 2 行 + 预览 + 2 条线",
               (len(tags.findChildren(SettingsRow)),
                len(tags.findChildren(QFrame, "RowDivider"))) == (2, 2),

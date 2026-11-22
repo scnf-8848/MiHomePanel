@@ -69,8 +69,9 @@ HIDDEN_ROOM_ID = "__hidden__"
 #: v19（2026-11-20 深夜）把挂件从「按设备数自动排行」改成**固定宫格**：
 #: ``widget_columns`` + ``widget_devices`` → ``widget_layout``（行×列）+
 #: ``widget_slots``（按下标存，空串 = 空槽）。老文件在 ``load()`` 里按行优先
-#: 灌进新槽位。
-PREFS_VERSION = 19
+#: 灌进新槽位。v20（2026-11-22）新增顶栏三块胶囊的显示开关 ``header_show``
+#: （``HEADER_ITEMS``），默认三块全开 —— 老文件缺这个键时就是默认值，不用迁移。
+PREFS_VERSION = 20
 
 
 def describe_oserror(exc: OSError, target: Path | None = None) -> str:
@@ -108,6 +109,16 @@ HOME_STYLE_DEFAULT = "size"
 #   remote_only  —— 始终走远程中继，绝不碰局域网（只想走中继时用）
 CAMERA_NETWORKS = ("lan_first", "remote_first", "remote_only")
 CAMERA_NETWORK_DEFAULT = "lan_first"
+
+# 顶栏（家庭标签右边那排胶囊）显示哪几块。三块各自独立：
+#   online      —— 当前家庭的「N 台设备 · M 台开启 · …」
+#   temperature —— 全屋温度范围
+#   humidity    —— 全屋湿度范围
+# 温湿度两颗共用顶栏余量（窄窗口会**临时**逐颗收起，见
+# ``ui/main_window.MainWindow._fit_climate``），所以"关掉"和"被窄窗口收起"是两件事：
+# 前者是用户偏好，后者只是让位，拉宽就回来。
+HEADER_ITEMS = ("online", "temperature", "humidity")
+HEADER_ITEM_DEFAULT = True
 
 # 耗材页的卡片排序：
 #   level  —— 余量低的排前面（默认：这页就是来看"哪个快用完了"）
@@ -278,6 +289,9 @@ class Prefs:
         self.home_active_style = HOME_STYLE_DEFAULT
         #: 摄像头取流方式，见 ``CAMERA_NETWORKS``
         self.camera_network = CAMERA_NETWORK_DEFAULT
+        #: 顶栏三块胶囊各自显不显示，见 ``HEADER_ITEMS``。每次读都走
+        #: ``shows_header``，别直接下标取——老文件 / 手工改坏时不该出 KeyError
+        self.header_show: dict[str, bool] = dict.fromkeys(HEADER_ITEMS, HEADER_ITEM_DEFAULT)
         #: 顶栏指令条上次选中的音箱 did。只记 did：名字会变、型号会换，
         #: 下次启动只要这台还在"支持执行文本指令"的列表里就沿用（见 ``ui/speaker_bar.py``）
         self.speaker_command_did = ""
@@ -546,6 +560,13 @@ class Prefs:
                 self.home_placement = placement
             if style in HOME_STYLES:
                 self.home_active_style = style
+        # 顶栏三块开关：只认真正的 bool，未知键丢弃、缺键保默认（全开）
+        header = data.get("header_show")
+        if isinstance(header, dict):
+            for key in HEADER_ITEMS:
+                value = header.get(key)
+                if isinstance(value, bool):
+                    self.header_show[key] = value
 
     def save(self) -> None:
         payload = {
@@ -572,6 +593,7 @@ class Prefs:
             "hidden_scenes": self.hidden_scenes,
             "hidden_collapsed": self.hidden_collapsed,
             "camera_network": self.camera_network,
+            "header_show": dict(self.header_show),
             "speaker_command_did": self.speaker_command_did,
             "speaker_silent": self.speaker_silent,
             "close_to_tray": self.close_to_tray,
@@ -743,6 +765,25 @@ class Prefs:
         if value not in CAMERA_NETWORKS or value == self.camera_network:
             return False
         self.camera_network = value
+        self.save()
+        return True
+
+    # -- 顶栏三块胶囊的显隐 ----------------------------------------------
+    def shows_header(self, key: str) -> bool:
+        """这一块要不要显示。未知键当"显示"——宁多画一块，也别因为读了个新键
+        就整块消失（早期版本写的 prefs.json 里没有这个键）。"""
+        if key not in HEADER_ITEMS:
+            return True
+        return bool(self.header_show.get(key, HEADER_ITEM_DEFAULT))
+
+    def set_header_show(self, key: str, on: bool) -> bool:
+        """改一块的显隐。返回是否真的变了（没变就不写盘）。"""
+        if key not in HEADER_ITEMS:
+            return False
+        on = bool(on)
+        if self.shows_header(key) == on:
+            return False
+        self.header_show[key] = on
         self.save()
         return True
 

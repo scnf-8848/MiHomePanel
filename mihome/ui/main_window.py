@@ -1238,6 +1238,9 @@ class MainWindow(QMainWindow):
         if hidden:
             bits.append(f"{hidden} 台已隐藏")
         self._set_status(" · ".join(bits))
+        # 「在线设备」这块也能关（设置 → 外观 → 顶栏展示）。关掉就整颗不画，
+        # 温湿度顺着流式布局往左靠；顶栏余量随之变宽，_fit_climate 会自己多放一颗。
+        self.status.setVisible(self.prefs.shows_header("online"))
         self._update_climate(active)
 
     def resizeEvent(self, event) -> None:  # noqa: N802
@@ -1250,19 +1253,24 @@ class MainWindow(QMainWindow):
 
         跟着顶栏的家庭走，所以每次 ``_update_header`` 都重算——它挂在 ``_on_changed``
         上，读数每轮轮询回来就会刷一次，不需要另设定时器。
+
+        隐藏设备**照算**：隐藏只是"别在卡片墙上占一格"，它的房间还在那儿。
+        被用户关掉的那颗（设置 → 外观 → 顶栏展示）交给 ``set_shown``，
+        与"有没有数据"分开记。
         """
+        for slot in climate_mod.SLOTS:
+            self.climate.set_shown(slot, self.prefs.shows_header(slot))
         self.climate.set_climate(
-            climate_mod.collect(self.store.devices.values(), active,
-                                is_hidden=self.prefs.is_hidden)
+            climate_mod.collect(self.store.devices.values(), active)
         )
         self._fit_climate()
 
     def _fit_climate(self) -> None:
         """窄窗口下逐颗收起温湿度胶囊，别让它们把搜索框顶出去。
 
-        ``_update_climate`` 只管"有没有数据"，这里管"放不放得下"——两件事分开，
-        否则要么窄窗口少看一个数、要么顶栏控件互相压住（实测 offscreen 字体下
-        920px 就压上了，真雅黑刚好够，多几个家庭就没了）。
+        ``_update_climate`` 只管"有没有数据 / 用户关没关"，这里管"放不放得下"——
+        两件事分开，否则要么窄窗口少看一个数、要么顶栏控件互相压住（实测 offscreen
+        字体下 920px 就压上了，真雅黑刚好够，多几个家庭就没了）。
         顺序：两颗 → 只留温度 → 整颗隐藏。窗口拉宽时同一段代码会按数据重新放出来。
         """
         strip = getattr(self, "climate", None)
@@ -1272,7 +1280,7 @@ class MainWindow(QMainWindow):
         # 先让数据侧复算一遍可见性：不这样的话"因为窄而收起"会被当成"没有数据"，
         # 窗口拉宽以后再也放不回来。
         strip.set_climate(strip.climate())
-        present = [c for c in (strip.temp, strip.hum) if c.text()]
+        present = strip.present()
         if not present:
             return
         # 按"没有它"量一次顶栏的最小宽度：其余都是定宽控件，最小即所需
@@ -1284,12 +1292,13 @@ class MainWindow(QMainWindow):
         need_all = need_one + (gap + present[1].width() if len(present) > 1 else 0)
         if self.width() >= need_all:
             strip.setVisible(True)
-            strip.temp.setVisible(bool(strip.temp.text()))
-            strip.hum.setVisible(bool(strip.hum.text()))
+            for chip in present:
+                chip.setVisible(True)
         elif self.width() >= need_one:
             strip.setVisible(True)
-            strip.temp.setVisible(bool(strip.temp.text()))
-            strip.hum.setVisible(False)
+            present[0].setVisible(True)
+            for chip in present[1:]:
+                chip.setVisible(False)
         else:
             strip.setVisible(False)
 
@@ -1546,6 +1555,9 @@ class MainWindow(QMainWindow):
                              tray_available=self.tray.active)
         dlg.theme_selected.connect(self.set_theme)
         dlg.preset_selected.connect(self.set_preset)
+        # 顶栏三块胶囊的开关：设置页只写偏好，画不画由这里重算一遍——
+        # 顶栏是流式布局，少一颗要多出来的宽度得重新量（_fit_climate）
+        dlg.header_changed.connect(lambda _key: self._update_header())
         # 账号动作（退出登录 / 扫码登录）不能在设置窗口还开着的时候做：
         # 登录窗口是另一个模态窗口，套在设置里面会把模态栈搞乱。
         action = {"kind": ""}

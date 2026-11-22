@@ -394,6 +394,8 @@ def _no_persist() -> None:
               # 桌面挂件（2026-11-20）：开机启用 + 设备表 + 列数 + 几何 + 三档 + 锁定 + 底色
               "widget_autostart", "widget_layout", "widget_slots", "widget_geom",
               "widget_collapsed", "widget_layer", "widget_locked", "widget_bg",
+              # 顶栏三块胶囊的显隐（2026-11-22）
+              "header_show",
           ]),
           str(sorted(payload)))
 

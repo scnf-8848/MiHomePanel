@@ -208,7 +208,7 @@ def main() -> int:
     check("三种样式登记齐全", model.STYLES, ("bar", "fill", "ring"))
     check("圆环样式也能落盘", (prefs.set_consumable_style("ring"),
                           Prefs(tmp / "prefs.json").consumable_style), (True, "ring"))
-    check("偏好版本已升到 19（新增字段要有版本号）", PREFS_VERSION, 19)
+    check("偏好版本已升到 20（新增字段要有版本号）", PREFS_VERSION, 20)
     check("删除一条", (again.remove_consumable(a.id), len(again.consumables)), (True, 1))
 
     print("\n3) 轮询：耗材属性即使没上卡片也要读到")

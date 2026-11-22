@@ -226,6 +226,32 @@ def main() -> int:
            bad_pages.last_home, bad_pages.last_room),
           ("wall", False, "123", ""))
 
+    # 顶栏三块胶囊的显隐（2026-11-22）：默认全开，关掉落盘、能读回来
+    header_path = prefs.path.with_name("header.json")
+    header = Prefs(header_path)
+    check("默认三块全开",
+          [header.shows_header(k) for k in ("online", "temperature", "humidity")],
+          [True, True, True])
+    check("关掉一块", header.set_header_show("temperature", False), True)
+    check("同一状态重复设置不写盘", header.set_header_show("temperature", False), False)
+    check("未知 key 不落盘", header.set_header_show("bogus", False), False)
+    check("未知 key 读出来当显示", header.shows_header("bogus"), True)
+    check("关掉的那块读回来是关",
+          Prefs(header_path).shows_header("temperature"), False)
+    check("其它两块没被带走",
+          [Prefs(header_path).shows_header(k) for k in ("online", "humidity")],
+          [True, True])
+    bad_header_path = header_path.with_name("header-bad.json")
+    bad_header_path.write_text(
+        json.dumps({"header_show": {"online": "off", "temperature": 0,
+                                    "humidity": False, "bogus": True}}),
+        encoding="utf-8",
+    )
+    bad_header = Prefs(bad_header_path)
+    check("坏值退回默认、只认 bool、未知键丢弃",
+          [bad_header.shows_header(k) for k in ("online", "temperature", "humidity")],
+          [True, True, False])
+
     # 纯函数边界
     check("排序函数容忍未知项", apply_order(["b"], ["a", "b", "c"]), ["b", "a", "c"])
     check("排序函数容忍空顺序", apply_order([], ["a", "b"]), ["a", "b"])

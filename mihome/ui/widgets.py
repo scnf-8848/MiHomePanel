@@ -16,7 +16,15 @@ from PySide6.QtCore import (
     QVariantAnimation,
     Signal,
 )
-from PySide6.QtGui import QColor, QFont, QFontMetrics, QPainter, QPainterPath, QPixmap
+from PySide6.QtGui import (
+    QColor,
+    QFont,
+    QFontMetrics,
+    QPainter,
+    QPainterPath,
+    QPen,
+    QPixmap,
+)
 from PySide6.QtWidgets import QHBoxLayout, QLabel, QLayout, QSizePolicy, QWidget
 
 from ..core.climate import SLOTS, Climate
@@ -277,23 +285,90 @@ class ElidedLabel(QLabel):
             super().setText(text)
 
 
+#: 胶囊左侧小图标的占位尺寸（宽 × 高）。高度贴着 12px 文字的视觉高度：再大就会
+#: 把 30px 的胶囊撑满，看着像一颗按钮而不是一条读数。
+CHIP_GLYPH_W = 10
+CHIP_GLYPH_H = 13
+#: 图标到文字的距离。和状态胶囊里"圆点 → 文字"的 7px 差不多，两排胶囊并排时
+#: 文字起点不会差一截
+CHIP_GLYPH_GAP = 6
+
+
+def paint_chip_glyph(p: QPainter, box: QRectF, kind: str, color: QColor) -> None:
+    """在 ``box`` 里画一枚胶囊小图标：``"thermometer"`` 温度计 / ``"droplet"`` 水滴。
+
+    为什么自己画、不用 emoji 或图标字体：胶囊是自绘的，混进来的字形带着自己的
+    颜色和基线，深浅两个主题里对不齐，颜色也不会跟着 ``theme.chip_text`` 变。
+    这里只用线条和路径，``color`` 由调用方给（跟随主题）。
+
+    温度计 = 一根圆头竖管 + 底端空心圆泡 + 泡心的实心水银；水滴 = 顶尖锐、底端圆
+    的闭合路径、整块实心。两者都刻意留一点上下留白：贴到 13px 边上的曲线在 100%
+    缩放下会糊成一条竖线。
+    """
+    if kind == "thermometer":
+        cx = box.center().x()
+        bulb_r = 2.7
+        bulb_cy = box.bottom() - bulb_r - 0.2
+        top = box.top() + 0.6
+        # 管子里那截"水银"：一根圆头竖线，下端伸进泡里，接缝被泡的描边盖住。
+        # 1.8 是下限：再细一档，13px 高、100% 缩放下会被抗锯齿摊成两列灰点
+        p.setPen(QPen(color, 1.8, Qt.SolidLine, Qt.RoundCap))
+        p.drawLine(QPointF(cx, top), QPointF(cx, bulb_cy))
+        p.setPen(QPen(color, 1.5))
+        p.setBrush(Qt.NoBrush)
+        p.drawEllipse(QPointF(cx, bulb_cy), bulb_r, bulb_r)
+        p.setPen(Qt.NoPen)
+        p.setBrush(color)
+        p.drawEllipse(QPointF(cx, bulb_cy), 1.15, 1.15)
+        return
+    if kind == "droplet":
+        cx = box.center().x()
+        r = 3.4
+        cy = box.bottom() - r - 0.2
+        top = box.top() + 0.6
+        side = (cy - top) * 0.34
+        drop = QPainterPath()
+        drop.moveTo(cx, top)
+        drop.cubicTo(cx + 1.3, top + side, cx + r * 0.98, cy - r * 0.78, cx + r, cy)
+        # 0° → -180°：从右侧绕**下方**到左侧（屏幕坐标里顺时针，就是水滴的圆底）
+        drop.arcTo(QRectF(cx - r, cy - r, r * 2, r * 2), 0, -180)
+        drop.cubicTo(cx - r * 0.98, cy - r * 0.78, cx - 1.3, top + side, cx, top)
+        drop.closeSubpath()
+        p.setPen(Qt.NoPen)
+        p.setBrush(color)
+        p.drawPath(drop)
+
+
 class StatusChip(QWidget):
     """状态胶囊（米家首页那排"28.3-29.5°""灯亮 5"）。
 
     米家那支深蓝黑是给"压在照片壁纸上"用的；我们顶栏是纯色底，照搬会出问题：
     深色主题下深色胶囊和背景几乎同色，切主题看不出变化。所以这里把它做成一张
     **缩小的卡片**——底色取 ``palette.card``、文字取次级色，深浅两套各一档。
+
+    左边可以放一枚小图标（``icon``，见 :func:`paint_chip_glyph`）：温湿度那两颗
+    靠它回答"这个数是什么"——``"48%"`` 单看只有百分号，分不出湿度还是占空比。
     """
 
     H = 30
     PAD = 14
     DOT = 6
 
-    def __init__(self, text: str, palette: theme.Palette, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        text: str,
+        palette: theme.Palette,
+        parent: QWidget | None = None,
+        *,
+        icon: str = "",
+    ) -> None:
         super().__init__(parent)
         self._p = palette
         self._text = text
-        self._dot = True
+        # 圆点和图标是**二选一**的：圆点表示"开 / 在线"，图标表示"这是什么读数"，
+        # 一颗胶囊同时挂两个既挤又含混。给了图标就默认不带圆点
+        self._dot = not icon
+        self._icon = icon
         self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         self.setFixedHeight(self.H)
         self._apply_width()
@@ -328,6 +403,8 @@ class StatusChip(QWidget):
         w = fm.horizontalAdvance(self._text) + self.PAD * 2
         if self._dot:
             w += self.DOT + 7
+        elif self._icon:
+            w += CHIP_GLYPH_W + CHIP_GLYPH_GAP
         self.setFixedWidth(max(56, w))
 
     def paintEvent(self, event) -> None:  # noqa: N802
@@ -344,6 +421,14 @@ class StatusChip(QWidget):
             p.setBrush(QColor(theme.TOGGLE_ON))
             p.drawEllipse(QPointF(x + self.DOT / 2, self.H / 2), self.DOT / 2, self.DOT / 2)
             x += self.DOT + 7
+        elif self._icon:
+            paint_chip_glyph(
+                p,
+                QRectF(x, (self.H - CHIP_GLYPH_H) / 2, CHIP_GLYPH_W, CHIP_GLYPH_H),
+                self._icon,
+                QColor(theme.chip_text(self._p)),
+            )
+            x += CHIP_GLYPH_W + CHIP_GLYPH_GAP
         draw_text(p, QRect(int(x), 0, self.width() - int(x) - 4, self.H), self._text,
                   size=12, color=theme.chip_text(self._p))
         p.end()
@@ -356,18 +441,27 @@ class ClimateStrip(QWidget):
     消失**，连中间那 8px 间距一起——`addSpacing` 加出来的缝不会跟着胶囊藏。
 
     两颗都不带那个绿色圆点：圆点在这套界面里表示"开着 / 在线"，温湿度是读数不是
-    状态，点亮会读成"温湿度传感器在线"。悬停给逐台读数（最多 6 台）。
+    状态，点亮会读成"温湿度传感器在线"。取而代之的是左边一枚小图标（温度计 /
+    水滴）——``"48%"`` 单独看只有一个百分号，不悬停根本分不出是湿度还是别的百分比。
+    悬停给逐台读数（见 ``Climate.tooltip``）。
+
+    **"关掉"和"没数据"是两件事**：``set_shown`` 记用户的偏好（设置 → 外观 →
+    顶栏展示），``set_climate`` 记事实。两者相与才决定这颗画不画，所以关掉再打开
+    不会丢数，窄窗口临时收起（主窗口那边做的）也不会把偏好改成关。
     """
 
     #: 胶囊之间（以及和左边状态胶囊之间）的留白。顶栏算余量时要用同一个数。
     GAP = 8
+    #: 槽位 → 左边那枚图标的画法名（见 :func:`paint_chip_glyph`）
+    ICONS: dict[str, str] = {"temperature": "thermometer", "humidity": "droplet"}
 
     def __init__(self, palette: theme.Palette, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._p = palette
         self._climate = Climate()
-        self.temp = StatusChip("", palette)
-        self.hum = StatusChip("", palette)
+        self._show: dict[str, bool] = dict.fromkeys(SLOTS, True)
+        self.temp = StatusChip("", palette, icon=self.ICONS["temperature"])
+        self.hum = StatusChip("", palette, icon=self.ICONS["humidity"])
         for chip, slot in zip((self.temp, self.hum), SLOTS, strict=True):
             chip.set_dot(False)
             tooltip.watch(chip, lambda slot=slot: self._climate.tooltip(slot))
@@ -385,12 +479,42 @@ class ClimateStrip(QWidget):
     def set_climate(self, climate: Climate) -> None:
         """换一份样本：有值就显示、没值就藏。文字与可见性一起变。"""
         self._climate = climate
-        temp, hum = climate.texts()
+        self._sync()
+
+    def set_shown(self, slot: str, on: bool) -> None:
+        """用户关掉 / 打开这一颗（设置 → 外观 → 顶栏展示）。"""
+        if slot not in SLOTS:
+            return
+        on = bool(on)
+        if self._show[slot] == on:
+            return
+        self._show[slot] = on
+        self._sync()
+
+    def shown(self, slot: str) -> bool:
+        return self._show.get(slot, True)
+
+    def present(self) -> list[StatusChip]:
+        """**此刻该画**的胶囊：有值 + 没被用户关掉，按 温度 → 湿度 顺序。
+
+        主窗口算顶栏余量时按这个列表量（不是按 ``text()``），否则"设置里关掉的
+        那颗"会被算进所需宽度，白收别的胶囊。
+        """
+        return [
+            chip
+            for slot, chip in zip(SLOTS, (self.temp, self.hum), strict=True)
+            if chip.text() and self._show[slot]
+        ]
+
+    def _sync(self) -> None:
+        temp, hum = self._climate.texts()
+        show_temp = bool(temp) and self._show["temperature"]
+        show_hum = bool(hum) and self._show["humidity"]
         self.temp.setText(temp)
-        self.temp.setVisible(bool(temp))
+        self.temp.setVisible(show_temp)
         self.hum.setText(hum)
-        self.hum.setVisible(bool(hum))
-        self.setVisible(bool(temp or hum))
+        self.hum.setVisible(show_hum)
+        self.setVisible(show_temp or show_hum)
 
     def set_palette(self, palette: theme.Palette) -> None:
         self._p = palette
