@@ -297,8 +297,8 @@ CHIP_GLYPH_GAP = 6
 def paint_chip_glyph(p: QPainter, box: QRectF, kind: str, color: QColor) -> None:
     """在 ``box`` 里画一枚胶囊小图标。
 
-    ``kind`` 三选一：``"house"`` 房子（在线设备）/ ``"thermometer"`` 温度计 /
-    ``"droplet"`` 水滴。
+    ``kind`` 四选一：``"house"`` 房子（在线设备）/ ``"thermometer"`` 温度计 /
+    ``"droplet"`` 水滴 / ``"bell"`` 铃铛（消息入口）。
 
     为什么自己画、不用 emoji 或图标字体：胶囊是自绘的，混进来的字形带着自己的
     颜色和基线，深浅两个主题里对不齐，颜色也不会跟着 ``theme.chip_text`` 变。
@@ -344,6 +344,27 @@ def paint_chip_glyph(p: QPainter, box: QRectF, kind: str, color: QColor) -> None
         p.setPen(Qt.NoPen)
         p.setBrush(color)
         p.drawEllipse(QPointF(cx, bulb_cy), 1.15, 1.15)
+        return
+    if kind == "bell":
+        # 钟体：肩上两段圆弧 + 两侧直边 + 底部向外撇出的喇叭口，整只**只描边**。
+        # 10px 宽里填实会糊成一块墨点；描边 1.3px 是这个尺寸下还看得出"钟形"的下限。
+        cx = box.center().x()
+        bell = QPainterPath()
+        bell.moveTo(cx - 3.0, 9.4)
+        bell.cubicTo(cx - 2.4, 8.7, cx - 2.2, 8.0, cx - 2.2, 6.6)
+        bell.lineTo(cx - 2.2, 4.5)
+        bell.cubicTo(cx - 2.2, 2.5, cx - 1.2, 1.5, cx, 1.5)
+        bell.cubicTo(cx + 1.2, 1.5, cx + 2.2, 2.5, cx + 2.2, 4.5)
+        bell.lineTo(cx + 2.2, 6.6)
+        bell.cubicTo(cx + 2.2, 8.0, cx + 2.4, 8.7, cx + 3.0, 9.4)
+        bell.closeSubpath()
+        p.setPen(QPen(color, 1.3, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+        p.setBrush(Qt.NoBrush)
+        p.drawPath(bell)
+        # 铃舌：底边下面那颗实心小圆
+        p.setPen(Qt.NoPen)
+        p.setBrush(color)
+        p.drawEllipse(QPointF(cx, 11.0), 0.95, 0.95)
         return
     if kind == "droplet":
         cx = box.center().x()
@@ -476,6 +497,36 @@ class StatusChip(QWidget):
         draw_text(p, QRect(int(x), 0, self.width() - int(x) - 4, self.H), self._text,
                   size=12, color=theme.chip_text(self._p))
         p.end()
+
+
+class ChipButton(StatusChip):
+    """可点的胶囊——顶栏那个"消息"入口。
+
+    没有直接给 :class:`StatusChip` 加 ``clicked``：它是"读数展示"，顶栏、详情页
+    到处在用，挂一个大部分时候没人接的信号只会让调用方猜"这颗到底能不能点"。
+    需要能点的就换这个子类，形状、配色、图标全部一样，只多一个手型光标和点击。
+    """
+
+    clicked = Signal()
+
+    def __init__(
+        self,
+        text: str,
+        palette: theme.Palette,
+        parent: QWidget | None = None,
+        *,
+        icon: str = "",
+    ) -> None:
+        super().__init__(text, palette, parent, icon=icon)
+        self.setCursor(Qt.PointingHandCursor)
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802
+        # 判"松手时还在胶囊里"：按下后拖出去再松开，按惯例不算点击
+        if event.button() == Qt.LeftButton and self.rect().contains(
+            event.position().toPoint()
+        ):
+            self.clicked.emit()
+        super().mouseReleaseEvent(event)
 
 
 class ClimateStrip(QWidget):

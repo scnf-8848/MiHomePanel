@@ -955,6 +955,28 @@ class Client:
                 self.last_error = f"场景列表失败: {exc}"
                 return []
 
+    def messages(self, limit: int = 30) -> dict[str, Any]:
+        """读一次消息中心（``POST /v2/message/v2/typelist``），返回云端原始 payload。
+
+        **只读**：标已读 / 删除是写账号数据，这条链路上没有对应方法，也不该有。
+        归一化交给 :mod:`mihome.core.messages`，这里只管把请求发出去。
+
+        失败**抛异常**、不吞成空 dict：空 dict 和"真的没有消息"在界面上长得一模一样，
+        用户会以为手机里也没消息。异常由 ``core/jobs.py`` 转成回调的 ``error``，
+        界面据此显示"读取失败"。
+
+        两个已知限制（同类项目真机实测，见
+        ``docs/reference/mihome-pc-unofficial.md`` §4.5）：这个接口**没有游标**，
+        ``limit`` 就是上限，更早的消息拿不到；``ctime`` 是 unix **秒**。
+        """
+        data: dict[str, Any] = {
+            "timestamp": int(time.time() * 1000),
+            "limit": int(limit),
+        }
+        with self._lock:
+            ret = self._api._request("/v2/message/v2/typelist", data)
+        return ret if isinstance(ret, dict) else {}
+
     # -- 杂务 ------------------------------------------------------------
     def flush(self) -> None:
         """把能力账本落盘（退出前 / 定时调用）。"""

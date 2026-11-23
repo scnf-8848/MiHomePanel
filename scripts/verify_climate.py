@@ -369,14 +369,22 @@ def test_fit() -> None:
 
         # 只留湿度：温度关掉以后，"先收湿度"那条顺序不该把唯一的湿度也收掉。
         # 这里直接调 set_shown + _fit_climate，而不是 _update_header——后者会按
-        # store 里的（空）设备重算读数，把上面手工塞的样本冲掉
+        # store 里的（空）设备重算读数，把上面手工塞的样本冲掉。
+        #
+        # 窗口宽度**按当前顶栏现算**，不写死 920：顶栏每加一个控件（2026-11-23
+        # 加了「消息」胶囊）基线就变，写死的话这条会莫名其妙假红。
         win.climate.set_shown("temperature", False)
-        win.resize(920, 600)
+        win.climate.setVisible(False)
+        win._head.invalidate()  # noqa: SLF001
+        base = win._head.minimumSize().width()  # noqa: SLF001
+        need_one = base + win.climate.GAP + win.climate.hum.width()
+        win.resize(need_one + 20, 600)
         app.processEvents()
         win._fit_climate()  # noqa: SLF001
         app.processEvents()
         check_true("只剩湿度时窄窗口也留着它",
-                   win.climate.isVisible() and win.climate.hum.isVisible())
+                   win.climate.isVisible() and win.climate.hum.isVisible(),
+                   f"{win.width()} vs 需要 {need_one}")
         check_true("关掉的那颗没算进所需宽度",
                    win.climate.geometry().right() <= win.search.geometry().x(),
                    f"{win.climate.geometry().right()} vs {win.search.geometry().x()}")

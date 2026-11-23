@@ -59,12 +59,13 @@ from .chrome import DimOverlay, TitleBar, WindowFrame, exec_with_dim_click
 from .consumables_page import ConsumablesPage
 from .desktop_widget import DesktopWidget
 from .home_tabs import HomeTabs
+from .messages_dialog import MessageDialog
 from .monitor_page import MonitorPage
 from .side_nav import SideNav
 from .speaker_bar import SpeakerBar
 from .tray import TrayController
 from .wall import WallView
-from .widgets import ClimateStrip, HLine, IconProvider, StatusChip
+from .widgets import ChipButton, ClimateStrip, HLine, IconProvider, StatusChip
 
 DRAIN_MS = 16
 POLL_MS = 3000
@@ -310,6 +311,12 @@ class MainWindow(QMainWindow):
         # 连左边那 8px 间距一起消失——间距做在容器内部，不在顶栏上加 addSpacing。
         self.climate = ClimateStrip(self.palette_ref)
         head.addWidget(self.climate)
+        # 消息入口：可点的胶囊。**不挂未读数**——那个数字要一路常驻请求，而这一版
+        # 只做"点开看看有什么"（只读，不标已读）。铃铛和房子/温度计/水滴同一套自绘。
+        head.addSpacing(8)
+        self.btn_messages = ChipButton("消息", self.palette_ref, icon="bell")
+        self.btn_messages.clicked.connect(self._open_messages)
+        head.addWidget(self.btn_messages)
         head.addStretch(1)
 
         self.search = QLineEdit()
@@ -902,6 +909,15 @@ class MainWindow(QMainWindow):
 
         dlg.succeeded.connect(ok)
         self._run_dialog(dlg)
+
+    def _open_messages(self) -> None:
+        """顶栏「消息」胶囊：读一次、看完就走。
+
+        只读——标已读 / 删除是写账号数据，这一版没有这两个动作（用户 2026-11-23 定）。
+        数据在弹窗 ``showEvent`` 里异步读（``Store.fetch_messages``），不挂轮询：
+        不开这一屏就没有任何请求。
+        """
+        self._run_dialog(MessageDialog(self.store, self.palette_ref, self))
 
     def _run_dialog(self, dlg) -> None:
         """模态子窗口统一入口：弹出期间压暗主窗口，关掉就恢复。
@@ -1718,6 +1734,7 @@ class MainWindow(QMainWindow):
         self._dim.set_palette(pal)
         self.status.set_palette(pal)
         self.climate.set_palette(pal)
+        self.btn_messages.set_palette(pal)
         self.alert_bar.set_palette(pal)
         self.speaker_bar.set_palette(pal)
         tooltip.set_palette(pal)

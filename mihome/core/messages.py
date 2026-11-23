@@ -1,0 +1,164 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+"""消息中心：把云端 ``/v2/message/v2/typelist`` 的返回摊成一张能给界面画的表。
+
+**只读**（2026-11-23 用户定）：只列出来看，不标已读、不删除——那是写账号数据。
+所以这个文件里没有任何网络调用，全是纯函数，离线就能断言。
+
+和"设备事件"是两条不同的路，别混：
+
+- 这里读的是**账号级通知记录**（洗衣完成、滤芯过期、场景执行失败），有 ``msg_id``、
+  有正文、有 ``is_new``；
+- ``/miotspec/event/get``（``poll_events`` 留给它的位置）读的是**单台设备的最近一次
+  事件**，只有一份、读完被覆盖，用来做触发，不能回看也不能计数。
+
+接口形状来自同类项目的真机实测（``docs/reference/mihome-pc-unofficial.md`` §4.5）：
+
+- ``typelist`` 返回 ``{"messages": [...]}``，**没有游标**，``limit`` 就是上限；
+- 每条带 ``msg_id / type / title / content / did / ctime / is_new``；
+- ``ctime`` 是 **unix 秒**（不是毫秒，别拿 ``time.time()*1000`` 比）。
+
+已知类型：``6`` 设备消息、``11`` 设备离线、``13`` 场景通知。没见过的类型**保留数字
+和一条中性标签**，不猜——把场景通知误标成设备消息，比显示"消息"更糟。
+"""
+
+from __future__ import annotations
+
+import time
+from dataclasses import dataclass
+from typing import Any, Iterable, Mapping
+
+#: 类型 → 中文标签。来源：同类项目真账号实测（2026-11-21），见 §4.5 那张接口表。
+TYPE_LABELS: dict[int, str] = {
+    6: "设备消息",
+    11: "设备离线",
+    13: "场景通知",
+}
+
+#: 不认识的类型统一这么叫（保留数字在 ``Message.kind`` 里）
+FALLBACK_LABEL = "消息"
+
+#: 一次拉多少条。云端这个接口没有游标，给多少就是上限；30 条已经够"看看有什么"，
+#: 再多也只是把同一屏塞满（对方默认也是 30）。
+DEFAULT_LIMIT = 30
+
+#: 正文超过这个长度就截断。列表是一眼扫的，没人读长文；完整正文留给悬停。
+BODY_MAX = 120
+
+
+def _int(value: Any) -> int:
+    """云端字段什么都可能给：``None`` / 字符串 / 浮点。转不动就当 0。"""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+@dataclass(frozen=True)
+class Message:
+    """一条通知记录。字段名与云端一致，只有 ``label`` / ``unread`` 是加工出来的。"""
+
+    msg_id: str
+    kind: int
+    label: str
+    title: str
+    content: str
+    did: str
+    device: str
+    when: int
+    unread: bool
+
+    @property
+    def body(self) -> str:
+        """能显示在标题下面的正文；**和设备名/标题重复时返回空串**。
+
+        实测这批消息的 ``content`` 经常就是设备名（"洗衣机"），照抄会在标题下面
+        再写一遍"洗衣机"，白白多占一行。
+        """
+        text = self.content.strip()
+        if not text:
+            return ""
+        if text == self.title.strip() or text == self.device.strip():
+            return ""
+        return text
+
+
+def parse(payload: Any, names: Mapping[str, str] | None = None) -> list[Message]:
+    """云端 payload → 按时间倒序的 :class:`Message` 列表。
+
+    ``names`` 是 ``did → 设备名``，用来把 ``did`` 变成人看得懂的名字；查不到就留空，
+    界面只显示时间和类型。脏记录（没有 ``msg_id``、不是 dict）直接丢：没有 id 的
+    记录既没法定位也没法去重，留着只会让列表里多一行空白。
+    """
+    data = payload if isinstance(payload, Mapping) else {}
+    known = names or {}
+    rows: list[Message] = []
+    for record in data.get("messages") or ():
+        if not isinstance(record, Mapping):
+            continue
+        msg_id = str(record.get("msg_id") or "").strip()
+        if not msg_id:
+            continue
+        kind = _int(record.get("type"))
+        did = str(record.get("did") or "")
+        rows.append(
+            Message(
+                msg_id=msg_id,
+                kind=kind,
+                label=TYPE_LABELS.get(kind, FALLBACK_LABEL),
+                title=str(record.get("title") or "").strip(),
+                content=str(record.get("content") or "").strip(),
+                did=did,
+                device=known.get(did, "") if did else "",
+                when=_int(record.get("ctime")),
+                unread=bool(_int(record.get("is_new"))),
+            )
+        )
+    # 云端返回顺序不保证（同一秒内更是随机），按时间倒序排一遍
+    rows.sort(key=lambda item: item.when, reverse=True)
+    return rows
+
+
+def summarise(items: Iterable[Message]) -> str:
+    """标题栏那行小字：``12 条消息 · 3 条未读``；没有未读时不写后半句。"""
+    rows = list(items)
+    if not rows:
+        return "没有消息"
+    unread = sum(1 for item in rows if item.unread)
+    head = f"{len(rows)} 条消息"
+    return f"{head} · {unread} 条未读" if unread else head
+
+
+def ago(seconds: float, *, now: float | None = None) -> str:
+    """``ctime`` → ``刚刚 / 5 分钟前 / 3 小时前 / 2 天前``。
+
+    90 秒以内写"刚刚"：这一屏的信息本来就不精确到秒，写"43 秒前"只会让人去数。
+    """
+    if not seconds:
+        return ""
+    delta = max(0.0, (now if now is not None else time.time()) - seconds)
+    if delta < 90:
+        return "刚刚"
+    if delta < 3600:
+        return f"{int(delta // 60)} 分钟前"
+    if delta < 86400:
+        return f"{int(delta // 3600)} 小时前"
+    return f"{int(delta // 86400)} 天前"
+
+
+def clip(text: str, limit: int = BODY_MAX) -> str:
+    """正文截断。按字符数切，不按像素——这里只需要"别把一行撑到五行"。"""
+    text = " ".join(text.split())
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+__all__ = [
+    "BODY_MAX",
+    "DEFAULT_LIMIT",
+    "FALLBACK_LABEL",
+    "Message",
+    "TYPE_LABELS",
+    "ago",
+    "clip",
+    "parse",
+    "summarise",
+]

@@ -37,6 +37,7 @@ from .geek import fetch as fetch_geek_entry
 from .geek import probe as geek_probe
 from .geek import remember as geek_remember
 from .jobs import PRIORITY_CONTROL, PRIORITY_DATA, SerialWorker
+from .messages import DEFAULT_LIMIT, Message, parse as parse_messages
 from .prefs import HIDDEN_ROOM, HIDDEN_ROOM_ID, Prefs
 from .spec import DeviceSpec, PropertySpec, SpecRepository, localize
 from .tree import (
@@ -902,6 +903,41 @@ class Store:
             # 只通知真的变了的设备：卡片、顶栏离线数、音箱候选都跟着这张表走；
             # 变回在线的设备下一轮 ``poll_refs`` 会自动重新纳入
             self._changed(changed)
+
+    # -- 消息中心 --------------------------------------------------------
+    def message_names(self) -> dict[str, str]:
+        """``did → 设备名``：消息行里要写"洗衣机"，不能甩一串 did 给人看。"""
+        out: dict[str, str] = {}
+        for did, st in self.devices.items():
+            name = getattr(st.node, "name", "") or ""
+            if name:
+                out[did] = name
+        return out
+
+    def fetch_messages(
+        self,
+        done: Callable[[list[Message] | None, BaseException | None], None],
+        *,
+        limit: int = DEFAULT_LIMIT,
+    ) -> None:
+        """读一次消息中心，归一化后交给 ``done``（主线程回调）。
+
+        **不挂轮询**：消息中心只在用户打开那一屏时读，空闲时零请求。未读数角标
+        也暂不做——那需要一路常驻请求，而用户要的只是"点开看看有什么"。
+
+        云端失败时 ``done(None, error)``，界面显示"读取失败"；空列表才显示
+        "没有消息"。两者分开，不能混成一句。
+        """
+        self.worker.submit(
+            self.client.messages,
+            (limit,),
+            priority=PRIORITY_DATA,
+            label="messages",
+            callback=lambda payload, error: done(
+                None if error is not None else parse_messages(payload, self.message_names()),
+                error,
+            ),
+        )
 
     def card_refs(self, did: str) -> list[Any]:
         """这台设备卡片上展示的属性引用（写入确认只读这些）。"""

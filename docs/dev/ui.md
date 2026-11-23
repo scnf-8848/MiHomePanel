@@ -1370,8 +1370,9 @@ AttributeError: 'WindowFrame' object has no attribute 'win'
 ## 顶栏：设备计数 + 全屋温湿度（2026-11-22）
 
 顶栏从左到右：家庭标签（`HomeTabs`）→ 状态胶囊（`StatusChip`，「N 台设备 · M 台开启 ·
-K 台离线 · H 台已隐藏」）→ 两颗温湿度胶囊（`ClimateStrip`）→ 弹性留白 → 搜索框 →
-主题 / 刷新两个圆按钮。前两块与温湿度都是**当前家庭**口径，切家一起换。
+K 台离线 · H 台已隐藏」）→ 两颗温湿度胶囊（`ClimateStrip`）→「消息」胶囊（`ChipButton`，
+2026-11-23 加）→ 弹性留白 → 搜索框 → 主题 / 刷新两个圆按钮。前三块都是**当前家庭**口径，
+切家一起换；「消息」是账号级，不跟家庭。
 
 **为什么给范围不给平均值**（用户 2026-11-22 提，照米家 App 的显示逻辑）：多台设备时写
 `21.5-22.8°C` / `46-51%`。平均会把"有一间 32 °C"这个最该被看见的事实抹掉；只有一台、
@@ -1417,6 +1418,35 @@ K 台离线 · H 台已隐藏」）→ 两颗温湿度胶囊（`ClimateStrip`）
 `ClimateStrip` + `StatusChip(icon=...)` + `paint_chip_glyph()`、
 `MainWindow._update_climate()`、`ui/settings.py` 的 `_HeaderShowRow` / `_ChipPreview`。
 验证：`scripts/verify_climate.py`（67 项，含主窗口接线与设置页开关）。
+
+## 消息中心（只读，2026-11-23）
+
+顶栏温湿度右边一颗「消息」胶囊（`ChipButton`，铃铛图标），点开 `MessageDialog` 列云端
+最近 30 条通知。**只读**：没有标已读、没有删除——那是写账号数据（用户 2026-11-23 定）。
+
+- **走的是另一条接口**：`/v2/message/v2/typelist`（`Client.messages()`），账号级通知记录，
+  有 `msg_id` / `title` / `content` / `ctime` / `is_new`。**不是** `poll_events` 那个
+  `/miotspec/event/get`——后者只给单台设备的"最近一次事件 + updateTime"，做触发用、
+  不能回看。两条通道别合并（对比表在 `docs/reference/mihome-pc-unofficial.md` §4.5）。
+- **不挂轮询**：只在弹窗 `showEvent` 里读一次（`Store.fetch_messages`），关掉就没有请求。
+  未读数角标也暂不做——那要一路常驻请求，而现在的目标只是"点开看看"。
+- **失败与空必须分开**：`Client.messages()` 失败**抛异常**、不吞成空 dict，界面显示
+  「读取失败」；只有真的零条才显示「还没有消息」。混成一句会让用户去手机里白找一圈。
+- 字段归一化在 `core/messages.py`（纯函数）：`ctime` 是 unix **秒**；未知 type 保留数字 +
+  中性标签「消息」，不猜；`content` 与设备名 / 标题相同时不重复显示；正文截断 120 字。
+- **已知上限**：这个接口没有游标，`limit` 就是上限，更早的记录拿不到。单设备历史
+  `/v2/message/v2/list` 虽然带 `timestamp`，但服务端只在传 0 时响应（同类项目实测），
+  同样只能给"最近 N 条"——所以没有做设备详情页那张"历史消息"卡。
+- 关窗与回调撞车的处理：`finished` 里置 `_alive = False`，迟到的回调直接丢（否则会去
+  碰已经销毁的控件）。
+
+后续形态（用户已说，先不做）：用它替掉顶栏那个搜索框（几十台设备用不上搜索），触发方式
+从"点击弹窗"改成"鼠标悬停自动浮出列表"。`MessageList` 已经和 `QDialog` 解耦，能直接塞进
+浮层容器。
+
+实现：`core/messages.py`、`ui/messages_dialog.py`（`MessageList` / `MessageDialog`）、
+`Store.fetch_messages()`、`MainWindow._open_messages()`。验证：`scripts/verify_messages.py`
+（46 项，含请求形状、三态、顶栏接线）。
 
 ## 主界面页面宿主（2026-11-15）
 
