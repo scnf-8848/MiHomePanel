@@ -18,7 +18,7 @@
 
 | 维度 | 本项目（MiHomePanel） | mihome-pc-unofficial |
 | --- | --- | --- |
-| 版本 | 0.1.8 | 0.7.36（Beta / pre-release） |
+| 版本 | 0.1.9 | 0.7.36（Beta / pre-release） |
 | 许可 | GPL-3.0-or-later（复用 mijiaAPI 传输层） | MIT（原创代码；APK 派生数据不分发） |
 | 语言 / 运行时 | Python 3.13 + PySide6（Qt 6） | Python 3.8 + **只用标准库** |
 | UI | Qt Widgets + 自绘控件 | 本地 `http.server` + **手写 HTML/CSS/JS** |
