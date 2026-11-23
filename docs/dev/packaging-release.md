@@ -238,7 +238,7 @@ README「下载与安装」里的 `releases/tag/v<版本>` 与 `MiHomePanel-v<�
 > 3. 同一个脚本接着调 `run_self_check(app_dir)` / `run_window_smoke(app_dir)` 补上两项
 >    门禁（`--skip-check` 可只移动）。
 > 实测产物 135 文件 / 81 MB / zip 45.6 MB（v0.1.5）、135 / 81 / 45.7 MB（v0.1.6）、
-> 135 / 80 / 45.5 MB（v0.1.7）、135 / 80 / 45.8 MB（v0.1.8），
+> 135 / 80 / 45.5 MB（v0.1.7）、135 / 80 / 45.8 MB（v0.1.8）、135 / 81 / 45.8 MB（v0.1.9），
 > 和文档里的 132 / 80 / 45 基本一致——说明手工裁剪的清单抄对了。
 
 > **`dist/` 会被整个删掉**：`build_exe.py` 开工先 `rmtree(dist)`，上一版的 zip、
