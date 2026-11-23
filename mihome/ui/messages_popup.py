@@ -26,6 +26,7 @@ from PySide6.QtGui import QColor, QCursor, QGuiApplication, QPainter, QPen
 from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
+    QLayout,
     QScrollArea,
     QVBoxLayout,
     QWidget,
@@ -42,10 +43,15 @@ from .widgets import HLine
 WIDTH = 400
 #: 内容四周的留白。
 PAD = 16
-#: 列表最多这么高，超出的滚动——再高就顶到屏幕下沿了。
-LIST_MAX_H = 380
+#: 列表最多这么高，超出的滚动。用户 2026-11-23 反馈"只能看到 2 条"，从 380 抬到 520：
+#: 真机上一条带正文的消息约 60-75px，520 能放进 6-7 条，正好是云端的全部记录。
+#: 真正生效的上限还要看屏幕（见 ``MessagePopup._place``），这里只是"再高就没意义"。
+LIST_MAX_H = 520
 #: 列表最矮这么高（只有一两条时不要缩成一条缝）。
 LIST_MIN_H = 110
+#: 摘要那行（"N 条消息"）的高度。用户要求"别占那么多"：字号降到 11、上下不留白，
+#: 只当一行小注解，焦点全给列表。
+SUM_H = 15
 #: 胶囊底边到浮层的距离。贴一点才像"这颗胶囊展开了"。
 GAP = 6
 #: 移开多久收起。留出"从胶囊挪进浮层"要穿过的那 6px 的时间。
@@ -60,6 +66,7 @@ def _qss(p: theme.Palette) -> str:
         f"QLabel#MsgKind{{color:{p.text_mute};font-size:11px;}}"
         f"QLabel#MsgBody{{color:{p.text_soft};font-size:12px;}}"
         f"QLabel#MsgMeta{{color:{p.text_mute};font-size:11px;}}"
+        f"QLabel#MsgSum{{color:{p.text_mute};font-size:11px;}}"
         f"QLabel#MsgHint{{color:{p.text_mute};font-size:12px;}}"
         "QScrollArea{border:none;background:transparent;}"
         "QWidget#MsgCanvas{background:transparent;}"
@@ -108,24 +115,39 @@ class MessageList(QWidget):
     """消息列表本体：一行摘要 + 滚动区，加载 / 失败 / 空三种态都在这里。
 
     不继承任何窗口类：浮层只负责定位与收放，列表自己管内容。
+
+    高度有两种模式：``auto``（浮层用，跟着条数长，夹在 ``min_h`` / ``max_h`` 之间）
+    和固定（设备历史对话框用，给多少就是多少）。
     """
 
-    def __init__(self, palette: theme.Palette, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        palette: theme.Palette,
+        parent: QWidget | None = None,
+        *,
+        fixed_height: int | None = None,
+    ) -> None:
         super().__init__(parent)
         self._p = palette
         self._items: list[Message] = []
+        #: 内容高度跟着条数走（浮层）还是钉死（对话框）
+        self._fixed_h = fixed_height
+        self.min_h = LIST_MIN_H
+        self.max_h = LIST_MAX_H
 
         col = QVBoxLayout(self)
         col.setContentsMargins(0, 0, 0, 0)
-        col.setSpacing(8)
+        # 摘要与列表之间只留一点缝：用户 2026-11-23 说"最上面那行占的高度太大"
+        col.setSpacing(6)
 
         self.summary = QLabel("正在读取…")
-        self.summary.setObjectName("MsgHint")
+        self.summary.setObjectName("MsgSum")
+        self.summary.setFixedHeight(SUM_H)
         col.addWidget(self.summary)
 
         self.scroll = QScrollArea(self)
         self.scroll.setWidgetResizable(True)
-        self.scroll.setFixedHeight(LIST_MIN_H)
+        self.scroll.setFixedHeight(fixed_height or LIST_MIN_H)
         self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.scroll.setFrameShape(QScrollArea.NoFrame)
         self.canvas = QWidget()
@@ -143,6 +165,10 @@ class MessageList(QWidget):
             item = self.rows.takeAt(0)
             widget = item.widget()
             if widget is not None:
+                # 先摘父再 deleteLater：只 deleteLater 的话它这一帧还留在原位画，
+                # 新行压在旧行上（截图里那串重影就是这么来的）
+                widget.hide()
+                widget.setParent(None)
                 widget.deleteLater()
 
     def _placeholder(self, text: str, color: str = "") -> QLabel:
@@ -150,17 +176,41 @@ class MessageList(QWidget):
         lab.setObjectName("MsgHint")
         lab.setWordWrap(True)
         lab.setAlignment(Qt.AlignCenter)
-        lab.setMinimumHeight(LIST_MIN_H - 30)
+        lab.setMinimumHeight(max(60, (self._fixed_h or self.min_h) - 30))
         if color:
             lab.setStyleSheet(f"color:{color};font-size:12px;")
         return lab
 
+    def set_max_height(self, height: int) -> None:
+        """浮层按屏幕余量再收一次上限（``_place`` 每次都会调）。"""
+        self.max_h = max(self.min_h, int(height))
+        self._fit_scroll()
+
+    def _content_width(self) -> int:
+        view = self.scroll.viewport().width()
+        return view if view > 40 else WIDTH - 2 * PAD - 6
+
     def _fit_scroll(self) -> None:
-        """让滚动区高度跟着内容走（夹在 ``LIST_MIN_H`` 与 ``LIST_MAX_H`` 之间）。"""
+        """让滚动区高度跟着内容走（夹在 ``min_h`` 与 ``max_h`` 之间）。
+
+        **不能只信 ``sizeHint()``**：行是刚 new 出来的，QSS 里的字号要等 polish
+        才生效，第一次量出来的高度会偏小（真机上就出现过"只显示两条"）。所以再问
+        一次 ``heightForWidth``——按内容宽度算，跟窗口有没有显示过无关。
+        """
+        if self._fixed_h is not None:
+            self.scroll.setFixedHeight(self._fixed_h)
+            return
         self.canvas.adjustSize()
         self.rows.activate()
         want = self.rows.sizeHint().height()
-        self.scroll.setFixedHeight(max(LIST_MIN_H, min(want, LIST_MAX_H)))
+        width = self._content_width()
+        if self.rows.hasHeightForWidth():
+            want = max(want, self.rows.heightForWidth(width))
+        self.scroll.setFixedHeight(max(self.min_h, min(want, self.max_h)))
+
+    def refit(self) -> None:
+        """重新量一次（浮层显示后由 ``MessagePopup`` 调，纠正第一遍的偏差）。"""
+        self._fit_scroll()
 
     def set_loading(self) -> None:
         self._reset()
@@ -247,14 +297,14 @@ class MessagePopup(QWidget):
         col = QVBoxLayout(self)
         col.setContentsMargins(PAD, PAD - 2, PAD, PAD)
         col.setSpacing(8)
+        # 高度由 ``_fit`` 自己算。默认的 SetDefaultConstraint 会让"上一次内容更大"时的
+        # 最小高度钉在窗口上：数据晚到、行变短以后窗口缩不回去，下面白一大块。
+        col.setSizeConstraint(QLayout.SetNoConstraint)
 
         self.list = MessageList(palette, self)
         col.addWidget(self.list)
 
-        self.note = QLabel(
-            f"只读 · 云端只回最近 {model.DEFAULT_LIMIT} 条内的最新几条；"
-            "更早的记录和各场景的完整日志请到米家 App 查看"
-        )
+        self.note = QLabel("只读 · 更早的记录与场景日志见米家 App")
         self.note.setObjectName("MsgHint")
         self.note.setWordWrap(True)
         col.addWidget(self.note)
@@ -297,14 +347,27 @@ class MessagePopup(QWidget):
         self._place(anchor)
         self.show()
         self.raise_()
+        # 第一遍量高度可能偏小（行是刚 new 的，QSS 字号要等 polish）：显示后下一轮
+        # 事件循环再量一次、再定位一次。用户 2026-11-23 报"只看到两条"就是这个。
+        QTimer.singleShot(0, self._refit)
+
+    def _refit(self) -> None:
+        if not self.isVisible():
+            return
+        self.list.refit()
+        if self._anchor is not None:
+            self._place(self._anchor)
 
     def _place(self, anchor: QWidget) -> None:
-        self._fit()
         screen = (
             QGuiApplication.screenAt(anchor.mapToGlobal(anchor.rect().center()))
             or QGuiApplication.primaryScreen()
         )
         area = screen.availableGeometry() if screen else QRect(0, 0, 1920, 1080)
+        # 先按屏幕余量收一次列表上限：宁可滚动，也别让浮层顶出屏幕下沿
+        chrome = 2 * PAD + SUM_H + 12 + 40  # 留白 + 摘要 + 两处间距 + 脚注
+        self.list.set_max_height(min(LIST_MAX_H, area.height() - chrome - 60))
+        self._fit()
         origin = anchor.mapToGlobal(QPoint(0, 0))
         w, h = self.width(), self.height()
         # 右边对齐胶囊：它是"这颗胶囊的展开"，往右伸出窗口会莫名其妙
@@ -316,11 +379,32 @@ class MessagePopup(QWidget):
         self.move(x, max(area.top() + 6, y))
 
     def _fit(self) -> None:
-        """按内容算高度。列表高度已经夹过上下限，这里只负责把窗口收紧。"""
+        """按内容算高度。
+
+        **不用 ``sizeHint()``**：脚注是 word-wrap 的，``sizeHint`` 会按"最宽那行"算，
+        多出来的几十像素被布局平摊到列表上下——真机上就是"摘要在中间、上下两大块空地"。
+        这里把两块都钉死：列表高度 = 摘要 + 间距 + 滚动区，窗口高度 = 留白 + 列表 +
+        间距 + 脚注（脚注按真实宽度量）。
+        """
         lay = self.layout()
-        if lay is not None:
-            lay.activate()
-        self.resize(WIDTH, self.sizeHint().height())
+        if lay is None:
+            return
+        list_lay = self.list.layout()
+        slack = list_lay.spacing() if list_lay is not None else 6
+        self.list.setFixedHeight(
+            self.list.summary.height() + slack + self.list.scroll.height()
+        )
+        margins = lay.contentsMargins()
+        width = WIDTH - margins.left() - margins.right()
+        # ``sizeHint`` 对 word-wrap 的标签会多报一行（实测 16 → 32），只认 heightForWidth
+        note_h = self.note.heightForWidth(width) or self.note.sizeHint().height()
+        # 还得钉死：不然布局拿它的 minimumSizeHint（按"最窄宽度折行"算，141px）当
+        # 最小高度，窗口缩不下去，下面白一大块
+        self.note.setFixedHeight(note_h)
+        self.resize(
+            WIDTH,
+            margins.top() + self.list.height() + lay.spacing() + note_h + margins.bottom(),
+        )
 
     # -- 数据 ------------------------------------------------------------
     def _refresh_data(self) -> None:
@@ -368,6 +452,8 @@ class MessagePopup(QWidget):
         self._fetched_at = time.monotonic()
         self.list.set_messages(self._items)
         self._fit()
+        # 数据到得比"显示后那一轮"晚时，同样再量一次
+        QTimer.singleShot(0, self._refit)
 
     # -- 收放 ------------------------------------------------------------
     def _schedule_hide(self) -> None:

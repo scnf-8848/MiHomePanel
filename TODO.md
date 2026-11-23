@@ -19,7 +19,7 @@
 > **监控页已落地**（2026-11-19）：三种入口都接了页面，「功能区收尾」只剩图标 / 排布 /
 > 常驻这些视觉待定，不再占 A 段条目，见「最近完成」。
 
-## B. 待排期：想法已记、明确暂不做（8 条）
+## B. 待排期：想法已记、明确暂不做（7 条）
 
 - **插件文案 / 故障码运行时拉取**（2026-11-23 记，来源：同类项目对照）：按 `model` 后台拉
   插件包，解 `value-list` 文案与 `fault` 表缓存到 `<data>/cache/plugin/`，UI 优先用它、查不到
@@ -36,16 +36,6 @@
   会显示"全部离线"却分不清是设备关机还是网断了。设备档案里存 `ip`（列表里就有），偶发
   TCP connect 一次即可区分；失败面很小，但别挂进 3 s 轮询
   → [mihome-pc-unofficial.md](docs/reference/mihome-pc-unofficial.md) §4.3
-- **消息历史要不要做：只剩"单设备最近一批"**（2026-11-23 记，**结论已探明，等用户拍板**）：
-  用户问"每类的历史信息能不能取"——三类都试过了（本机账号只读探针）：① `typelist` 是
-  "每类最新几条"，`limit`/`type`/`home_id`/`timestamp`/`offset` **全部无效**（恒 6 条），
-  没有游标；② `/v2/message/v2/list` 按 `did` 能给该设备历史，但只有"最近一批"（6 条跨
-  5.5 天，`timestamp=0` 与 `timestamp=now` 一个给数据一个给空），**不能往回翻**；③ App 的
-  「智能日志」（场景历史）**没有可发现的接口**——插件 SDK 只有原生方法
-  `loadScenesHistoryForDevice`，JS 里没有 URL，四个猜的路径全 **404**。
-  所以做也只能做"单设备最近一批"，UI 复杂度换来的信息量有限，**用户说"我后续再决定"**；
-  真要开工先读结论，别重推一遍
-  → [mihome-pc-unofficial.md](docs/reference/mihome-pc-unofficial.md) §4.5 末段
 - **多账号**：超出米家原版；方案已写（`<data>/accounts/<uid>/auth.json` + 换 Client 重建
   Store），注意 `capabilities` / `icons` / `prefs` 按账号隔离
   → [历史快照 · 待排期](docs/archive/todo-2026-11-15-full.md)
@@ -150,11 +140,21 @@
   **不挂轮询**（悬停时读一次 + 60 秒缓存）、**不显示未读数**、不标已读不删除（那是写账号
   数据）。失败与空必须分开：`Client.messages()` 失败抛异常 → 界面「读取失败」，只有真的
   零条才说「还没有消息」。`ctime` 是 unix **秒**；未知 type 保留数字 + 中性标签，不猜。
-  **按家庭过滤**：每条记录都带整数 `home_id`，`parse(home=...)` 丢掉别家的；**缺 `home_id`
-  的照旧显示**（宁可多一条别家的，也别把自己家的悄悄藏掉）。
+  **按家庭过滤（当晚修过一次）**：家庭 id **不在顶层** `home_id`（实测恒为 0，拿它比对
+  等于不过滤——用户报"两个家都能看到全部"就是这个），而在 `params.body.home_id`；
+  `parse(home=...)` 改读后者，**判断不了家庭的照旧显示**（场景通知 `params` 是空的，
+  宁可多一条别家的，也别把自己家的悄悄藏掉）。
+  **浮层高度重做**：用户报"只能看到 2 条"。根因是窗口先按加载态（列表 110px）显示、
+  数据异步回来后被 `SetDefaultConstraint` 钉住长不高，加上 word-wrap 标签的 `sizeHint`
+  多报一行、刚建的行还没 polish。现在显式算高度（脚注 `setFixedHeight`、布局
+  `SetNoConstraint`）、显示后与数据到达后各 `singleShot(0)` 再量一次；列表上限 380 → 520，
+  摘要那行压到 15px、脚注收成一行。
   **同一晚撤掉顶栏搜索框**（几十台设备用不上），`Ctrl+F` 一并取消，`card_field_qss` 与
   `WallView.set_filter` / `RoomSection.apply_filter` 整套按名过滤跟着删。
-  见 `docs/dev/ui.md`「消息中心（只读 + 悬停浮层）」；验证 `scripts/verify_messages.py`（68 项）。
+  **新增单设备「消息记录」**：设备详情页**左下角**，替掉原来的「隐藏此设备」（隐藏仍可
+  在卡片右键做）。走 `/v2/message/v2/list`——`type` 必填，`6` 与 `11` 各问一次再合并，
+  一种失败不算整体失败；`timestamp` 只认 0，**只有最近一批**，脚注照实写。
+  见 `docs/dev/ui.md`「消息中心」；验证 `scripts/verify_messages.py`（94 项）。
   顺带把 README 补上设备清单 `limit=200` 的静默缺失（超 200 台少设备、不报错）。
 
 - **顶栏全屋温湿度（2026-11-22）**：设备计数右边多两颗胶囊，多台设备时写**范围**

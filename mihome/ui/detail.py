@@ -37,7 +37,6 @@ from ..core.camera import shared as camera_service
 from ..core.catalog import format_value
 from ..core.enum_text import prop_short
 from ..core.freshness import stale_text
-from ..core.prefs import HIDDEN_ROOM
 from ..core.spec import PropertySpec
 from ..core.store import DeviceState, Store
 from . import theme, tooltip
@@ -54,6 +53,7 @@ from .chrome import (
     surface_border,
 )
 from .combo import Combo
+from .device_messages import open_device_messages
 from .ptz_pad import PtzPad
 from .widgets import ElidedLabel, IconProvider, ToggleSwitch, draw_text
 
@@ -446,18 +446,20 @@ class DetailDialog(QDialog):
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         outer.addWidget(scroll, 1)
 
-        # 底部固定一行：左边"隐藏此设备"，右边数据新鲜度。不跟着内容滚走。
+        # 底部固定一行：左边"消息记录"，右边数据新鲜度。不跟着内容滚走。
+        # 「隐藏此设备」2026-11-23 让位给「消息记录」（用户定：看设备时想顺手确认
+        # "它最近出过什么事"）；隐藏仍可在首页卡片右键完成，没有丢功能。
         foot = QWidget()
         foot.setFixedHeight(36)
         fl = QHBoxLayout(foot)
         fl.setContentsMargins(PAD, 0, PAD, 0)
         fl.setSpacing(10)
-        self.btn_hide = QPushButton("隐藏此设备")
-        self.btn_hide.setObjectName("Link")
-        self.btn_hide.setCursor(Qt.PointingHandCursor)
-        self.btn_hide.clicked.connect(self._toggle_hidden)
-        tooltip.watch(self.btn_hide, self._hide_tip)
-        fl.addWidget(self.btn_hide)
+        self.btn_msgs = QPushButton("消息记录")
+        self.btn_msgs.setObjectName("Link")
+        self.btn_msgs.setCursor(Qt.PointingHandCursor)
+        self.btn_msgs.clicked.connect(self._open_messages)
+        tooltip.watch(self.btn_msgs, "这台设备最近的云端消息记录（只读）")
+        fl.addWidget(self.btn_msgs)
         fl.addStretch(1)
         self._foot = QLabel("")
         self._foot.setStyleSheet(f"color:{palette.text_mute}; font-size:11px;")
@@ -528,7 +530,6 @@ class DetailDialog(QDialog):
         self._adv_rows: list[ControlRow] = []
         self._build_advanced()
         self._col.addStretch(1)
-        self._sync_hide_button()
         # 建完立刻按 store 里的当前值填一遍。只靠下面那个 600ms 的定时器，第一帧
         # 会是控件的"出厂态"——滑条停在最左、轨道一段都不亮、开关默认关着——用户
         # 看到的是"先空一下才变成真实值"（2026-11-12 用户报）。而 store 里明明
@@ -1322,20 +1323,13 @@ class DetailDialog(QDialog):
             # 用户刚选了模式：等 device 把 scene-mode 改过来之前，别被"无"擦掉
             self._mode_pending = True
 
-    def _hide_tip(self) -> str:
-        """悬停提示的文案（惰性取，隐藏状态变了不用重新注册）。"""
-        hidden = self.store.prefs.is_hidden(self.state.did)
-        return ("重新显示在所属房间" if hidden
-                else f"隐藏后收进首页末尾的「{HIDDEN_ROOM}」分组，不影响控制")
+    def _open_messages(self) -> None:
+        """左下角「消息记录」：这台设备最近的云端消息（只读）。
 
-    def _toggle_hidden(self) -> None:
-        hidden = self.store.prefs.is_hidden(self.state.did)
-        self.store.set_hidden(self.state.did, not hidden)
-        self._sync_hide_button()
-
-    def _sync_hide_button(self) -> None:
-        hidden = self.store.prefs.is_hidden(self.state.did)
-        self.btn_hide.setText("取消隐藏" if hidden else "隐藏此设备")
+        模态打开、窗里只有一张列表；数据在它自己的 ``showEvent`` 里读，所以点第二次
+        会重新问一次云端（不缓存——这页是"专门来看"，宁可拿新的）。
+        """
+        open_device_messages(self.store, self.state, self._p, self)
 
     def _sync(self) -> None:
         st = self.store.devices.get(self.state.did)
@@ -1391,7 +1385,6 @@ class DetailDialog(QDialog):
             row.set_stale(stale_text(stamps.get(row.prop.key)) if st.online else "")
         self.titlebar.set_title(st.name)
         self.titlebar.set_subtitle(st.room or "")
-        self._sync_hide_button()
         if not st.online:
             self._foot.setText("设备已离线，控制不可用")
         elif st.age > 1e6:

@@ -86,6 +86,13 @@ SUCCESS_CODES: frozenset[int] = frozenset({0, 1})  # 上游把 0/1 都当成功
 DEFAULT_CHUNK = 300
 DEFAULT_MUTE = 3.0  # 写入后忽略回读的秒数
 
+#: 单设备消息（``/v2/message/v2/list``）一次要多少条。这个接口没有游标，"要多少"
+#: 就是"最多能拿到多少"，实测 20 与 50 返回同一批 6 条，给 50 只是不想自己卡住自己。
+DEVICE_MSG_LIMIT = 50
+#: 单设备消息要问的类型：6 = 设备消息、11 = 设备离线。``type`` 是**必填**，
+#: 少传一个就是 ``-8 invalid param``；没有的类型只会回空数组，试一下不花钱。
+DEVICE_MSG_TYPES: tuple[int, ...] = (6, 11)
+
 #: 请求语言。**必须显式指定**，不能交给 mijiaAPI 去猜——见 :func:`apply_locale`。
 API_LOCALE = "zh_CN"
 
@@ -968,7 +975,8 @@ class Client:
         两个已知限制（2026-11-23 本机只读实测，见
         ``docs/reference/mihome-pc-unofficial.md`` §4.5）：这个接口**没有游标**，
         ``limit`` / ``type`` / ``home_id`` / ``timestamp`` 传什么都不改变结果；
-        ``ctime`` 是 unix **秒**。返回的每条都带整数 ``home_id``，可以按家庭过滤。
+        ``ctime`` 是 unix **秒**。家庭 id 只在 ``params.body.home_id`` 里（顶层那个
+        恒为 0），归一化见 :func:`mihome.core.messages.parse`。
         """
         data: dict[str, Any] = {
             "timestamp": int(time.time() * 1000),
@@ -977,6 +985,41 @@ class Client:
         with self._lock:
             ret = self._api._request("/v2/message/v2/typelist", data)
         return ret if isinstance(ret, dict) else {}
+
+    def device_messages(self, did: str, limit: int = DEVICE_MSG_LIMIT) -> dict[str, Any]:
+        """某台设备的消息记录（``POST /v2/message/v2/list``），合并后返回同一个形状。
+
+        **``type`` 是必填**：2026-11-23 实测不传直接 ``-8 invalid param``。所以按已知
+        的设备类类型各问一次（``6`` 设备消息、``11`` 设备离线），谁返回就并起来；某一种
+        出错不算整体失败，两种都失败才抛（``error`` 交给界面显示"读取失败"）。
+
+        ``timestamp`` 只认 ``0``：传"现在"或最早一条的 ``ctime`` 都返回**空数组**，
+        也就是说**没有翻页**——同一台设备实测最近 6 条跨 5.5 天，``limit`` 20 与 50
+        返回一模一样（见 ``docs/reference/mihome-pc-unofficial.md`` §4.5）。
+
+        **只读**：``force_read`` 恒 ``False``，不标已读、不删除。
+        """
+        rows: list[dict[str, Any]] = []
+        errors: list[BaseException] = []
+        with self._lock:
+            for kind in DEVICE_MSG_TYPES:
+                data = {
+                    "did": did,
+                    "type": int(kind),
+                    "timestamp": 0,
+                    "limit": int(limit),
+                    "force_read": False,
+                }
+                try:
+                    ret = self._api._request("/v2/message/v2/list", data)
+                except Exception as exc:  # noqa: BLE001  一种类型炸了不影响另一种
+                    errors.append(exc)
+                    continue
+                got = ret.get("messages") if isinstance(ret, dict) else None
+                rows.extend(r for r in (got or []) if isinstance(r, dict))
+        if errors and len(errors) == len(DEVICE_MSG_TYPES):
+            raise errors[0]
+        return {"messages": rows}
 
     # -- 杂务 ------------------------------------------------------------
     def flush(self) -> None:
@@ -988,6 +1031,8 @@ __all__ = [
     "CapabilityBook",
     "Client",
     "DEFAULT_CHUNK",
+    "DEVICE_MSG_LIMIT",
+    "DEVICE_MSG_TYPES",
     "HomeNode",
     "PropRef",
     "ReadValue",

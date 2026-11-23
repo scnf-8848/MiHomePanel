@@ -20,8 +20,12 @@
 - 每条带 ``msg_id / uid / type / title / content / img_url / did / params /
   ctime / is_new / home_id / home_owner``；
 - ``ctime`` 是 **unix 秒**（不是毫秒，别拿 ``time.time()*1000`` 比）；
-- ``home_id`` 是**整数**，每条都有——所以能按当前家庭过滤（见 ``parse(home=...)``）。
-  场景通知没有 ``did``，但同样带 ``home_id``，不会因此漏掉。
+- **家庭 id 在 ``params.body.home_id`` 里**，不在顶层：顶层那个 ``home_id`` 实测**恒为 0**
+  （6 条全是），真正的 15 位家庭 id 只出现在 ``params.body.home_id``（5 条设备消息都有，
+  两个家庭两个值，都在账号的家庭列表里）。场景通知（``type=13``）的 ``params`` 是空
+  dict，**归属不明**——这种按 ``parse(home=...)`` 的规矩照留。
+- 单设备历史 ``/v2/message/v2/list`` 的 ``type`` 是**必填**（不传 → ``-8 invalid param``），
+  所以按已知类型各问一次再合并（见 ``Client.device_messages``）。
 
 已知类型：``6`` 设备消息、``11`` 设备离线、``13`` 场景通知。没见过的类型**保留数字
 和一条中性标签**，不猜——把场景通知误标成设备消息，比显示"消息"更糟。
@@ -60,6 +64,31 @@ def _int(value: Any) -> int:
         return int(value)
     except (TypeError, ValueError):
         return 0
+
+
+def _body(record: Mapping[str, Any]) -> Mapping[str, Any]:
+    """``params.body``；消息中心这条链路里真正的业务字段都埋在它下面。"""
+    params = record.get("params")
+    body = params.get("body") if isinstance(params, Mapping) else None
+    return body if isinstance(body, Mapping) else {}
+
+
+def _home_id(record: Mapping[str, Any]) -> str:
+    """这条记录属于哪个家庭；判断不了就是 ``""``。
+
+    **顶层 ``home_id`` 不可用**：2026-11-23 本机只读探针里 6 条记录全是 ``0``——
+    拿它比对会让"按家庭过滤"看起来永远生效不了（或者把它们全删掉）。真正的家庭 id
+    在 ``params.body.home_id``（15 位整数，两个家庭两个值，都在账号的家庭列表里）。
+    两处都试，取第一个大于 0 的；场景通知的 ``params`` 是空 dict，于是得到 ``""``。
+    """
+    for value in (record.get("home_id"), _body(record).get("home_id")):
+        try:
+            number = int(value)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            continue
+        if number > 0:
+            return str(number)
+    return ""
 
 
 @dataclass(frozen=True)
@@ -103,9 +132,10 @@ def parse(
     界面只显示时间和类型。脏记录（没有 ``msg_id``、不是 dict）直接丢：没有 id 的
     记录既没法定位也没法去重，留着只会让列表里多一行空白。
 
-    ``home`` 给当前家庭 id 时只留这个家庭的消息。**判断不了家庭的照留**：早期记录
-    或将来接口改字段时 ``home_id`` 可能是空的，宁可多显示一条别家消息，也不要把
-    自己家的消息悄悄藏掉。
+    ``home`` 给当前家庭 id 时只留这个家庭的消息。`home_id` 取的是
+    ``params.body.home_id``（顶层那个恒为 0，见 :func:`_home_id`）。
+    **判断不了家庭的照留**：场景通知的 ``params`` 是空的，宁可多显示一条别家消息，
+    也不要把自己家的消息悄悄藏掉。
     """
     data = payload if isinstance(payload, Mapping) else {}
     known = names or {}
@@ -118,7 +148,7 @@ def parse(
             continue
         kind = _int(record.get("type"))
         did = str(record.get("did") or "")
-        msg_home = str(record.get("home_id") or "")
+        msg_home = _home_id(record)
         if home and msg_home and msg_home != str(home):
             continue
         rows.append(

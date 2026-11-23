@@ -457,7 +457,8 @@ mihome/
                     品类色、QPalette 映射
     inline_toast.py 主窗口内的提示浮层（按右栏内容区定位，ok / fail 两档）
     messages_popup.py 顶栏「消息」胶囊的悬停浮层（不是对话框）：Enter/Leave + 260ms 收起、
-                    Esc 关闭、当前家庭过滤、60 秒缓存；只读
+                    Esc 关闭、当前家庭过滤、60 秒缓存；高度显式算（不靠 sizeHint）；只读
+    device_messages.py 详情页左下角「消息记录」窗：单设备最近一批（type 6 + 11 合并），只读
     widgets.py      流式布局、图标缓存、文本绘制、切换开关
     wheel_guard.py  滚轮护栏：滚轮只滚页面，不改设备参数（WheelSafe / SafeSlider）
 scripts/

@@ -28,7 +28,16 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
-from .api import Client, HomeNode, PropRef, ReadValue, Topology, classify, explain
+from .api import (
+    DEVICE_MSG_LIMIT,
+    Client,
+    HomeNode,
+    PropRef,
+    ReadValue,
+    Topology,
+    classify,
+    explain,
+)
 from .catalog import CardSpec, build_card, summary_line
 from .geek import Entry as GeekEntry
 from .geek import GeekError
@@ -939,6 +948,33 @@ class Store:
                 None
                 if error is not None
                 else parse_messages(payload, self.message_names(), home=home),
+                error,
+            ),
+        )
+
+    def fetch_device_messages(
+        self,
+        did: str,
+        done: Callable[[list[Message] | None, BaseException | None], None],
+        *,
+        limit: int = DEVICE_MSG_LIMIT,
+    ) -> None:
+        """某一台设备的消息记录（``/v2/message/v2/list``）。
+
+        给详情页左下角「消息记录」用：只读、**不挂轮询**，打开才读一次。不按家庭过滤
+        ——这台设备本来就只属于一个家庭，问的是"它自己发生过什么"。
+        ``limit`` 是上限而不是页大小：这个接口没有游标，拿不到更早的（见
+        ``Client.device_messages``）。
+        """
+        self.worker.submit(
+            self.client.device_messages,
+            (did, limit),
+            priority=PRIORITY_DATA,
+            label="device-messages",
+            callback=lambda payload, error: done(
+                None
+                if error is not None
+                else parse_messages(payload, self.message_names()),
                 error,
             ),
         )
