@@ -151,15 +151,18 @@
   摘要那行压到 15px、脚注收成一行。
   **同一晚撤掉顶栏搜索框**（几十台设备用不上），`Ctrl+F` 一并取消，`card_field_qss` 与
   `WallView.set_filter` / `RoomSection.apply_filter` 整套按名过滤跟着删。
-  **详情页左下角：先做过「单设备消息记录」，当晚撤掉换成「设备事件」**。消息记录走
-  `/v2/message/v2/list`（`type` 必填、`6`/`11` 各问一次再合并、`timestamp` 只认 0、
-  只有最近一批），但用户实测**只有门锁 / 洗衣机 / 蒸烤箱 / 净烟机 4 台**会发通知，挂在
-  通用详情页上等于给其它几十台摆一个空窗。换成 `/miotspec/event/get`：事件源来自设备规格
-  （本机 55 台里 35 台有），**只显示唯一的最新那一条**（曾按"最多 3 行 + 另有 N 个"做过一版，
-  按用户要求收成一条），一行纯文字、放不下省略，`code == -9` 按"没有记录"处理、不当失败。
-  顺带替掉原来的「隐藏此设备」（隐藏仍可在卡片右键做）。
-  见 `docs/dev/ui.md`「消息中心」「详情页底部『设备事件』」；验证
-  `scripts/verify_messages.py`（74 项）、`scripts/verify_events.py`。
+  **详情页左下角：试过三样，全撤了，现在留空**。①「隐藏此设备」按钮（管理动作，移到卡片
+  右键）；②「单设备消息记录」，走 `/v2/message/v2/list`（`type` 必填、`6`/`11` 各问一次再
+  合并、`timestamp` 只认 0、只有最近一批），但用户实测**只有门锁 / 洗衣机 / 蒸烤箱 / 净烟机
+  4 台**会发通知，挂在通用详情页上等于给其它几十台摆空窗；③「设备事件」最新一条，走
+  `/miotspec/event/get`（事件源来自设备规格，本机 55 台里 35 台有），先按"3 行 + 另有 N 个"
+  做、再按用户要求收成**唯一最新那一条**的一行纯文字——**实测效果仍不理想，用户要求整个
+  去掉、位置留空**。三次的实现（`ui/device_messages.py`、`core/events.py`、
+  `Client.device_events`、`Store.fetch_device_messages/device_events`、
+  `scripts/verify_events.py`）都已删除，`git log` 里有完整版本，恢复成本低。
+  接口结论留在 `docs/dev/ui.md`「详情页底部」与 `docs/reference/mijia-automation-events.md` §3
+  （`params` 包裹、`-9`、`value` 是字符串、`arguments` 复数），将来做自动化触发直接用。
+  见 `docs/dev/ui.md`「消息中心」「详情页底部」；验证 `scripts/verify_messages.py`（74 项）。
   顺带把 README 补上设备清单 `limit=200` 的静默缺失（超 200 台少设备、不报错）。
 
 - **顶栏全屋温湿度（2026-11-22）**：设备计数右边多两颗胶囊，多台设备时写**范围**

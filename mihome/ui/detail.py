@@ -30,7 +30,6 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ..core import events as event_model
 from ..core import timing
 from ..core.camera import CameraError, is_camera, probe_local
 from ..core.camera import shared as camera_service
@@ -391,11 +390,6 @@ class DetailDialog(QDialog):
     #: 它能不收尾就把画面收回去继续播。接过之后本页只清自己的界面。
     about_to_stop = Signal(str)
 
-    #: 底部「设备事件」那一行的高度。只放一行 12px 文字 + 2px 下边距，比按内容
-    #: 自适应可靠：这一行的字会随时间变化（「1 分钟前」→「2 分钟前」），自适应
-    #: 会让底部一直轻微跳。
-    EVENT_H = 22
-
     def __init__(
         self,
         state: DeviceState,
@@ -422,22 +416,6 @@ class DetailDialog(QDialog):
         self._speed_rows: dict[str, ControlRow] = {}
         #: 用户刚点过模式、设备还没把 scene-mode 改过来的过渡态
         self._mode_pending = False
-        #: 设备事件：只读一次，结果经队列回主线程（窗口没了也不碰控件）
-        self._events_queue: queue.SimpleQueue[
-            tuple[list[event_model.DeviceEvent] | None, BaseException | None]
-        ] = queue.SimpleQueue()
-        self._events_loaded = False
-        #: 三态：等结果 / 读取失败 / 正常（空表也算正常，文案是「还没有记录」）
-        self._events_pending = False
-        self._events_error = False
-        self._events_rows: list[event_model.DeviceEvent] = []
-        #: 上一次写进标签的全文。相对时间每分钟都会变，先比再写免得每 600ms 重绘
-        self._events_text = ""
-        #: 事件是一次性请求，600ms 的 ``_sync`` 收太慢（用户会看到"读取中"停一下）。
-        #: 只在等结果期间跑，拿到就停——不引入常驻定时器。
-        self._events_timer = QTimer(self)
-        self._events_timer.setInterval(100)
-        self._events_timer.timeout.connect(self._collect_events)
         self.setWindowTitle(state.name)
         self.setWindowFlags(Qt.Dialog | Qt.FramelessWindowHint)
         # 浮窗：圆角 18 + 外圈阴影（窗口比可见面板大一圈，内容挂 ``body``）
@@ -466,33 +444,10 @@ class DetailDialog(QDialog):
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         outer.addWidget(scroll, 1)
 
-        # 底部固定两行（不跟着内容滚走）：
-        #   上面一行「设备事件」——读 ``/miotspec/event/get`` 的**最新那一条**，纯文字；
-        #   下面一行是数据新鲜度。
-        # 只画一条不是偷懒：``event/get`` 每个源只回答"最后发生在什么时候"，问回来
-        # 的七八条里除了时间最大的那条，其余都是几个月前的事，对"它最近出过什么事"
-        # 没有增量信息（2026-11-23 用户定：只留唯一的最新一条，不要列表、不要弹窗）。
-        # 2026-11-23 另一条结论：设备事件比「单设备消息记录」通用。后者只有"会发通知"
-        # 的设备才有（家里实测只有门锁 / 洗衣机 / 蒸烤箱 / 净烟机），挂在通用详情页上
-        # 等于给其它几十台设备摆一个空窗；事件源来自设备规格，本机 55 台里 35 台有。
-        self.events_box = QWidget()
-        self.events_box.setFixedHeight(self.EVENT_H)
-        eb = QHBoxLayout(self.events_box)
-        eb.setContentsMargins(PAD, 0, PAD, 2)
-        eb.setSpacing(8)
-        ev_cap = QLabel("设备事件")
-        ev_cap.setObjectName("EventsCap")
-        # 单行、放不下打省略号：最小窗口（400）里这一行只有 ~356px，一条
-        # 「开锁 · 3 分钟前（操作位置 室外）」就顶满了。折行会把底部两行撑成三行，
-        # 而且同一句在不同设备上高度不一，翻着看很乱；全文挂在 tooltip 上。
-        self.events_body = ElidedLabel("")
-        self.events_body.setObjectName("EventsBody")
-        eb.addWidget(ev_cap, 0, Qt.AlignVCenter)
-        eb.addWidget(self.events_body, 1)
-        # 规格里一个事件源都没有就整块不出现：与其摆一行"没有事件"，不如把地让出来
-        self.events_box.hide()
-        outer.addWidget(self.events_box)
-
+        # 底部只有一行数据新鲜度，左边**留空**：
+        # 这里换过三种东西——「隐藏此设备」按钮、单设备「消息记录」、「设备事件」最新一条，
+        # 2026-11-23 用户实测都不理想，要求撤掉、把位置空出来。别再往里塞，
+        # 除非先问（三次尝试的过程与理由见 ``docs/dev/ui.md``「详情页底部」）。
         foot = QWidget()
         foot.setFixedHeight(30)
         fl = QHBoxLayout(foot)
@@ -504,12 +459,7 @@ class DetailDialog(QDialog):
         fl.addWidget(self._foot)
         outer.addWidget(foot)
 
-        self.setStyleSheet(
-            "QDialog{background:transparent;}"
-            # 事件块只用纯文字：这一页是"看一眼它最近出过什么事"，不需要按钮和弹窗
-            f"QLabel#EventsCap{{color:{palette.text_mute};font-size:11px;}}"
-            f"QLabel#EventsBody{{color:{palette.text_soft};font-size:12px;}}"
-        )
+        self.setStyleSheet("QDialog{background:transparent;}")
 
         body = QWidget()
         body.setStyleSheet(f"background:{surface_bg(palette)};")
@@ -579,12 +529,6 @@ class DetailDialog(QDialog):
         self._timer.start(600)  # 详情页跟着轮询走，不用自己发请求
 
     # -- 构建 ------------------------------------------------------------
-    def showEvent(self, event) -> None:
-        super().showEvent(event)
-        # 每次打开详情页读一次。放在 showEvent 而不是构造函数里：构造时窗口还没上屏，
-        # 读回来的东西要等到下一次布局才画得出来，反而像是"先空一下"。
-        self._load_events()
-
     def _build_camera(self) -> None:
         """摄像头品类才有的实时画面。
 
@@ -1367,70 +1311,7 @@ class DetailDialog(QDialog):
             # 用户刚选了模式：等 device 把 scene-mode 改过来之前，别被"无"擦掉
             self._mode_pending = True
 
-    def _load_events(self) -> None:
-        """打开页面读一次设备事件（**不轮询**：事件是"最近一次"，刷新也没新东西）。
-
-        事件源来自设备规格；规格里一个都没有就既不请求也不占地方——这正是换掉
-        消息记录的原因：能不能看取决于规格，而不是"云端推不推通知"。
-        """
-        if self._events_loaded:
-            return
-        self._events_loaded = True
-        if not event_model.sources(self.state.spec):
-            return
-        self._events_pending = True
-        self.events_box.show()
-        self._render_events()
-        self._events_timer.start()
-        results = self._events_queue
-        # 只捕获队列：窗口关掉以后回调也不碰控件（同摄像头那条路）
-        self.store.fetch_device_events(
-            self.state.did, lambda rows, error: results.put((rows, error))
-        )
-
-    def _collect_events(self) -> None:
-        while True:
-            try:
-                rows, error = self._events_queue.get_nowait()
-            except queue.Empty:
-                return
-            self._events_timer.stop()
-            self._events_show(rows, error)
-
-    def _events_show(
-        self,
-        rows: list[event_model.DeviceEvent] | None,
-        error: BaseException | None,
-    ) -> None:
-        self._events_pending = False
-        # 失败与"没有记录"必须分开：前者是这个功能坏了，后者是设备没出过事
-        self._events_error = error is not None
-        self._events_rows = list(rows or [])
-        self.events_box.show()
-        self._render_events()
-
-    def _render_events(self) -> None:
-        """把当前状态写成底部那一行：读取中 / 读取失败 / 唯一的最新一条。
-
-        由 ``_sync`` 每 600ms 也调一次——「3 分钟前」得自己往前走，不然页面开着
-        不动，半小时后还写着"3 分钟前"。文本没变就不写标签，避免每轮重绘。
-        """
-        if not self._events_loaded:
-            return
-        if self._events_pending:
-            text = "读取中…"
-        elif self._events_error:
-            text = "读取失败"
-        else:
-            text = event_model.line(self._events_rows)
-        if text != self._events_text:
-            self._events_text = text
-            self.events_body.set_full(text)
-
     def _sync(self) -> None:
-        self._collect_events()
-        # 相对时间（"3 分钟前"）跟着刷新节奏往前走，只在文本变化时才写标签
-        self._render_events()
         st = self.store.devices.get(self.state.did)
         if st is None:
             return

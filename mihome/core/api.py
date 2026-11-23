@@ -86,10 +86,6 @@ SUCCESS_CODES: frozenset[int] = frozenset({0, 1})  # 上游把 0/1 都当成功
 DEFAULT_CHUNK = 300
 DEFAULT_MUTE = 3.0  # 写入后忽略回读的秒数
 
-#: 一次 ``event/get`` 最多带几个事件源。实测一台门锁 26 个源、一次请求 100ms 内回来；
-#: 给 50 是留余量，同时保证真遇到几百个源的设备也不会把请求撑爆（超了自动分片）。
-EVENT_CHUNK = 50
-
 #: 请求语言。**必须显式指定**，不能交给 mijiaAPI 去猜——见 :func:`apply_locale`。
 API_LOCALE = "zh_CN"
 
@@ -983,50 +979,6 @@ class Client:
             ret = self._api._request("/v2/message/v2/typelist", data)
         return ret if isinstance(ret, dict) else {}
 
-    def device_events(
-        self,
-        did: str,
-        sources: Iterable[tuple[int, int]],
-        *,
-        chunk: int = EVENT_CHUNK,
-    ) -> list[dict[str, Any]]:
-        """读一台设备若干事件源的**最近一次**（``POST /miotspec/event/get``）。
-
-        ``sources`` 是 ``[(siid, eiid)]``，来自设备规格（``spec.events()``）；除 `did`
-        以外的字段**必须**包在 ``{"params": [...]}`` 里，直接传顶层数组或单个 dict 都会
-        被 `-8` 拒。一次请求能带几十个源，所以按 ``chunk`` 分片、串行发完再合并。
-
-        返回云端原始条目：每条带 ``siid / eiid / code / value / updateTime``。
-        ``value`` 是**字符串**，里面才是 ``[{piid, value}]``；``code == -9`` 表示
-        "从来没发生过"，属于正常结果，不是失败——归一化交给 :mod:`mihome.core.events`。
-
-        整体失败（网关返回 code、结构不对）**抛异常**，由 ``core/jobs.py`` 转成回调的
-        ``error``：界面据此显示"读取失败"，而不是显示成"没有记录"——那两件事用户看到
-        的处理方式不一样。
-
-        **只读**：这个接口没有写入口，也不该有。
-        """
-        items = [
-            {"did": did, "siid": int(siid), "eiid": int(eiid)} for siid, eiid in sources
-        ]
-        if not items:
-            return []
-        rows: list[dict[str, Any]] = []
-        step = max(1, int(chunk))
-        for start in range(0, len(items), step):
-            with self._lock:
-                ret = self._api._request(
-                    "/miotspec/event/get", {"params": items[start : start + step]}
-                )
-            if isinstance(ret, Mapping):
-                # 整体失败：云端把错误码放在顶层，而不是逐条
-                code = int(ret.get("code") or -1)
-                raise APIError(code, str(ret.get("message") or "事件读取失败"))
-            if not isinstance(ret, list):
-                raise APIError(-1, f"事件响应结构异常（{type(ret).__name__}）")
-            rows.extend(dict(r) for r in ret if isinstance(r, Mapping))
-        return rows
-
     # -- 杂务 ------------------------------------------------------------
     def flush(self) -> None:
         """把能力账本落盘（退出前 / 定时调用）。"""
@@ -1037,7 +989,6 @@ __all__ = [
     "CapabilityBook",
     "Client",
     "DEFAULT_CHUNK",
-    "EVENT_CHUNK",
     "HomeNode",
     "PropRef",
     "ReadValue",

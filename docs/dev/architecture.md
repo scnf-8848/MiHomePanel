@@ -401,7 +401,6 @@ mihome/
     tree.py     64 条设备条目 → 56 台真机（多键面板的虚拟子设备折叠）
     prefs.py    用户偏好：排序、隐藏（设备 / 场景，含首页分组折叠）、家庭标签样式、卡片样式、上次页面与房间、顶栏三块显隐（prefs.json）
     messages.py 消息中心：云端通知记录归一化（只读，不标已读 / 不删除）
-    events.py   设备事件：`/miotspec/event/get` 归一化（最近一次 + 参数翻中文），纯函数
     icons.py    产品图缓存
     paths.py    数据目录约定
     single_instance.py 单实例：命名互斥量 + 注册消息广播（不依赖 QtNetwork），再启动只把已有窗口叫到前台

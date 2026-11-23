@@ -38,9 +38,6 @@ from .api import (
     explain,
 )
 from .catalog import CardSpec, build_card, summary_line
-from .events import DeviceEvent
-from .events import parse as parse_events
-from .events import sources as event_sources
 from .geek import Entry as GeekEntry
 from .geek import GeekError
 from .geek import candidates as geek_candidates
@@ -950,37 +947,6 @@ class Store:
                 None
                 if error is not None
                 else parse_messages(payload, self.message_names(), home=home),
-                error,
-            ),
-        )
-
-    def fetch_device_events(
-        self,
-        did: str,
-        done: Callable[[list[DeviceEvent] | None, BaseException | None], None],
-    ) -> None:
-        """某一台设备的**事件最近一次**（``/miotspec/event/get``）。
-
-        给详情页左下角用：只读、**不挂轮询**，打开页面读一次。事件源来自这台设备的
-        规格（``spec.events()``），所以"有没有东西可看"取决于规格而不是"云端推不推
-        通知"——本机 55 台里 35 台有事件源，比消息中心覆盖面大得多。
-
-        规格里一个事件都没有时**不发请求**，直接回调空表：那不是失败，只是这台设备
-        没有事件可报。真失败（网关返回错误码 / 网络断）走 ``error``，界面显示"读取失败"。
-        """
-        st = self.devices.get(did)
-        spec = st.spec if st is not None else None
-        srcs = event_sources(spec)
-        if not srcs:
-            done([], None)
-            return
-        self.worker.submit(
-            self.client.device_events,
-            (did, srcs),
-            priority=PRIORITY_DATA,
-            label="device-events",
-            callback=lambda payload, error: done(
-                None if error is not None else parse_events(payload, spec),
                 error,
             ),
         )
