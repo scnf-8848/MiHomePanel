@@ -19,8 +19,8 @@
 菜单用 ``ui/menu.py`` 的 ``Menu``（自绘圆角 + 透明底），不是裸 ``QMenu``：裸的那层
 是**独立原生窗口**，默认带不透明实心底，QSS 的 ``border-radius`` 只画出圆角图案，
 四角外面还是方块底色——真机上就是"四个黑角"。这个坑在主窗口卡片菜单上踩过，做法
-别翻回去。菜单里目前只有**打开主窗口**和**退出**两项，其余功能（场景、刷新）留着
-以后按需加，不要提前堆。
+别翻回去。菜单里目前只有**打开主窗口**、**桌面挂件**（勾选 = 挂件此刻在屏幕上）和
+**退出**三项，其余功能（场景、刷新）留着以后按需加，不要提前堆。
 
 ``MIHOME_NO_TRAY=1`` 是排障开关：怀疑"托盘里点不开 / 图标不显示"时用它把托盘
 整个关掉，程序回到"关窗即退出"的老行为，好确认问题是不是托盘引起的。
@@ -45,13 +45,13 @@ import os
 import sys
 from ctypes import wintypes
 
-from PySide6.QtCore import QObject, QRectF, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QIcon, QPainter, QPixmap
+from PySide6.QtCore import QObject, QRect, QRectF, Qt, QTimer, Signal
+from PySide6.QtGui import QAction, QColor, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import QApplication, QSystemTrayIcon
 
 from ..core import applog
 from . import app_icon, theme
-from .menu import Menu
+from .menu import Menu, choice_icon, menu_qss
 
 _ICON_SIZES = (16, 20, 24, 32, 48)
 
@@ -208,11 +208,75 @@ def _drawn_icon(accent: str) -> QIcon:
     return icon
 
 
+class _TrayMenu(Menu):
+    """托盘菜单：勾选 ✓ 画在**文字右侧**。
+
+    托盘只有一个勾选项（桌面挂件）。走 ``QAction.setIcon`` 的话 Qt 会为整列图标
+    预留左侧空位，「打开主窗口」「退出」也会跟着缩进，观感很怪。这里改为：
+    左侧仍按普通菜单的 16 px 内边距排版；右侧固定留出一条勾位，勾选图标直接画在
+    这条空位里。勾与不勾都占同样的宽度，所以文字位置不会跳动。
+
+    图标本身复用 ``menu.choice_icon``（自绘 ✓ + 主题 accent 色），不是系统
+    check indicator，和项目里其它菜单保持同一套观感。
+    """
+
+    #: 勾选图标宽度（与 choice_icon 的默认尺寸一致）
+    CHECK_W = 16
+    #: 图标右边缘离菜单项右边界的距离
+    CHECK_RIGHT = 12
+    #: 右侧预留的总宽度：图标 + 右间距 + 图标与文字之间至少留 8 px
+    RIGHT_PAD = CHECK_RIGHT + CHECK_W + 8
+
+    def __init__(self, palette: theme.Palette) -> None:
+        self._checked: set[QAction] = set()
+        super().__init__(None, palette)
+        self._apply_style()
+
+    def set_palette(self, palette: theme.Palette) -> None:
+        # 不走 ``Menu.set_palette``：那份样式表没有右侧勾位，直接用会把它冲掉
+        self._p = palette
+        self._apply_style()
+
+    def _apply_style(self) -> None:
+        # 左侧内边距与普通菜单一致（16 px，去掉为图标列预留的缩进）
+        self.setStyleSheet(
+            menu_qss(self._p)
+            + f"\n    QMenu::item {{ padding: 7px {self.RIGHT_PAD}px 7px 16px; }}"
+        )
+
+    def set_action_checked(self, act: QAction, on: bool) -> None:
+        """标记哪一项在右侧显示 ✓。只影响画法，不参与显隐逻辑。"""
+        if on:
+            self._checked.add(act)
+        else:
+            self._checked.discard(act)
+        self.update()
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        super().paintEvent(event)
+        if not self._checked:
+            return
+        painter = QPainter(self)
+        icon = choice_icon(self._p, True)
+        for act in self._checked:
+            rect = self.actionGeometry(act)
+            if rect.isEmpty():
+                continue
+            x = rect.right() - self.CHECK_RIGHT - self.CHECK_W + 1
+            y = rect.center().y() - self.CHECK_W // 2
+            icon.paint(painter, QRect(x, y, self.CHECK_W, self.CHECK_W))
+        painter.end()
+
+
 class TrayController(QObject):
     """托盘图标 + 菜单。只管"点了什么"，真正的动作交给窗口接。"""
 
     open_requested = Signal()
     quit_requested = Signal()
+    #: 托盘「桌面挂件」被点击：参数是**目标可见性**（True = 要显示）。
+    #: 菜单自己不记"想显示 / 想隐藏"，勾选态一律由 ``set_widget_checked`` 从挂件的
+    #: 实际显隐回灌，避免菜单和真窗口各说一套。
+    widget_toggle_requested = Signal(bool)
 
     def __init__(
         self,
@@ -228,6 +292,8 @@ class TrayController(QObject):
         self._explicit = available is not None
         self._available = tray_available() if available is None else bool(available)
         self._shown = False
+        #: 挂件此刻在不在屏幕上。只做**展示**用，源头是 ``DesktopWidget.visibility_changed``
+        self._widget_on = False
         #: 注册判据的注入点（离屏平台没有通知区域，测试要能替掉它）
         self._probe = probe
         self._attempt = 0
@@ -238,8 +304,9 @@ class TrayController(QObject):
 
         self._icon = QSystemTrayIcon(tray_icon(), self)
         self._icon.setToolTip("米家控制台")
-        # 圆角菜单（透明底 + 去边框），理由见模块开头的第 5 段
-        self._menu = Menu(None, palette)
+        # 圆角菜单（透明底 + 去边框），理由见模块开头的第 5 段。
+        # 托盘专用子类：勾选 ✓ 画在文字右侧，左侧不再为图标列留缩进
+        self._menu = _TrayMenu(palette)
         self._build_menu()
         self._icon.setContextMenu(self._menu)
         self._icon.activated.connect(self._on_activated)
@@ -372,8 +439,10 @@ class TrayController(QObject):
     def set_palette(self, palette: theme.Palette) -> None:
         self._p = palette
         # 图标不跟着主题走（是程序图标，不是状态点），这里不用重设
-        # 菜单是独立的一层窗口，自己带一份样式表，不会跟着主窗口的 QSS 走
+        # 菜单是独立的一层窗口，自己带一份样式表，不会跟着主窗口的 QSS 走；
+        # 右侧勾选图标用 accent 色，重设调色板后要重画（见 _TrayMenu.paintEvent）
         self._menu.set_palette(palette)
+        self._menu.update()
 
     def set_status(self, text: str) -> None:
         tip = "米家控制台"
@@ -411,17 +480,38 @@ class TrayController(QObject):
 
     # -- 菜单 ------------------------------------------------------------
     def _build_menu(self) -> None:
-        """两项：打开窗口、退出。中间一条分隔线，把"退出"和日常动作分开。
+        """三项：打开窗口、桌面挂件（勾选 = 此刻在屏幕上）、退出。
 
-        这里**故意**只留这两项。以前放过「常用场景」子菜单和「刷新设备」，
-        用户看过之后要求先去掉——托盘菜单要加什么，等想清楚再加，不提前堆功能。
+        分隔线以上是日常动作用的，下面单独放「退出」。托盘菜单要加什么，等想清楚
+        再加，不提前堆功能（以前放过的「常用场景」「刷新设备」都被要求去掉了）。
         """
         m = self._menu
         act_open = m.addAction("打开主窗口")
         act_open.triggered.connect(self.open_requested)
+        # 勾选不使用 QAction.setCheckable / setIcon：系统 indicator 在深色主题下带方底，
+        # 而图标列又会让整菜单左缩进。这里只在右侧勾位里自绘 ✓（见 _TrayMenu）。
+        self._act_widget = QAction("桌面挂件", m)
+        self._act_widget.triggered.connect(
+            lambda: self.widget_toggle_requested.emit(not self._widget_on)
+        )
+        m.addAction(self._act_widget)
+        m.set_action_checked(self._act_widget, self._widget_on)
         m.addSeparator()
         act_quit = m.addAction("退出")
         act_quit.triggered.connect(self.quit_requested)
+
+    def set_widget_checked(self, on: bool) -> None:
+        """把挂件**实际**是否显示回灌到菜单勾选。
+
+        主窗口在 ``DesktopWidget.visibility_changed`` 里调它，所以左栏入口、挂件
+        自己的 ×、看门狗重建之后的显隐都会同步到这里；本方法只改右侧勾位的画法，
+        不发信号，不会反过来再触发一次显隐。
+        """
+        on = bool(on)
+        if on == self._widget_on:
+            return
+        self._widget_on = on
+        self._menu.set_action_checked(self._act_widget, on)
 
     def menu(self) -> Menu:
         """给验证脚本用：直接查菜单结构，不必真去模拟鼠标。"""

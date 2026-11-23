@@ -547,7 +547,11 @@ class MainWindow(QMainWindow):
         self.tray = TrayController(self.palette_ref, self, available=tray_available)
         self.tray.open_requested.connect(self.show_from_tray)
         self.tray.quit_requested.connect(self.quit_app)
+        self.tray.widget_toggle_requested.connect(self._on_tray_widget_toggle)
         self.tray.install()
+        # 勾选态从挂件的实际显隐来（启动时多半还没显示，autostart 那次 show 会
+        # 经 visibility_changed 再把它点亮）
+        self.tray.set_widget_checked(self.widget_panel.isVisible())
         self.tray.set_status(self.status.text())
         self._apply_poll_mode()
 
@@ -1619,7 +1623,31 @@ class MainWindow(QMainWindow):
         w.manage_requested.connect(self._open_widget_manager)
         w.quit_requested.connect(self.quit_app)
         w.rebuild_needed.connect(self._rebuild_desktop_widget)
-        w.visibility_changed.connect(self.nav.set_widget_on)
+        w.visibility_changed.connect(self._on_widget_visibility_changed)
+
+    def _on_widget_visibility_changed(self, visible: bool) -> None:
+        """挂件真的上了屏 / 收了：左栏入口亮起状态与托盘「桌面挂件」勾选一起变。
+
+        两处都以"此刻在不在屏幕上"为准，不回写偏好——当次显隐是会话状态。
+        托盘比挂件晚建（``__init__`` 里 tray 最后才创建），所以取不到时就跳过，
+        创建后那次 ``set_widget_checked`` 会补上初始值。
+        """
+        self.nav.set_widget_on(visible)
+        tray = getattr(self, "tray", None)
+        if tray is not None:
+            tray.set_widget_checked(visible)
+
+    def _set_widget_visible(self, visible: bool) -> None:
+        """显隐挂件。左栏入口、挂件自己的 × 之外的托盘入口都走这里。"""
+        if visible == self.widget_panel.isVisible():
+            return
+        if not visible:
+            self.widget_panel.hide()
+            return
+        self.widget_panel.show()
+        self.widget_panel.raise_()
+        self.widget_panel.rebuild()
+        self.widget_panel.apply_layer(self.prefs.widget_layer)
 
     def _toggle_widget_visible(self) -> None:
         """左栏「桌面挂件」入口：在屏幕上就收起，不在就弹出来。
@@ -1627,13 +1655,16 @@ class MainWindow(QMainWindow):
         这里**不写** ``widget_autostart``：那个开关只回答"下次启动要不要自动出现"，
         归设置页管；当次显隐是会话状态。挂件自己的 × 也走同一条路径。
         """
-        if self.widget_panel.isVisible():
-            self.widget_panel.hide()
-            return
-        self.widget_panel.show()
-        self.widget_panel.raise_()
-        self.widget_panel.rebuild()
-        self.widget_panel.apply_layer(self.prefs.widget_layer)
+        self._set_widget_visible(not self.widget_panel.isVisible())
+
+    def _on_tray_widget_toggle(self, on: bool) -> None:
+        """托盘「桌面挂件」：只切换**当前显隐**，不碰 ``widget_autostart``。
+
+        托盘开关与设置页「启动时开启桌面挂件」是两个独立设定（用户 2026-11-23 明确）：
+        前者只管此刻在不在屏幕上，后者只管下次启动要不要自动出现，不能联动。
+        勾选态由 ``visibility_changed`` 回灌，菜单不另存一份。
+        """
+        self._set_widget_visible(on)
 
     def _show_widget_at_start(self) -> None:
         if not self.prefs.widget_autostart:

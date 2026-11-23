@@ -141,7 +141,8 @@ def _controller_checks(app: QApplication) -> None:
     # -- 菜单结构 ----------------------------------------------------------
     m = t.menu()
     texts = [x for x in _texts(m) if x]
-    check("菜单只有「打开主窗口」「退出」", texts == ["打开主窗口", "退出"], str(texts))
+    check("菜单是「打开主窗口」「桌面挂件」「退出」",
+          texts == ["打开主窗口", "桌面挂件", "退出"], str(texts))
     check("「常用场景」「刷新设备」已去掉",
           _find(m, "常用场景") is None and _find(m, "刷新设备") is None)
     check("菜单是自绘圆角菜单（透明底 + 去边框 + 去系统阴影）",
@@ -156,6 +157,24 @@ def _controller_checks(app: QApplication) -> None:
           _emitted(t.open_requested, _find(m, "打开主窗口")))
     check("菜单里的「退出」能发信号",
           _emitted(t.quit_requested, _find(m, "退出")))
+
+    # 「桌面挂件」：勾选态由 set_widget_checked 回灌，点击发出的是"目标可见性"，
+    # 不是菜单自己记的翻转值——菜单里不能另存一份显隐状态。
+    toggles: list[bool] = []
+
+    def collect(value: bool) -> None:
+        toggles.append(value)
+
+    t.widget_toggle_requested.connect(collect)
+    t.set_widget_checked(False)
+    _find(m, "桌面挂件").trigger()
+    t.set_widget_checked(True)
+    _find(m, "桌面挂件").trigger()
+    check("「桌面挂件」点击发出目标可见性", toggles == [True, False], str(toggles))
+    t.widget_toggle_requested.disconnect(collect)
+    # ✓ 画在右侧：动作自身不能带图标，否则 Qt 会给整个菜单留出左侧图标列，
+    # 「打开主窗口」「退出」也跟着缩进（用户 2026-11-23 要求移除）。
+    check("勾选不占用左侧图标列", _find(m, "桌面挂件").icon().isNull())
 
     # 换主题时菜单要跟着换（它自己带一份样式表，不换就是白底配深色文字）
     t.set_palette(theme.DARK)
@@ -217,6 +236,32 @@ def _window_checks(app: QApplication) -> None:
               str(win.prefs.path).startswith(str(_TMP)), str(win.prefs.path))
         check("默认就是收进托盘", win.prefs.close_to_tray is True)
         check("托盘已挂上", win.tray.active is True)
+
+        # -- 托盘「桌面挂件」：勾选 ↔ 挂件实际显隐 ------------------------
+        # zorder / 圆角区域都是 Win32 调用，离屏窗口没有真实句柄，这里只验接线：
+        # 把落位与重绘换成空实现，看"显隐 → 勾选回灌 → 偏好落盘"这条链。
+        win.widget_panel.apply_layer = lambda *a, **k: True  # type: ignore[method-assign]
+        win.widget_panel.rebuild = lambda: None  # type: ignore[method-assign]
+        win.widget_panel._apply_region = lambda: None  # type: ignore[method-assign]  # noqa: SLF001
+        check("托盘勾选初始关（挂件没显示）",
+              win.tray._widget_on is False)  # noqa: SLF001
+        win.tray.widget_toggle_requested.emit(True)
+        app.processEvents()
+        check("托盘勾上真的显示挂件",
+              win.widget_panel.isVisible() is True
+              and win.tray._widget_on is True)  # noqa: SLF001
+        check("托盘显隐不写「启动时开启」偏好",
+              win.prefs.widget_autostart is False)
+        win._toggle_widget_visible()  # 左栏入口：收起
+        app.processEvents()
+        check("从其它入口收起后勾选跟着灭",
+              win.widget_panel.isVisible() is False
+              and win.tray._widget_on is False)  # noqa: SLF001
+        win.tray.widget_toggle_requested.emit(False)
+        app.processEvents()
+        check("取消勾选只隐藏，不改「启动时开启」偏好",
+              win.widget_panel.isVisible() is False
+              and win.prefs.widget_autostart is False)
 
         # -- 轮询降频：看不见的时候不该还按 3 秒一敲 ----------------------
         polls: list[int] = []
