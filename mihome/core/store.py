@@ -29,7 +29,6 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from .api import (
-    DEVICE_MSG_LIMIT,
     Client,
     HomeNode,
     PropRef,
@@ -39,6 +38,9 @@ from .api import (
     explain,
 )
 from .catalog import CardSpec, build_card, summary_line
+from .events import DeviceEvent
+from .events import parse as parse_events
+from .events import sources as event_sources
 from .geek import Entry as GeekEntry
 from .geek import GeekError
 from .geek import candidates as geek_candidates
@@ -952,29 +954,33 @@ class Store:
             ),
         )
 
-    def fetch_device_messages(
+    def fetch_device_events(
         self,
         did: str,
-        done: Callable[[list[Message] | None, BaseException | None], None],
-        *,
-        limit: int = DEVICE_MSG_LIMIT,
+        done: Callable[[list[DeviceEvent] | None, BaseException | None], None],
     ) -> None:
-        """某一台设备的消息记录（``/v2/message/v2/list``）。
+        """某一台设备的**事件最近一次**（``/miotspec/event/get``）。
 
-        给详情页左下角「消息记录」用：只读、**不挂轮询**，打开才读一次。不按家庭过滤
-        ——这台设备本来就只属于一个家庭，问的是"它自己发生过什么"。
-        ``limit`` 是上限而不是页大小：这个接口没有游标，拿不到更早的（见
-        ``Client.device_messages``）。
+        给详情页左下角用：只读、**不挂轮询**，打开页面读一次。事件源来自这台设备的
+        规格（``spec.events()``），所以"有没有东西可看"取决于规格而不是"云端推不推
+        通知"——本机 55 台里 35 台有事件源，比消息中心覆盖面大得多。
+
+        规格里一个事件都没有时**不发请求**，直接回调空表：那不是失败，只是这台设备
+        没有事件可报。真失败（网关返回错误码 / 网络断）走 ``error``，界面显示"读取失败"。
         """
+        st = self.devices.get(did)
+        spec = st.spec if st is not None else None
+        srcs = event_sources(spec)
+        if not srcs:
+            done([], None)
+            return
         self.worker.submit(
-            self.client.device_messages,
-            (did, limit),
+            self.client.device_events,
+            (did, srcs),
             priority=PRIORITY_DATA,
-            label="device-messages",
+            label="device-events",
             callback=lambda payload, error: done(
-                None
-                if error is not None
-                else parse_messages(payload, self.message_names()),
+                None if error is not None else parse_events(payload, spec),
                 error,
             ),
         )

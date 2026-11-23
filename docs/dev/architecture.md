@@ -401,6 +401,7 @@ mihome/
     tree.py     64 条设备条目 → 56 台真机（多键面板的虚拟子设备折叠）
     prefs.py    用户偏好：排序、隐藏（设备 / 场景，含首页分组折叠）、家庭标签样式、卡片样式、上次页面与房间、顶栏三块显隐（prefs.json）
     messages.py 消息中心：云端通知记录归一化（只读，不标已读 / 不删除）
+    events.py   设备事件：`/miotspec/event/get` 归一化（最近一次 + 参数翻中文），纯函数
     icons.py    产品图缓存
     paths.py    数据目录约定
     single_instance.py 单实例：命名互斥量 + 注册消息广播（不依赖 QtNetwork），再启动只把已有窗口叫到前台
@@ -458,7 +459,6 @@ mihome/
     inline_toast.py 主窗口内的提示浮层（按右栏内容区定位，ok / fail 两档）
     messages_popup.py 顶栏「消息」胶囊的悬停浮层（不是对话框）：Enter/Leave + 260ms 收起、
                     Esc 关闭、当前家庭过滤、60 秒缓存；高度显式算（不靠 sizeHint）；只读
-    device_messages.py 详情页左下角「消息记录」窗：单设备最近一批（type 6 + 11 合并），只读
     widgets.py      流式布局、图标缓存、文本绘制、切换开关
     wheel_guard.py  滚轮护栏：滚轮只滚页面，不改设备参数（WheelSafe / SafeSlider）
 scripts/

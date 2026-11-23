@@ -600,7 +600,10 @@ def parse_raw(raw: dict[str, Any], source: str = "cloud", fetched_at: int = 0) -
                 urn=e.get("type", ""),
                 description=e.get("description", "") or "",
                 comment=e.get("comment", "") or "",
-                arg_piids=_as_piids(e.get("argument")),
+                # 真实 spec 里字段名是 **复数** ``arguments``（2026-11-23 抽查 49 份缓存
+                # 规格，无一份带单数 ``argument``）。只读单数会让所有事件参数静默为空，
+                # 于是"锁事件"只剩一个名字、参数 pid 全丢。两种都认，兼容旧缓存。
+                arg_piids=_as_piids(e.get("arguments") or e.get("argument")),
             )
             for e in (s.get("events") or [])
         ]

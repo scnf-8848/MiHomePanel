@@ -86,12 +86,9 @@ SUCCESS_CODES: frozenset[int] = frozenset({0, 1})  # 上游把 0/1 都当成功
 DEFAULT_CHUNK = 300
 DEFAULT_MUTE = 3.0  # 写入后忽略回读的秒数
 
-#: 单设备消息（``/v2/message/v2/list``）一次要多少条。这个接口没有游标，"要多少"
-#: 就是"最多能拿到多少"，实测 20 与 50 返回同一批 6 条，给 50 只是不想自己卡住自己。
-DEVICE_MSG_LIMIT = 50
-#: 单设备消息要问的类型：6 = 设备消息、11 = 设备离线。``type`` 是**必填**，
-#: 少传一个就是 ``-8 invalid param``；没有的类型只会回空数组，试一下不花钱。
-DEVICE_MSG_TYPES: tuple[int, ...] = (6, 11)
+#: 一次 ``event/get`` 最多带几个事件源。实测一台门锁 26 个源、一次请求 100ms 内回来；
+#: 给 50 是留余量，同时保证真遇到几百个源的设备也不会把请求撑爆（超了自动分片）。
+EVENT_CHUNK = 50
 
 #: 请求语言。**必须显式指定**，不能交给 mijiaAPI 去猜——见 :func:`apply_locale`。
 API_LOCALE = "zh_CN"
@@ -986,40 +983,49 @@ class Client:
             ret = self._api._request("/v2/message/v2/typelist", data)
         return ret if isinstance(ret, dict) else {}
 
-    def device_messages(self, did: str, limit: int = DEVICE_MSG_LIMIT) -> dict[str, Any]:
-        """某台设备的消息记录（``POST /v2/message/v2/list``），合并后返回同一个形状。
+    def device_events(
+        self,
+        did: str,
+        sources: Iterable[tuple[int, int]],
+        *,
+        chunk: int = EVENT_CHUNK,
+    ) -> list[dict[str, Any]]:
+        """读一台设备若干事件源的**最近一次**（``POST /miotspec/event/get``）。
 
-        **``type`` 是必填**：2026-11-23 实测不传直接 ``-8 invalid param``。所以按已知
-        的设备类类型各问一次（``6`` 设备消息、``11`` 设备离线），谁返回就并起来；某一种
-        出错不算整体失败，两种都失败才抛（``error`` 交给界面显示"读取失败"）。
+        ``sources`` 是 ``[(siid, eiid)]``，来自设备规格（``spec.events()``）；除 `did`
+        以外的字段**必须**包在 ``{"params": [...]}`` 里，直接传顶层数组或单个 dict 都会
+        被 `-8` 拒。一次请求能带几十个源，所以按 ``chunk`` 分片、串行发完再合并。
 
-        ``timestamp`` 只认 ``0``：传"现在"或最早一条的 ``ctime`` 都返回**空数组**，
-        也就是说**没有翻页**——同一台设备实测最近 6 条跨 5.5 天，``limit`` 20 与 50
-        返回一模一样（见 ``docs/reference/mihome-pc-unofficial.md`` §4.5）。
+        返回云端原始条目：每条带 ``siid / eiid / code / value / updateTime``。
+        ``value`` 是**字符串**，里面才是 ``[{piid, value}]``；``code == -9`` 表示
+        "从来没发生过"，属于正常结果，不是失败——归一化交给 :mod:`mihome.core.events`。
 
-        **只读**：``force_read`` 恒 ``False``，不标已读、不删除。
+        整体失败（网关返回 code、结构不对）**抛异常**，由 ``core/jobs.py`` 转成回调的
+        ``error``：界面据此显示"读取失败"，而不是显示成"没有记录"——那两件事用户看到
+        的处理方式不一样。
+
+        **只读**：这个接口没有写入口，也不该有。
         """
+        items = [
+            {"did": did, "siid": int(siid), "eiid": int(eiid)} for siid, eiid in sources
+        ]
+        if not items:
+            return []
         rows: list[dict[str, Any]] = []
-        errors: list[BaseException] = []
-        with self._lock:
-            for kind in DEVICE_MSG_TYPES:
-                data = {
-                    "did": did,
-                    "type": int(kind),
-                    "timestamp": 0,
-                    "limit": int(limit),
-                    "force_read": False,
-                }
-                try:
-                    ret = self._api._request("/v2/message/v2/list", data)
-                except Exception as exc:  # noqa: BLE001  一种类型炸了不影响另一种
-                    errors.append(exc)
-                    continue
-                got = ret.get("messages") if isinstance(ret, dict) else None
-                rows.extend(r for r in (got or []) if isinstance(r, dict))
-        if errors and len(errors) == len(DEVICE_MSG_TYPES):
-            raise errors[0]
-        return {"messages": rows}
+        step = max(1, int(chunk))
+        for start in range(0, len(items), step):
+            with self._lock:
+                ret = self._api._request(
+                    "/miotspec/event/get", {"params": items[start : start + step]}
+                )
+            if isinstance(ret, Mapping):
+                # 整体失败：云端把错误码放在顶层，而不是逐条
+                code = int(ret.get("code") or -1)
+                raise APIError(code, str(ret.get("message") or "事件读取失败"))
+            if not isinstance(ret, list):
+                raise APIError(-1, f"事件响应结构异常（{type(ret).__name__}）")
+            rows.extend(dict(r) for r in ret if isinstance(r, Mapping))
+        return rows
 
     # -- 杂务 ------------------------------------------------------------
     def flush(self) -> None:
@@ -1031,8 +1037,7 @@ __all__ = [
     "CapabilityBook",
     "Client",
     "DEFAULT_CHUNK",
-    "DEVICE_MSG_LIMIT",
-    "DEVICE_MSG_TYPES",
+    "EVENT_CHUNK",
     "HomeNode",
     "PropRef",
     "ReadValue",

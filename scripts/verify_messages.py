@@ -194,10 +194,9 @@ def test_client() -> None:
 
 
 class _Sub:
-    """``Store.fetch_messages`` / ``fetch_device_messages`` 用到的那几样。"""
+    """``Store.fetch_messages`` 用到的那几样。"""
 
     devices: dict = {}
-    last_dev_call: list = []
 
     class worker:
         @staticmethod
@@ -208,13 +207,6 @@ class _Sub:
         @staticmethod
         def messages(limit: int):
             return PAYLOAD
-
-        @classmethod
-        def device_messages(cls, did: str, limit: int):
-            _Sub.last_dev_call.append((did, limit))
-            return {"messages": [
-                record("51", 6, "这台设备的历史", content="", did=did, when=NOW),
-            ]}
 
     @staticmethod
     def message_names():
@@ -236,10 +228,6 @@ def test_store_home() -> None:
     Store.fetch_messages(sub, lambda items, err: seen.append((items, err)), home="9")  # type: ignore[arg-type]
     check("别家的全被滤掉", len(seen[0][0] or []), 0)
 
-    seen.clear()
-    Store.fetch_device_messages(sub, "d1", lambda items, err: seen.append((items, err)))  # type: ignore[arg-type]
-    check("单设备取数把 did / limit 传下去", _Sub.last_dev_call, [("d1", 50)])
-    check("单设备回调拿到 1 条", (len(seen[0][0] or []), seen[0][1]), (1, None))
 
 
 # -- 4. 浮层 -------------------------------------------------------------
@@ -386,112 +374,6 @@ def test_popup() -> None:
     app.processEvents()
 
 
-class FakeListApi:
-    """``Client.device_messages`` 用：按 type 返回不同的一批。"""
-
-    locale = "zh_CN"
-
-    def __init__(self, rows_by_type: dict[int, list[dict]]) -> None:
-        self.rows_by_type = rows_by_type
-        self.calls: list[tuple[str, dict]] = []
-        self.fail: set[int] = set()
-
-    def _request(self, path: str, data: dict) -> dict:
-        self.calls.append((path, data))
-        if data.get("type") in self.fail:
-            raise RuntimeError("boo")
-        return {"messages": self.rows_by_type.get(int(data.get("type")), [])}
-
-
-def test_device_client() -> None:
-    print("\n11) Client.device_messages：type 必填、两种类型合并、一种炸了不算失败")
-    api = FakeListApi({
-        6: [record("61", 6, "门锁开了", did="d1", when=NOW)],
-        11: [record("62", 11, "设备离线", did="d1", when=NOW - 60)],
-    })
-    client = Client(api=api)  # type: ignore[arg-type]
-    out = client.device_messages("d1", 50)
-    check("两种类型各问一次", [c[1]["type"] for c in api.calls], [6, 11])
-    check("都问同一个 did", {c[1]["did"] for c in api.calls}, {"d1"})
-    check("timestamp 只认 0", {c[1]["timestamp"] for c in api.calls}, {0})
-    check("只读：force_read 恒 False", {c[1]["force_read"] for c in api.calls}, {False})
-    check("路径", {c[0] for c in api.calls}, {"/v2/message/v2/list"})
-    check("两批合起来", sorted(r["msg_id"] for r in out["messages"]), ["61", "62"])
-
-    api.fail = {11}
-    out2 = client.device_messages("d1")
-    check("一种类型炸了，另一种照给", [r["msg_id"] for r in out2["messages"]], ["61"])
-
-    api.fail = {6, 11}
-    raised = ""
-    try:
-        client.device_messages("d1")
-    except RuntimeError as exc:
-        raised = str(exc)
-    # 两种都失败才算失败：界面据此显示"读取失败"，而不是冒充"没有记录"
-    check("两种都失败才抛", raised, "boo")
-
-
-def test_device_dialog() -> None:
-    print("\n12) 设备消息记录窗：固定高度、只读、失败与空分开")
-    from types import SimpleNamespace  # noqa: PLC0415
-
-    from PySide6.QtWidgets import QApplication  # noqa: PLC0415
-
-    from mihome.ui import device_messages as D  # noqa: PLC0415
-    from mihome.ui import theme  # noqa: PLC0415
-    from mihome.ui.detail import DetailDialog  # noqa: PLC0415
-
-    app = QApplication.instance() or QApplication(sys.argv)
-    rows = M.parse(PAYLOAD, NAMES)
-
-    class Store2:
-        active_home = "1"
-
-        def __init__(self, items, error=None) -> None:
-            self.items = items
-            self.error = error
-            self.calls: list[tuple[str, int]] = []
-
-        def fetch_device_messages(self, did, done, *, limit=50) -> None:
-            self.calls.append((did, limit))
-            done(None, self.error) if self.error else done(list(self.items), None)
-
-    state = SimpleNamespace(did="d1", name="洗衣机")
-    st = Store2(rows)
-    dlg = D.DeviceMessagesDialog(st, state, theme.LIGHT)
-    check("构造时还没请求", st.calls, [])
-    dlg.show()
-    app.processEvents()
-    check("显示后读一次，带 did", st.calls, [("d1", 50)])
-    check("列表高度是钉死的", dlg.list.scroll.height(), D.LIST_H)
-    check("摘要写条数", dlg.list.summary.text(), "3 条消息")
-    check("窗口宽度固定", dlg.width(), D.WIDTH + 2 * D.SHADOW_PAD)
-    check_true("只读：没有已读 / 删除按钮",
-               not [b for b in dlg.findChildren(object)
-                    if callable(getattr(b, "text", None))
-                    and str(getattr(b, "text")()).strip() in ("全部已读", "标为已读", "删除")])
-    dlg.close()
-
-    bad = D.DeviceMessagesDialog(Store2([], error=RuntimeError("网络断了")), state, theme.LIGHT)
-    bad.show()
-    app.processEvents()
-    check("失败态摘要", bad.list.summary.text(), "读取失败")
-    bad.close()
-
-    empty = D.DeviceMessagesDialog(Store2([]), state, theme.LIGHT)
-    empty.show()
-    app.processEvents()
-    check("空态摘要", empty.list.summary.text(), "还没有记录")
-    empty.close()
-
-    # 详情页左下角：入口换成「消息记录」，隐藏按钮撤掉
-    check_true("详情页有 _open_messages（左下角那颗按钮接的）",
-               callable(getattr(DetailDialog, "_open_messages", None)))
-    check_true("详情页不再有 _toggle_hidden（隐藏改在卡片右键）",
-               not hasattr(DetailDialog, "_toggle_hidden"))
-
-
 def test_header() -> None:
     print("\n10) 顶栏：消息在右侧、搜索框已撤、点击也能浮出")
     from PySide6.QtWidgets import QApplication  # noqa: PLC0415
@@ -550,8 +432,6 @@ def main() -> int:
     test_store_home()
     test_popup()
     test_header()
-    test_device_client()
-    test_device_dialog()
     print()
     if FAILS:
         print(f"共 {len(FAILS)} 项失败：")
