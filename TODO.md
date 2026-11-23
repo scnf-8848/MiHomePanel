@@ -19,7 +19,7 @@
 > **监控页已落地**（2026-11-19）：三种入口都接了页面，「功能区收尾」只剩图标 / 排布 /
 > 常驻这些视觉待定，不再占 A 段条目，见「最近完成」。
 
-## B. 待排期：想法已记、明确暂不做（7 条）
+## B. 待排期：想法已记、明确暂不做（8 条）
 
 - **插件文案 / 故障码运行时拉取**（2026-11-23 记，来源：同类项目对照）：按 `model` 后台拉
   插件包，解 `value-list` 文案与 `fault` 表缓存到 `<data>/cache/plugin/`，UI 优先用它、查不到
@@ -36,6 +36,14 @@
   会显示"全部离线"却分不清是设备关机还是网断了。设备档案里存 `ip`（列表里就有），偶发
   TCP connect 一次即可区分；失败面很小，但别挂进 3 s 轮询
   → [mihome-pc-unofficial.md](docs/reference/mihome-pc-unofficial.md) §4.3
+- **消息中心（只读）**（2026-11-23 记，同源）：侧栏「消息 N」+ 列表页（类型筛选 / 未读点 /
+  相对时间）+ 设备详情一张"最近几条"卡。列表走 `/v2/message/v2/typelist`，单设备走
+  `/v2/message/v2/list`（必带 `did`）。**先只读**——标已读 / 删除是写账号数据，要动先问。
+  三条坑别重踩：`list` 的 `timestamp` 传"现在"返回空、传 `0` 才给最新那批（所以只有
+  "最近 N 条"，没有翻页）；`batch_read_msg` 按 `did` 分组，没 `did` 的场景通知标不了；
+  `typelist` 没有游标。**它和 `poll_events` 不是一套东西**：那是 `/miotspec/event/get`
+  的单台设备"最近一次事件"，做触发用；消息中心是账号级记录，两条通道别合并
+  → [mihome-pc-unofficial.md](docs/reference/mihome-pc-unofficial.md) §4.5
 - **多账号**：超出米家原版；方案已写（`<data>/accounts/<uid>/auth.json` + 换 Client 重建
   Store），注意 `capabilities` / `icons` / `prefs` 按账号隔离
   → [历史快照 · 待排期](docs/archive/todo-2026-11-15-full.md)
