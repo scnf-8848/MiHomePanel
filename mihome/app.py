@@ -11,8 +11,7 @@ from pathlib import Path
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import QApplication
 
-from .core import autostart
-from .core.applog import install_qt_handler
+from .core import applog, autostart
 from .core.single_instance import SingleInstance, focus_window
 from .ui import app_icon, fonts, theme
 from .ui.main_window import MainWindow
@@ -546,6 +545,13 @@ def main() -> int:
         ns = parser.parse_args(args)
         return probe_camera(rounds=ns.rounds, lane=ns.lane, timeout=ns.timeout)
 
+    # Windows 系统通知（后台提醒 / 收进托盘那条气泡）头部的图标取自 AUMID 的
+    # IconUri，不是托盘图标——不显式注册的话 Windows 会按 exe 路径生成一个
+    # "第一次弹通知时的图标快照"，换图标后一直显示旧的。必须在建窗口、挂托盘
+    # 之前做，所以放在 QApplication 之前；源码运行与打包版走同一条路径。
+    if not app_icon.install_notification_identity("米家控制台"):
+        applog.log("tray", "通知身份（AUMID）没注册上，系统通知会退回按 exe 生成的图标")
+
     QApplication.setHighDpiScaleFactorRoundingPolicy(
         Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
     )
@@ -555,7 +561,7 @@ def main() -> int:
     # 窗口化的 exe 没有控制台，Qt 的 qWarning 一直是"写完就没了"（2026-11-21 查
     # 托盘图标查不出来，就是因为最关键的那句提示被吞掉了）。装一个 handler 落
     # logs/qt.log，代价只有几条文件写入。
-    install_qt_handler()
+    applog.install_qt_handler()
     app.setApplicationName("米家控制台")
     app.setApplicationDisplayName("米家控制台")
     app.setOrganizationName("MiHomePanel")

@@ -300,13 +300,20 @@ class DesktopWidget(QWidget):
         top = self._content_top()
         self._scroll = max(0, min(self._scroll, self._max_scroll()))
         view = self._viewport_rows()
+        # 面板最小宽 MIN_W=200 比单列内容（158）宽 42：以前卡片固定从 PANEL_PAD 左对齐，
+        # 多出来的 42 px 全堆在右侧，单列时右留白明显大于左（用户 2026-11-23 指出）。
+        # 把内容块在左右留白之间居中，多出来的宽度平分两侧；≥2 列时面板宽正好等于内容
+        # 宽 + 2*PANEL_PAD，偏移量为 0，布局与以前完全一致。
+        content_w = CARD_W * cols + GAP * (cols - 1)
+        inner = self.width() - PANEL_PAD * 2
+        x0 = PANEL_PAD + max(0, (inner - content_w) // 2)
         for index, card in self._cards.items():
             row, col = divmod(index, cols)
             rel = row - self._scroll
             visible = 0 <= rel < view
             card.setVisible(visible)
             if visible:
-                x = PANEL_PAD + col * (CARD_W + GAP)
+                x = x0 + col * (CARD_W + GAP)
                 y = top + rel * (CARD_H + GAP)
                 card.move(x, y)
 
