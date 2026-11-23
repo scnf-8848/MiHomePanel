@@ -19,8 +19,23 @@
 > **监控页已落地**（2026-11-19）：三种入口都接了页面，「功能区收尾」只剩图标 / 排布 /
 > 常驻这些视觉待定，不再占 A 段条目，见「最近完成」。
 
-## B. 待排期：想法已记、明确暂不做（4 条）
+## B. 待排期：想法已记、明确暂不做（7 条）
 
+- **插件文案 / 故障码运行时拉取**（2026-11-23 记，来源：同类项目对照）：按 `model` 后台拉
+  插件包，解 `value-list` 文案与 `fault` 表缓存到 `<data>/cache/plugin/`，UI 优先用它、查不到
+  再退 `core/enum_text.py` 的三层人工短名。**包不随发行版分发**（只缓存本地），体积零增加，
+  换来没见过的型号也能显示中文。代价：多一次后台请求，覆盖率取决于云端给不给包
+  → [mihome-pc-unofficial.md](docs/reference/mihome-pc-unofficial.md) §4.1
+- **云端管理：房间 CRUD / 设备搬家**（同一天记，可行性已由同类项目验证）：写接口能通
+  （新建 / 改名 / 删除 / 搬家都做了）。**同时记下三条做不了的**：场景与定时**新建**要先有
+  一条同类对象当模板（`sc_id` 校验，手拼 `-998`）；自动化任意触发**做不到**
+  （spec-scene 表不存在于任何可得数据源）；房间排序服务端不支持（`-8 invalid homeid`）。
+  要动先读结论，别重推一遍
+  → [mihome-pc-unofficial.md](docs/reference/mihome-pc-unofficial.md) §4.4
+- **在线判定加局域网 TCP 探测**：现在只认云端 `isOnline`（15 s 重读清单），家里断网时
+  会显示"全部离线"却分不清是设备关机还是网断了。设备档案里存 `ip`（列表里就有），偶发
+  TCP connect 一次即可区分；失败面很小，但别挂进 3 s 轮询
+  → [mihome-pc-unofficial.md](docs/reference/mihome-pc-unofficial.md) §4.3
 - **多账号**：超出米家原版；方案已写（`<data>/accounts/<uid>/auth.json` + 换 Client 重建
   Store），注意 `capabilities` / `icons` / `prefs` 按账号隔离
   → [历史快照 · 待排期](docs/archive/todo-2026-11-15-full.md)
@@ -53,7 +68,13 @@
   真要加先读 [布局调研](docs/reference/camera-wall-layout.md) 的约束
   → [监控页](docs/dev/ui.md)
 
-## C. 技术债 / 维护项（5 条）
+## C. 技术债 / 维护项（6 条）
+
+- **设备列表单页 200 条上限**（2026-11-23 记）：`api.py` 的 `/home/home_device_list` 只请求
+  `limit=200`、不翻页，注释写的是"设备数 64 条远小于单页 200"。**超过 200 台的账号会静默
+  少设备**（同类项目把这条列进已知限制，也没解）。低成本处置：返回条数正好 200 时打一行
+  警告进日志 + 顶栏状态里标一个"列表可能不全"，别悄悄少一台设备还当它在
+  → [mihome-pc-unofficial.md](docs/reference/mihome-pc-unofficial.md) §6
 
 - **耗材属性清单会混进「档位 / 模式」类整数**（2026-11-18 提，11-19 查清，**结论：不做**）：
   `_numeric_props` 收 `readable` 且 `kind in (number, range)`，而**49 份缓存规格里 401 个
