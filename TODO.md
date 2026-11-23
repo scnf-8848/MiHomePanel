@@ -720,7 +720,7 @@
   ④ 故障码部分本就不做（连展示路径都没有），不计入本次否决的主线理由。
   **唯一保留的可能**：某个具体型号的 spec 注释确实坏了时，单独做一次离线提取、
   人工审核后补进三层表；**不做通用流水线、不在运行时依赖插件接口**。
-  依据：[mijia-api-ecosystem-research.md](2026-11-23/mijia-api-ecosystem/outputs/mijia-api-ecosystem-research.md) §3.9、§3.10。
+  依据：[mijia-api-ecosystem-research.md](docs/reference/mijia-api-ecosystem-research.md) §3.9、§3.10。
 - **能源 / 能耗历史 + 全屋温湿度历史曲线**（2026-11-23 用户拍板**否决**）：
   `/v2/user/statistics` 实测可用，但覆盖面撑不起一个页面，做出来只会误导——
   ① 能耗：自有家庭 55 台设备，7 天窗口只有 4 台插座 + 2 台空调返回耗电数据，其余全部
@@ -731,7 +731,7 @@
   （同型号插座量级从 `[69]` 到 `[46074, 46216]` 不等，需用米家 App 同窗口数值做型号级
   校准）；**单次最多 300 点**（`limit=500/0` 都被夹到 300，可用 `time_end` 往前翻页）；
   **返回空不等于没数据**（有设备近 90 天为空、3 年窗口能取到历史）。
-  依据：[mijia-api-ecosystem-research.md](2026-11-23/mijia-api-ecosystem/outputs/mijia-api-ecosystem-research.md) §3.3。
+  依据：[mijia-api-ecosystem-research.md](docs/reference/mijia-api-ecosystem-research.md) §3.3。
 - **耗材页的顶栏警告条 / 托盘气泡 / 跨阈值只提醒一次 + 回升自动解除**（2026-11-18
   用户定不做）：轻重提示只由侧栏「耗材」入口的两个计数圆点表达（灰轻 / 红重），
   将来可能把圆点也带到桌面挂件上——那只是多一个显示位置，**不开新的提醒通道**。

@@ -60,6 +60,7 @@
 
 | 文档              | 研究的问题       | 为什么排除                        |
 | --------------- | ----------- | ---------------------------- |
+| [mijia-api-ecosystem-research.md](mijia-api-ecosystem-research.md) | 米家第三方接口生态全图 + 未使用能力逐项评估（事件轮询 / 统计接口 / 插件包 / 云端写接口 / 中枢本地 MQTT） | **统计历史与插件文案运行时拉取已否决**：统计接口只覆盖少数计量设备（7 天窗口仅 4 台插座 + 2 台空调有耗电，温湿度只有独立传感器有），插件包与 spec 非 1:1 映射且专有内容不可分发；云端写接口可行但暂不排期。2026-11-23 调研，**不要重开**，先看原文 §3 |
 | [card-frosted-glass.md](card-frosted-glass.md) | 卡片磨砂玻璃（背景模糊）怎么做、值不值得 | **当前形态看不见，放弃**。卡片本来就是半透明（`card_alpha` 0.76～0.90 压在窗口自绘背景上），而背景只有纯色 / 渐变——离屏实测模糊前后最大差：纯色 **0/255**、渐变 **1～3/255**，等于没做；有细节的图才有 20+ /255。**截图 + 模糊那条路另有结构性缺陷**：卡片父链不画底色，`grab()` 拿不到纯背景（抓顶层窗口会把卡片自己糊进去），逐帧成本几十 ms、缓存后滚动错位。**2026-11-15 用户定不做**（不是"暂缓"）。**万一将来非做不可**（先有「自选图片壁纸」或卡片背后有实时画面），唯一形态是「模糊背景源 + 卡片按 `mapTo` 取切片」，模糊只算一次、每卡一次 blit；系统级 API（Win11 Mica / Acrylic）只能整窗糊桌面壁纸，与 24 预设的设计相反，不采用 |
 | [font-swap.md](font-swap.md) | 13 px 下的「笔画毛刺」能不能靠换字体解决、要花多少 | **B 案（换字体）2026-11-17 用户定不做，已闭环**：毛刺是 ClearType 子像素彩边，雅黑 / MiSans / Noto 一样脏，换字体只改字形、彩边一个字都修不了。真正有效的是换字体引擎，**A 案 11-16 已落地**（`ui/fonts.py`，彩边 176→9、布局零位移，`MIHOME_FONT_ENGINE=default` 可退回，回归 `scripts/verify_fonts.py`），落地后灰度字已能接受，"换不换字形"不再排期；子集体积与许可成本只作技术备忘 |
 | [process-poll-vs-wmi.md](process-poll-vs-wmi.md) | 「某程序」触发每秒轮询程序名会不会拖慢电脑、WMI 事件订阅能不能避免轮询 | **换 WMI 是倒退，不是优化**：现役 Toolhelp32 快照本机实测 6.7 ms/次；免管理员的 `__InstanceCreationEvent WITHIN 1` 本质仍是每秒快照，微软实测单订阅让 WMI 服务吃 5.8%–7% CPU；真事件型 `Win32_ProcessStartTrace` / ETW **要管理员**，与项目「非管理员」承诺冲突。**11-19 已落地**：采样进 `QThread`（主线程零读进程表）+ 间隔 1s→2s（0.67%→0.34% 单核，用户接受漏 2s 内短命进程） | `core/automation/process_sampler.py`（worker）、`service.py`（`PROCESS_POLL_MS` / `_on_process_sample`）、`pc_state.py`；探针 `scripts/probe_process_poll.py`；验证 `verify_automation_process.py` |
@@ -88,7 +89,7 @@
   要统计只能在程序里自己攒。这与统计接口那条结论无关：那个接口只覆盖少数计量设备，已否决。
 - **温湿度 / 能源历史有没有云端接口**：**已查（2026-11-23）：可用但覆盖不足**——7 天窗口只有  
   4 台插座 + 2 台空调有耗电统计，温湿度只有独立传感器（`linp.sensor_ht.ks2bb`）有，  
-  **已否决、不再作为待查项**。依据：[调研报告 §3.3](../../2026-11-23/mijia-api-ecosystem/outputs/mijia-api-ecosystem-research.md)。
+  **已否决、不再作为待查项**。依据：[调研报告 §3.3](mijia-api-ecosystem-research.md)。
 - **极客版常驻会话**（ECJPAKE + AES-GCM，程序内直接登录、不再显示码）：技术上可行，  
   工作量明显更大，`mijia-geek-login-code.md` 第 5 节 C 档，**暂不做**。
 - **风扇两个速度属性在"错"的模式下写会怎样**：直吹风写 `fan-level`、自然风写
