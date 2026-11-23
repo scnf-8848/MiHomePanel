@@ -356,8 +356,8 @@ def test_fit() -> None:
         win._fit_climate()  # noqa: SLF001
         app.processEvents()
         check_true("最小宽度下没压住搜索框",
-                   win.climate.geometry().right() <= win.search.geometry().x(),
-                   f"{win.climate.geometry().right()} vs {win.search.geometry().x()}")
+                   win.climate.geometry().right() <= win.btn_messages.geometry().x(),
+                   f"{win.climate.geometry().right()} vs {win.btn_messages.geometry().x()}")
         # 这个宽度在回退字体下两颗都放不下，整块收起也算对；关键是**不许压住搜索框**
         check_true("放不下时按顺序收：要么只剩温度、要么整块收起",
                    (not win.climate.isVisible())
@@ -386,8 +386,8 @@ def test_fit() -> None:
                    win.climate.isVisible() and win.climate.hum.isVisible(),
                    f"{win.width()} vs 需要 {need_one}")
         check_true("关掉的那颗没算进所需宽度",
-                   win.climate.geometry().right() <= win.search.geometry().x(),
-                   f"{win.climate.geometry().right()} vs {win.search.geometry().x()}")
+                   win.climate.geometry().right() <= win.btn_messages.geometry().x(),
+                   f"{win.climate.geometry().right()} vs {win.btn_messages.geometry().x()}")
         win.climate.set_shown("temperature", True)
     finally:
         win.close()

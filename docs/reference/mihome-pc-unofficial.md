@@ -134,6 +134,27 @@
    会一直显示未读——他们会如实写进限制，不会假装成功。
 3. `typelist` 没有游标，列表条数上限就是 `limit`，更早的消息看不到。
 
+**我们自己实测（2026-11-23，本机账号只读探针，未写任何账号数据）**——三条都给死了：
+
+- `typelist`：不管传什么都是**同样的 6 条**（5 条 `type=6` 设备消息 + 1 条 `type=13`
+  场景通知）。`limit`（5 / 30 / 100）、`type`、`home_id`、`timestamp`（0 / 现在 / 最早一条
+  的 `ctime`）、`offset` **全部无效**——参数收下但不参与筛选，也没有游标。所以"每类只显示
+  最新一条"是接口本身的行为，不是 App 前端截的。
+- `list`（单设备）：`timestamp=0` 给该设备**最近一批** 6 条、跨 5.5 天，`limit=20` 与
+  `limit=50` 返回一模一样；`timestamp=now` 或 `timestamp=最早那条的 ctime` 一律**空数组**
+  → **没有向后翻页这回事**，和上面第 1 坑一致。
+- 每条记录都带整数 `home_id`（还有 `home_owner` / `uid` / `sender_uid` / 整数 `msg_id` /
+  `type` / `title` / `content` / `img_url` / `params` / `is_new` / `status` / `ctime`(unix 秒) /
+  `last_modify`）→ **可以按家庭过滤**，我们就是这么做的；缺 `home_id` 的记录照旧显示。
+- App 里的「智能日志」（场景历史）**拿不到**：插件 SDK 只暴露原生宿主方法
+  `loadScenesHistoryForDevice(did, timestamp=-1, limit≤50)`（SDK 10010 起），**JS 源码里
+  没有对应的 URL**；照着命名猜的 `GetSceneHistory` / `GetSceneLog` / `GetSceneHistoryList` /
+  `GetSceneRecordList` 四个路径全是 **HTTP 404 `Not Found`**（要用裸 `session.post` 才看得见
+  ——过 mijiaAPI 的解密包装会变成 `BadGzipFile`，容易误判成"接口存在但解不开"）。
+  点设备消息进的那一页本质就是上面的 `list`。
+
+所以真要"历史"，只能做"单设备最近一批"，做不出"按类型往回翻"或"场景日志"。
+
 **要接的话**：别塞进 `poll_events`——那是"单台设备最近一次事件"的语义，
 `PollDemandBoard` 的假设对不上。新开一块 `poll_messages`（`idle_ms=None`，只在打开消息页 /
 侧栏角标需要时登记），45 s 一档就够（对方就是这么做的，且页面不可见时跳过）。
@@ -158,7 +179,9 @@
 ## 7. 待办
 
 - 选做：插件文案运行时拉取（§4.1）→ `TODO.md` B 段
-- 选做：消息中心只读页（§4.5，先只读、不碰已读/删除）→ `TODO.md` B 段
+- 已落地：消息中心只读浮层（§4.5，悬停浮出、当前家庭、不碰已读/删除）→ `TODO.md`「最近完成」
+- **待用户拍板**：要不要做「单设备最近一批」的历史页（§4.5 末段，其余三类历史都取不到）
+  → `TODO.md` B 段
 - 选做：可用性记忆 / 置灰（§4.2）、局域网 TCP 探测（§4.3）→ `TODO.md` B / C 段
 - 只记结论不开工：场景 / 定时新建要模板、自动化任意触发做不到、房间排序服务端不支持（§4.4）
 - 一条警示：设备列表 >200 台会静默缺设备（`TODO.md` C 段），两家都还没解

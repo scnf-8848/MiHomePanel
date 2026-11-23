@@ -11,14 +11,23 @@
 - ``/miotspec/event/get``（``poll_events`` 留给它的位置）读的是**单台设备的最近一次
   事件**，只有一份、读完被覆盖，用来做触发，不能回看也不能计数。
 
-接口形状来自同类项目的真机实测（``docs/reference/mihome-pc-unofficial.md`` §4.5）：
+接口形状是 2026-11-23 用只读探针在本机账号上实测的
+（探针结论记在 ``docs/reference/mihome-pc-unofficial.md`` §4.5）：
 
-- ``typelist`` 返回 ``{"messages": [...]}``，**没有游标**，``limit`` 就是上限；
-- 每条带 ``msg_id / type / title / content / did / ctime / is_new``；
-- ``ctime`` 是 **unix 秒**（不是毫秒，别拿 ``time.time()*1000`` 比）。
+- ``typelist`` 返回 ``{"messages": [...]}``，**没有游标**；``limit`` / ``type`` /
+  ``home_id`` / ``timestamp`` 传什么都不改变结果（实测 limit 30 与 100 都只回 6 条：
+  取 5 条设备消息 + 每类 1 条）。这是**账号级"最近几条"**，不是历史列表。
+- 每条带 ``msg_id / uid / type / title / content / img_url / did / params /
+  ctime / is_new / home_id / home_owner``；
+- ``ctime`` 是 **unix 秒**（不是毫秒，别拿 ``time.time()*1000`` 比）；
+- ``home_id`` 是**整数**，每条都有——所以能按当前家庭过滤（见 ``parse(home=...)``）。
+  场景通知没有 ``did``，但同样带 ``home_id``，不会因此漏掉。
 
 已知类型：``6`` 设备消息、``11`` 设备离线、``13`` 场景通知。没见过的类型**保留数字
 和一条中性标签**，不猜——把场景通知误标成设备消息，比显示"消息"更糟。
+
+**不做未读**（2026-11-23 用户定）：``is_new`` 仍然读得到，但界面不显示——我们从
+不标已读，那个点会永远亮着，反而成了噪音。
 """
 
 from __future__ import annotations
@@ -55,7 +64,7 @@ def _int(value: Any) -> int:
 
 @dataclass(frozen=True)
 class Message:
-    """一条通知记录。字段名与云端一致，只有 ``label`` / ``unread`` 是加工出来的。"""
+    """一条通知记录。字段名与云端一致，只有 ``label`` 是加工出来的。"""
 
     msg_id: str
     kind: int
@@ -64,8 +73,8 @@ class Message:
     content: str
     did: str
     device: str
+    home: str
     when: int
-    unread: bool
 
     @property
     def body(self) -> str:
@@ -82,12 +91,21 @@ class Message:
         return text
 
 
-def parse(payload: Any, names: Mapping[str, str] | None = None) -> list[Message]:
+def parse(
+    payload: Any,
+    names: Mapping[str, str] | None = None,
+    *,
+    home: str = "",
+) -> list[Message]:
     """云端 payload → 按时间倒序的 :class:`Message` 列表。
 
     ``names`` 是 ``did → 设备名``，用来把 ``did`` 变成人看得懂的名字；查不到就留空，
     界面只显示时间和类型。脏记录（没有 ``msg_id``、不是 dict）直接丢：没有 id 的
     记录既没法定位也没法去重，留着只会让列表里多一行空白。
+
+    ``home`` 给当前家庭 id 时只留这个家庭的消息。**判断不了家庭的照留**：早期记录
+    或将来接口改字段时 ``home_id`` 可能是空的，宁可多显示一条别家消息，也不要把
+    自己家的消息悄悄藏掉。
     """
     data = payload if isinstance(payload, Mapping) else {}
     known = names or {}
@@ -100,6 +118,9 @@ def parse(payload: Any, names: Mapping[str, str] | None = None) -> list[Message]
             continue
         kind = _int(record.get("type"))
         did = str(record.get("did") or "")
+        msg_home = str(record.get("home_id") or "")
+        if home and msg_home and msg_home != str(home):
+            continue
         rows.append(
             Message(
                 msg_id=msg_id,
@@ -109,8 +130,8 @@ def parse(payload: Any, names: Mapping[str, str] | None = None) -> list[Message]
                 content=str(record.get("content") or "").strip(),
                 did=did,
                 device=known.get(did, "") if did else "",
+                home=msg_home,
                 when=_int(record.get("ctime")),
-                unread=bool(_int(record.get("is_new"))),
             )
         )
     # 云端返回顺序不保证（同一秒内更是随机），按时间倒序排一遍
@@ -119,13 +140,12 @@ def parse(payload: Any, names: Mapping[str, str] | None = None) -> list[Message]
 
 
 def summarise(items: Iterable[Message]) -> str:
-    """标题栏那行小字：``12 条消息 · 3 条未读``；没有未读时不写后半句。"""
+    """标题那行小字：``6 条消息``。
+
+    不写未读数（2026-11-23 用户定）：这里从不标已读，未读数只会一直是"全部未读"。
+    """
     rows = list(items)
-    if not rows:
-        return "没有消息"
-    unread = sum(1 for item in rows if item.unread)
-    head = f"{len(rows)} 条消息"
-    return f"{head} · {unread} 条未读" if unread else head
+    return f"{len(rows)} 条消息" if rows else "没有消息"
 
 
 def ago(seconds: float, *, now: float | None = None) -> str:

@@ -2,7 +2,7 @@
 """离屏截图：启动主窗口，等数据到位后保存成 PNG。
 
 用法：
-  .venv/Scripts/python.exe -X utf8 scripts/shot.py [输出路径] [--dark] [--filter 关键词]
+  .venv/Scripts/python.exe -X utf8 scripts/shot.py [输出路径] [--dark]
 """
 
 from __future__ import annotations
@@ -32,9 +32,6 @@ def main() -> int:
     if args and not args[0].startswith("--"):
         out = Path(args.pop(0))
     dark = "--dark" in args
-    flt = ""
-    if "--filter" in args:
-        flt = args[args.index("--filter") + 1]
 
     app = QApplication(sys.argv[:1])
     app.setStyle("Fusion")
@@ -49,8 +46,6 @@ def main() -> int:
     win.resize(1360, 900)
     win.show()
     win.start()
-    if flt:
-        win.search.setText(flt)
 
     state = {"done": 0}
 

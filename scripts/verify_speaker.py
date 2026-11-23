@@ -684,21 +684,16 @@ def test_main_window(app: QApplication) -> None:
               str(notes))
 
         # -- Esc 先照顾正在输入的那一格 --------------------------------------
-        win.search.setText("abc")
+        # 顶栏搜索框 2026-11-23 撤了，Esc 现在只认"浮层 → 指令条"这个顺序
         win.speaker_bar.input.setEnabled(True)  # 空设备列表下本来是禁用的
         win.speaker_bar.input.setFocus()
         app.processEvents()
         check("焦点确实在指令条里", win.speaker_bar.input.hasFocus())
         win.speaker_bar.input.setText("关灯")
-        win._clear_search()  # noqa: SLF001
-        check("Esc 先清指令条，不动搜索框",
-              win.speaker_bar.input.text() == "" and win.search.text() == "abc",
-              f"{win.speaker_bar.input.text()!r} / {win.search.text()!r}")
-        win._clear_search()  # noqa: SLF001
-        check("再按一次交出焦点",
-              not win.speaker_bar.input.hasFocus() and win.search.text() == "abc",
-              win.search.text())
-        win.search.clear()
+        win._on_escape()  # noqa: SLF001
+        check("Esc 先清指令条", win.speaker_bar.input.text() == "", "")
+        win._on_escape()  # noqa: SLF001
+        check("再按一次交出焦点", not win.speaker_bar.input.hasFocus())
 
         calls.clear()
         off = S.target_for("real", "小爱音箱Pro", "xiaomi-lx06", spec2, online=False)

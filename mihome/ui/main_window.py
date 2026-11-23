@@ -33,7 +33,6 @@ from PySide6.QtGui import QColor, QKeySequence, QPainter, QPainterPath, QShortcu
 from PySide6.QtWidgets import (
     QApplication,
     QHBoxLayout,
-    QLineEdit,
     QMainWindow,
     QStackedWidget,
     QVBoxLayout,
@@ -59,7 +58,7 @@ from .chrome import DimOverlay, TitleBar, WindowFrame, exec_with_dim_click
 from .consumables_page import ConsumablesPage
 from .desktop_widget import DesktopWidget
 from .home_tabs import HomeTabs
-from .messages_dialog import MessageDialog
+from .messages_popup import MessagePopup
 from .monitor_page import MonitorPage
 from .side_nav import SideNav
 from .speaker_bar import SpeakerBar
@@ -311,21 +310,14 @@ class MainWindow(QMainWindow):
         # 连左边那 8px 间距一起消失——间距做在容器内部，不在顶栏上加 addSpacing。
         self.climate = ClimateStrip(self.palette_ref)
         head.addWidget(self.climate)
-        # 消息入口：可点的胶囊。**不挂未读数**——那个数字要一路常驻请求，而这一版
-        # 只做"点开看看有什么"（只读，不标已读）。铃铛和房子/温度计/水滴同一套自绘。
-        head.addSpacing(8)
-        self.btn_messages = ChipButton("消息", self.palette_ref, icon="bell")
-        self.btn_messages.clicked.connect(self._open_messages)
-        head.addWidget(self.btn_messages)
         head.addStretch(1)
 
-        self.search = QLineEdit()
-        self.search.setPlaceholderText("搜索设备    Ctrl+F")
-        self.search.setClearButtonEnabled(True)
-        self.search.setFixedSize(216, 32)
-        # 不抢初始焦点：启动时搜索框带蓝色边框会显得像"待输入"，而且会吞掉快捷键
-        self.search.setFocusPolicy(Qt.ClickFocus)
-        head.addWidget(self.search)
+        # 消息入口：原来这里是搜索框（2026-11-23 撤掉——几十台设备用不上搜索，
+        # Ctrl+F 一并不要，位置让给消息）。**悬停浮出**列表，点击只是"立刻浮出"
+        # 一次（外接鼠标坏了 / 触屏时还能用），实现在 ``ui/messages_popup.py``。
+        self.btn_messages = ChipButton("消息", self.palette_ref, icon="bell")
+        self.btn_messages.clicked.connect(self._show_messages)
+        head.addWidget(self.btn_messages)
         head.addSpacing(12)
 
         self.btn_theme = RoundButton("theme", self.palette_ref)
@@ -334,6 +326,11 @@ class MainWindow(QMainWindow):
         head.addSpacing(8)
         head.addWidget(self.btn_refresh)
         col.addWidget(header)
+
+        # 浮层挂在主窗口下面（生命周期跟着窗口走），但它是顶层 ``Qt.Tool``，
+        # 不会被内容区裁掉。``attach`` 之后 Enter / Leave 全由它自己接管。
+        self.messages = MessagePopup(self.store, self.palette_ref, self)
+        self.messages.attach(self.btn_messages)
         # 顶栏和内容之间的那条 1px 线只在纯色档保留：渐变档顶栏自己铺了一层色带
         # （见 HeaderBand），再叠一条"从背景推的单一颜色"就会在变色背景上突兀。
         self._header_line = HLine(self.palette_ref.border)
@@ -455,7 +452,6 @@ class MainWindow(QMainWindow):
         self.wall.capability_refresh_requested.connect(self._on_capability_refresh)
         self.wall.device_reset_requested.connect(self._on_device_reset)
         self.wall.scene_hide_requested.connect(self.store.set_scene_hidden)
-        self.search.textChanged.connect(self.wall.set_filter)
         self.wall.scene_run.connect(self._on_scene)
         self.wall.card_clicked.connect(self._on_card_clicked)
         # 耗材页算出两档提醒的条数，由这里转给侧栏圆点：页面不认识 SideNav，
@@ -507,9 +503,8 @@ class MainWindow(QMainWindow):
 
         self._shortcuts = []
         for seq, slot in (
-            ("Ctrl+F", self._focus_search),
             ("F5", self._reload),
-            ("Esc", self._clear_search),
+            ("Esc", self._on_escape),
             ("Ctrl+R", self._reload),
             ("Ctrl+,", self.open_settings),
         ):
@@ -910,14 +905,13 @@ class MainWindow(QMainWindow):
         dlg.succeeded.connect(ok)
         self._run_dialog(dlg)
 
-    def _open_messages(self) -> None:
-        """顶栏「消息」胶囊：读一次、看完就走。
+    def _show_messages(self) -> None:
+        """顶栏「消息」胶囊：把浮层叫出来。
 
-        只读——标已读 / 删除是写账号数据，这一版没有这两个动作（用户 2026-11-23 定）。
-        数据在弹窗 ``showEvent`` 里异步读（``Store.fetch_messages``），不挂轮询：
-        不开这一屏就没有任何请求。
+        悬停已经会自动浮出，这里只是给"鼠标不动 / 触屏"留一个显式入口。
+        **不压暗主窗口、不停摄像头播放**——它是胶囊的展开态，不是一层页面。
         """
-        self._run_dialog(MessageDialog(self.store, self.palette_ref, self))
+        self.messages.show_for()
 
     def _run_dialog(self, dlg) -> None:
         """模态子窗口统一入口：弹出期间压暗主窗口，关掉就恢复。
@@ -1181,6 +1175,8 @@ class MainWindow(QMainWindow):
         if home_id == self.store.active_home:
             return
         self.store.active_home = home_id
+        # 浮层里的消息按家庭过滤过：切家就收起来，悬停再读一次新的
+        self.messages.hide()
         self.store.scenes = self.store.scenes_for(home_id)
         self.wall.set_home(home_id)
         self.nav.build(self.store, home_id)
@@ -1284,7 +1280,7 @@ class MainWindow(QMainWindow):
         self._fit_climate()
 
     def _fit_climate(self) -> None:
-        """窄窗口下逐颗收起温湿度胶囊，别让它们把搜索框顶出去。
+        """窄窗口下逐颗收起温湿度胶囊，别让它们把右边的消息 / 圆按钮顶出去。
 
         ``_update_climate`` 只管"有没有数据 / 用户关没关"，这里管"放不放得下"——
         两件事分开，否则要么窄窗口少看一个数、要么顶栏控件互相压住（实测 offscreen
@@ -1494,27 +1490,22 @@ class MainWindow(QMainWindow):
     def _on_scene(self, scene_id: str) -> None:
         self.store.run_scene(scene_id, self.store.active_home)
 
-    def _focus_search(self) -> None:
-        self.search.setFocus()
-        self.search.selectAll()
+    def _on_escape(self) -> None:
+        """``Esc``：先收消息浮层，再照顾正在输入的那一格。
 
-    def _clear_search(self) -> None:
-        """``Esc``：先照顾正在输入的那一格。
-
-        光标在指令条里时，按 Esc 却清掉顶栏搜索框是莫名其妙的——按"离光标最近的
-        输入框"来排序：指令条有字就清字，没字就交出焦点，然后才轮到搜索框。
+        浮层是"悬停出来的"，Esc 是它的键盘退路；光标又在指令条里时，按 Esc 却
+        关掉浮层也说不通——所以先看浮层开没开，再看离光标最近的输入框：
+        指令条有字就清字，没字就交出焦点。
         """
+        if self.messages.isVisible():
+            self.messages.hide()
+            return
         bar = getattr(self, "speaker_bar", None)
         if bar is not None and bar.input.hasFocus():
             if bar.input.text():
                 bar.input.clear()
             else:
                 bar.input.clearFocus()
-            return
-        if self.search.text():
-            self.search.clear()
-        else:
-            self.search.clearFocus()
 
     def _on_card_clicked(self, did: str) -> None:
         st = self.store.devices.get(did)
@@ -1735,29 +1726,13 @@ class MainWindow(QMainWindow):
         self.status.set_palette(pal)
         self.climate.set_palette(pal)
         self.btn_messages.set_palette(pal)
+        self.messages.set_palette(pal)
         self.alert_bar.set_palette(pal)
         self.speaker_bar.set_palette(pal)
         tooltip.set_palette(pal)
         tray = getattr(self, "tray", None)
         if tray is not None:
             tray.set_palette(pal)
-        # 搜索框压在顶栏**底板**上，所以"底从哪来"取决于顶栏是什么材质：
-        #
-        # 渐变档 —— 顶栏是一条半透明玻璃带（``bar_bg`` 压深一档 + ``HeaderBand``
-        # 再铺 ``card_alpha``），搜索框必须和快捷语音指令条一样走"卡面"：同一支
-        # ``pal.card`` + ``card_alpha``，描边一起透。以前从 ``pal.bg`` 推色（浅灰底
-        # + 深灰实线），在渐变上就是一张贴纸（用户 11-17 连问两次）。
-        #
-        # 纯色档 —— 顶栏是 ``blend(bg, card, 0.62)`` 的白里带灰浅板（L≈250），
-        # 卡面也是白（0.80 不透明），叠上去只剩 5 个色级、边界全靠描边。这里继续
-        # 用从 ``pal.bg`` 推一档的浅灰（L≈230），落差回到 20 级。
-        if pal.surface.is_gradient():
-            self.search.setStyleSheet(theme.card_field_qss(pal))
-        else:
-            self.search.setStyleSheet(
-                theme.field_qss(pal, radius=16, padding="0 14px", font_size=13,
-                                base=pal.bg)
-            )
         self._header.set_palette(pal)
         self._header_line.set_color(pal.border)
         self._header_line.setVisible(not pal.surface.is_gradient())

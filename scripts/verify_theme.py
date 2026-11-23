@@ -388,20 +388,9 @@ def main() -> int:
                _lum(grad.bg) - _lum(theme.bar_bg(grad)) >= 15,
                f"Δ={_lum(grad.bg) - _lum(theme.bar_bg(grad)):.1f}")
 
-    # -- 9c. 压在背景上的输入框走卡面 -------------------------------------
-    print("\n9c) card_field_qss（顶栏搜索框）")
-    q = theme.card_field_qss(grad)
-    check_true("底色是 rgba（跟着背景透）",
-               "background: rgba(" in q, q.splitlines()[2].strip())
-    check_true("描边更实一档、也是 rgba",
-               "border: 1px solid rgba(" in q
-               and theme.qss_alpha(min(1.0, grad.card_alpha + 0.22))
-               > theme.qss_alpha(grad.card_alpha))
-    check_true("底色取的是 pal.card（和语音指令条同一支）",
-               theme.card_fill(grad.card, grad).name().upper() in q.upper())
-
-    # -- 9d. 编号档的色标结构 ---------------------------------------------
-    print("\n9d) 编号渐变档的色标")
+    # -- 9c. 编号档的色标结构 ---------------------------------------------
+    # 原 9c（顶栏搜索框的 card_field_qss）随搜索框一起在 2026-11-23 撤掉
+    print("\n9c) 编号渐变档的色标")
     stop_bad: list[str] = []
     for preset in numbered:
         for mode, surf in (("light", preset.light), ("dark", preset.dark)):

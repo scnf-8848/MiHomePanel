@@ -456,6 +456,8 @@ mihome/
                     （`Surface` / `Preset` / `hue_gap` / `palette_for`）、派生底色、
                     品类色、QPalette 映射
     inline_toast.py 主窗口内的提示浮层（按右栏内容区定位，ok / fail 两档）
+    messages_popup.py 顶栏「消息」胶囊的悬停浮层（不是对话框）：Enter/Leave + 260ms 收起、
+                    Esc 关闭、当前家庭过滤、60 秒缓存；只读
     widgets.py      流式布局、图标缓存、文本绘制、切换开关
     wheel_guard.py  滚轮护栏：滚轮只滚页面，不改设备参数（WheelSafe / SafeSlider）
 scripts/
@@ -511,7 +513,7 @@ scripts/
   verify_speaker.py  小爱文字指令：三型号能力解析 / 清洗 / 入参拼装 / 指令条三格 / 家庭隔离（139 项，假 spec + 假 API）
   verify_gang_wireless.py 多键面板「转无线」：规格识别（逐路 / 只认同服务 / 值不写死）、卡片改成不可点且不发写请求、详情页行锁住但不写死 `write`（离屏，`--live` 才读一次真设备）
   verify_switch_wired_style.py 「隐藏转无线」样式：只画实际控制通断的那几路、按剩余数量重排、一路不剩退回产品图、全有线时等同标准卡（离屏）
-  verify_hidden_fold.py 「已隐藏设备」折叠与按房间分层：只有该分组可折、三角紧贴标题、台数常驻、收起后只剩标题行高、落盘与重建、搜索临时展开、坏数据当展开（59 项）
+  verify_hidden_fold.py 「已隐藏设备」折叠与按房间分层：只有该分组可折、三角紧贴标题、台数常驻、收起后只剩标题行高、落盘与重建、坏数据当展开（53 项）
   verify_single_instance.py 单实例：空着能拿 / 第二个拿不到 / 广播真到子进程窗口并 emit / 进程退出即释放 / 换数据目录互不影响（真子进程，不 mock）
   verify_autostart.py 开机启动：命令格式与旧值解析、四种状态、heal 只在已启用时改写、关掉后值消失、模拟打包态、三种启动形态、设置页第 5 页（46 项，只碰临时注册表键）
   verify_tray.py 系统托盘：图标多尺寸与像素、单击/双击打开而右键不打开、菜单只有「打开主窗口 / 退出」、
@@ -531,7 +533,7 @@ scripts/
                  警告条尺寸与关闭信号、"整批失败不能算成功"的判据（99 项，离屏 + 纯逻辑）
   render_preview.py  用真实数据渲染卡片墙 HTML 预览
   grab_mihome.py     米家 App 安卓端只读采集：截图 / UI 层级 XML / 窗口焦点 / 点击坐标（需 USB 调试授权）
-  shot.py            主窗口截图（--dark / --filter 关键词）
+  shot.py            主窗口截图（--dark）
   shot_detail.py     详情页截图（关键词 / --dark）
   shot_ui.py         多视图截图：主窗口 / 设置页 / 详情页 / 下拉框 / 胶囊标签 / 卡片样式 / 存在传感器状态卡 / 空调温度控制卡 / 已隐藏设备折叠（34 张）
   shot_states.py     交互态截图：房间标题悬停、详情页底部、离线禁用

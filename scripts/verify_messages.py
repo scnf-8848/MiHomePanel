@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""验证消息中心：字段口径、时间文字、请求形状、弹窗三态与"只读"。
+"""验证消息中心：字段口径、家庭过滤、时间文字、请求形状、浮层三态与"只读"。
 
 跑法：``PYTHONPATH=. .venv/Scripts/python.exe scripts/verify_messages.py``
 
 全部离线：假 payload、假 api 对象、假 store；offscreen 起 QApplication。
-口径（2026-11-23 用户定）：**只读** —— 看得到、能关窗，没有标已读、没有删除。
+口径（2026-11-23 用户定）：**只读** + **悬停浮出** + **不显示未读**。
 """
 
 from __future__ import annotations
@@ -44,16 +44,19 @@ NAMES = {"d1": "洗衣机", "d2": "压力锅", "d3": "洗碗机"}
 
 
 def record(msg_id: str, kind: int, title: str, *, content: str = "", did: str = "",
-           when: int = 0, new: int = 0) -> dict:
-    return {"msg_id": msg_id, "type": kind, "title": title, "content": content,
-            "did": did, "ctime": when, "is_new": new}
+           when: int = 0, home: int | None = 1) -> dict:
+    row = {"msg_id": msg_id, "type": kind, "title": title, "content": content,
+           "did": did, "ctime": when, "is_new": 0}
+    if home is not None:
+        row["home_id"] = home
+    return row
 
 
 NOW = int(time.time())
 PAYLOAD = {
     "messages": [
-        record("11", 6, "洗涤完成", content="洗衣机", did="d1", when=NOW - 3600, new=1),
-        record("12", 13, "观影模式执行失败", when=NOW - 90, new=1),
+        record("11", 6, "洗涤完成", content="洗衣机", did="d1", when=NOW - 3600),
+        record("12", 13, "观影模式执行失败", when=NOW - 90),
         record("13", 6, "滤芯即将到期", content="滤芯剩余 3%", did="d3", when=NOW - 86400),
     ]
 }
@@ -69,13 +72,13 @@ def test_parse() -> None:
     check("类型 13 有中文标签", rows[0].label, "场景通知")
     check("did 换成设备名", rows[1].device, "洗衣机")
     check("没有 did 的消息设备名为空", rows[0].device, "")
-    check("is_new=1 算未读", [r.unread for r in rows], [True, True, False])
+    check("home_id 收成字符串", rows[0].home, "1")
     check("ctime 是秒：3600 秒前 = 1 小时前", M.ago(rows[1].when), "1 小时前")
     # 正文与设备名重复时不再显示第二遍（实测这批消息的 content 常就是设备名）
     check("正文等于设备名时不重复显示", rows[1].body, "")
     check("正文有独立内容时保留", rows[2].body, "滤芯剩余 3%")
 
-    print("\n2) parse：未知类型与脏数据")
+    print("\n2) parse：未知类型、脏数据、家庭过滤")
     unknown = M.parse({"messages": [record("21", 99, "谁也不知道这是什么")]}, {})
     check("未知类型保留数字", unknown[0].kind, 99)
     check("未知类型给中性标签、不瞎猜", unknown[0].label, "消息")
@@ -88,20 +91,26 @@ def test_parse() -> None:
     check("没有 msg_id 的丢掉", len(dirty), 1)
     check("标题为 None 变空串", dirty[0].title, "")
     check("时间转不动当 0（不炸）", dirty[0].when, 0)
-    check("is_new 为 None 当未读 False", dirty[0].unread, False)
     check("payload 不是 dict 时返回空表", M.parse(None, NAMES), [])
+
+    mixed = {"messages": [
+        record("31", 6, "本家", when=NOW, home=7),
+        record("32", 6, "别家", when=NOW - 60, home=8),
+        record("33", 6, "没有 home_id", when=NOW - 120, home=None),
+    ]}
+    kept = M.parse(mixed, {}, home="7")
+    check("只留当前家庭", [r.msg_id for r in kept], ["31", "33"])
+    check("不传 home 就不过滤", len(M.parse(mixed, {})), 3)
+    check("home 认字符串与整数两种写法", len(M.parse(mixed, {}, home=7)), 2)
+    # 判断不了家庭的照留：宁可多显示一条，也别把自己家的悄悄藏掉
+    check_true("缺 home_id 的记录不被误删", any(r.msg_id == "33" for r in kept))
 
 
 # -- 2. 文字 -------------------------------------------------------------
 def test_text() -> None:
     print("\n3) 摘要 / 相对时间 / 截断")
     rows = M.parse(PAYLOAD, NAMES)
-    check("摘要写条数与未读", M.summarise(rows), "3 条消息 · 2 条未读")
-    check(
-        "全读过就不写后半句",
-        M.summarise(M.parse({"messages": [record("31", 6, "完成", when=NOW)]}, {})),
-        "1 条消息",
-    )
+    check("摘要只写条数（不写未读）", M.summarise(rows), "3 条消息")
     check("空表", M.summarise([]), "没有消息")
 
     check("89 秒内写刚刚", M.ago(1000, now=1080), "刚刚")
@@ -161,78 +170,178 @@ def test_client() -> None:
     check("失败抛异常，不吞成空 dict", raised, "网络断了")
 
 
-# -- 4. 弹窗 -------------------------------------------------------------
-class FakeStore:
-    """``MessageDialog`` 只用到 ``fetch_messages`` 一个方法。"""
+class _Sub:
+    """``Store.fetch_messages`` 用到的那几样（不建整个 Store）。"""
 
-    def __init__(self, items=None, error=None) -> None:
-        self.calls = 0
+    devices: dict = {}
+
+    class worker:
+        @staticmethod
+        def submit(fn, args, **kwargs):
+            kwargs["callback"](fn(*args), None)
+
+    class client:
+        @staticmethod
+        def messages(limit: int):
+            return PAYLOAD
+
+    @staticmethod
+    def message_names():
+        return NAMES
+
+
+def test_store_home() -> None:
+    print("\n5) Store.fetch_messages：把当前家庭传进 parse")
+    from mihome.core.store import Store  # noqa: PLC0415
+
+    seen: list = []
+    sub = _Sub()
+    Store.fetch_messages(sub, lambda items, err: seen.append((items, err)), home="1")  # type: ignore[arg-type]
+    items, err = seen[0]
+    check("成功回调拿到 3 条", (len(items or []), err), (3, None))
+    check("设备名照样补上", (items or [])[1].device, "洗衣机")
+
+    seen.clear()
+    Store.fetch_messages(sub, lambda items, err: seen.append((items, err)), home="9")  # type: ignore[arg-type]
+    check("别家的全被滤掉", len(seen[0][0] or []), 0)
+
+
+# -- 4. 浮层 -------------------------------------------------------------
+class FakeStore:
+    """``MessagePopup`` 只用到 ``active_home`` 与 ``fetch_messages``。"""
+
+    def __init__(self, items=None, error=None, home: str = "1") -> None:
+        self.calls: list[str] = []
         self.items = items if items is not None else []
         self.error = error
+        self.active_home = home
 
-    def fetch_messages(self, done, *, limit: int = M.DEFAULT_LIMIT) -> None:
-        self.calls += 1
+    def fetch_messages(self, done, *, limit: int = M.DEFAULT_LIMIT, home: str = "") -> None:
+        self.calls.append(home)
         if self.error is not None:
             done(None, self.error)
         else:
             done(list(self.items), None)
 
 
-def test_dialog() -> None:
-    print("\n5) 弹窗：三态与只读")
-    from PySide6.QtWidgets import QApplication  # noqa: PLC0415
+def test_popup() -> None:
+    print("\n6) 浮层：三态、缓存、家庭、收起")
+    from PySide6.QtCore import QEvent, QPoint, Qt  # noqa: PLC0415
+    from PySide6.QtWidgets import QApplication, QWidget  # noqa: PLC0415
 
+    from mihome.ui import messages_popup as P  # noqa: PLC0415
     from mihome.ui import theme  # noqa: PLC0415
-    from mihome.ui.messages_dialog import MessageDialog  # noqa: PLC0415
 
     app = QApplication.instance() or QApplication(sys.argv)
     rows = M.parse(PAYLOAD, NAMES)
 
+    anchor = QWidget()
+    anchor.resize(70, 30)
+    anchor.show()
+
     store = FakeStore(rows)
-    dlg = MessageDialog(store, theme.LIGHT)
-    check("打开前不读（构造不发请求）", store.calls, 0)
-    dlg.show()
+    pop = P.MessagePopup(store, theme.LIGHT)
+    pop.attach(anchor)
+    check("挂上胶囊但还没浮出", (pop.isVisible(), store.calls), (False, []))
+    check_true("不抢焦点（不激活就能显示）",
+               pop.testAttribute(Qt.WA_ShowWithoutActivating))
+    check_true("是 Tool 窗口（不进任务栏）", bool(pop.windowFlags() & Qt.Tool))
+    check("宽度固定", pop.width(), P.WIDTH)
+
+    pop.show_for()
     app.processEvents()
-    check("打开时读一次", store.calls, 1)
-    check("行数", len(dlg.list.messages()), 3)
-    check("标题栏摘要", dlg.list.summary.text(), "3 条消息 · 2 条未读")
-    check_true("只读：窗上没有已读/删除按钮",
-               not [b for b in dlg.findChildren(object) if hasattr(b, "text")
-                    and callable(getattr(b, "text", None))
+    check("浮出时读一次，带当前家庭", store.calls, ["1"])
+    check("行数", len(pop.list.messages()), 3)
+    check("摘要不写未读", pop.list.summary.text(), "3 条消息")
+    check_true("只读：没有已读 / 删除按钮",
+               not [b for b in pop.findChildren(object)
+                    if callable(getattr(b, "text", None))
                     and str(getattr(b, "text")()).strip() in ("全部已读", "标为已读", "删除")])
-    dlg.close()
+    check_true("浮层在胶囊下方",
+               pop.geometry().top() >= anchor.mapToGlobal(QPoint(0, 0)).y() + anchor.height())
+    check_true("列表高度夹在上下限之间",
+               P.LIST_MIN_H <= pop.list.scroll.height() <= P.LIST_MAX_H,
+               str(pop.list.scroll.height()))
+
+    print("\n7) 悬停：Enter 浮出、Leave 起计时、缓存命中不再请求")
+    pop.hide()
+    app.processEvents()
+    QApplication.sendEvent(anchor, QEvent(QEvent.Enter))
+    app.processEvents()
+    check_true("Enter 就浮出（不用点）", pop.isVisible())
+    check("还在缓存期内，不再请求", store.calls, ["1"])
+
+    QApplication.sendEvent(anchor, QEvent(QEvent.Leave))
+    check_true("Leave 只是起计时，不是立刻收", pop._hide_timer.isActive())  # noqa: SLF001
+    QApplication.sendEvent(anchor, QEvent(QEvent.Enter))
+    check_true("移回来就取消计时", not pop._hide_timer.isActive())  # noqa: SLF001
     app.processEvents()
 
-    empty = MessageDialog(FakeStore([]), theme.LIGHT)
-    empty.show()
+    print("\n8) 收起：光标不在里面才真的关")
+    pop.show_for()
+    app.processEvents()
+    inside = pop.mapToGlobal(pop.rect().center())
+    far = QPoint(inside.x() + 2000, inside.y() + 2000)
+
+    class _Cursor:
+        at = far
+
+        @classmethod
+        def pos(cls):
+            return cls.at
+
+    real_cursor = P.QCursor
+    P.QCursor = _Cursor  # type: ignore[assignment]
+    try:
+        _Cursor.at = inside
+        pop._on_hide_timeout()  # noqa: SLF001
+        check_true("光标还在浮层里就不收", pop.isVisible())
+        _Cursor.at = far
+        pop._on_hide_timeout()  # noqa: SLF001
+        check_true("光标走远了才收", not pop.isVisible())
+    finally:
+        P.QCursor = real_cursor  # type: ignore[assignment]
+
+    print("\n9) 家庭切换 / 失败 / 空态")
+    store.active_home = "2"
+    pop.show_for()
+    app.processEvents()
+    check("切家庭会重新读，并带上新家庭", store.calls, ["1", "2"])
+    pop.hide()
+
+    empty = P.MessagePopup(FakeStore([]), theme.LIGHT)
+    empty.attach(anchor)
+    empty.show_for()
     app.processEvents()
     check("空态摘要", empty.list.summary.text(), "没有消息")
-    empty.close()
-    app.processEvents()
+    empty.hide()
 
-    failed = MessageDialog(FakeStore(error=RuntimeError("网络断了")), theme.LIGHT)
-    failed.show()
+    failed = P.MessagePopup(FakeStore(error=RuntimeError("网络断了")), theme.LIGHT)
+    failed.attach(anchor)
+    failed.show_for()
     app.processEvents()
     # "读失败"不能显示成"没有消息"：那会让人去手机里白找一圈
     check("失败态摘要", failed.list.summary.text(), "读取失败")
-    check_true("失败态不是空态文案", failed.list.messages() == [])
-    failed.close()
-    app.processEvents()
+    check_true("失败态不冒充空态", failed.list.messages() == [])
+    failed.hide()
 
-    # 关掉以后回调才到：不能去碰已经销毁的控件
-    late = MessageDialog(FakeStore(rows), theme.LIGHT)
-    late.show()
+    # 有旧数据时失败：留着旧的，不要擦掉已经看到的东西
+    keep = P.MessagePopup(FakeStore(rows), theme.LIGHT)
+    keep.attach(anchor)
+    keep.show_for()
     app.processEvents()
-    late._on_finished(0)  # noqa: SLF001
-    late._on_loaded(rows, None)  # noqa: SLF001  _alive 已置 False，应当直接返回
-    check_true("关窗后迟到的回调被丢弃", late._alive is False)  # noqa: SLF001
-    late.close()
+    keep._store.error = RuntimeError("断了")  # noqa: SLF001
+    keep._fetched_at = 0.0  # noqa: SLF001  让缓存过期
+    keep.show_for()
+    app.processEvents()
+    check("刷新失败时保留上一轮结果", len(keep.list.messages()), 3)
+    keep.hide()
+    anchor.close()
     app.processEvents()
 
 
 def test_header() -> None:
-    print("\n6) 顶栏入口：可点胶囊 + 接线")
-    from PySide6.QtCore import Qt  # noqa: PLC0415
+    print("\n10) 顶栏：消息在右侧、搜索框已撤、点击也能浮出")
     from PySide6.QtWidgets import QApplication  # noqa: PLC0415
 
     from mihome.ui import theme  # noqa: PLC0415
@@ -245,15 +354,25 @@ def test_header() -> None:
     try:
         btn = win.btn_messages
         check("带铃铛图标、不画绿点", (btn._icon, btn._dot), ("bell", False))  # noqa: SLF001
-        check("文字就是「消息」（没有未读数：那要一路常驻请求）", btn.text(), "消息")
-        check_true("可点（手型光标）", btn.cursor().shape() == Qt.PointingHandCursor)
+        check("文字就是「消息」（没有未读数）", btn.text(), "消息")
+        check_true("搜索框已经撤掉", not hasattr(win, "search"))
+        # 窗口没 show 时 layout 还没跑，geometry 都是 0；从布局顺序判更可靠：
+        # 温湿度 → 弹性留白 → 消息 → 主题/刷新（消息占的是原搜索框的位置）
+        head = win._head  # noqa: SLF001
+        check_true("消息在温湿度之后、圆按钮之前（原搜索框的位置）",
+                   head.indexOf(win.climate) < head.indexOf(btn)
+                   < head.indexOf(win.btn_theme),
+                   f"{head.indexOf(win.climate)} / {head.indexOf(btn)} / "
+                   f"{head.indexOf(win.btn_theme)}")
+        check_true("浮层认下了这颗胶囊", win.messages._anchor is btn)  # noqa: SLF001
+        check("快捷键里没有 Ctrl+F",
+              [s.key().toString() for s in win._shortcuts],  # noqa: SLF001
+              ["F5", "Esc", "Ctrl+R", "Ctrl+,"])
         # 用信号模拟点击：真点要跑 event loop 且窗口得显示出来
-        seen: list[object] = []
-        win._run_dialog = lambda dlg: seen.append(dlg)  # noqa: SLF001
+        seen: list[bool] = []
+        win.messages.show_for = lambda *_a: seen.append(True)  # type: ignore[method-assign]
         btn.clicked.emit()
-        check("点了会开消息窗", [type(d).__name__ for d in seen], ["MessageDialog"])
-        check("开着的那颗不是只读胶囊类（说明确实换成了可点版本）",
-              type(btn).__name__, "ChipButton")
+        check("点了也会浮出", seen, [True])
     finally:
         win.close()
         app.processEvents()
@@ -276,7 +395,8 @@ def main() -> int:
     test_parse()
     test_text()
     test_client()
-    test_dialog()
+    test_store_home()
+    test_popup()
     test_header()
     print()
     if FAILS:

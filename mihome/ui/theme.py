@@ -901,30 +901,6 @@ def field_qss(
                         radius=radius, padding=padding, font_size=font_size, alpha=alpha)
 
 
-def card_field_qss(
-    p: Palette,
-    selector: str = "QLineEdit",
-    *,
-    radius: int = 16,
-    padding: str = "0 14px",
-    font_size: int = 13,
-) -> str:
-    """压在背景上的**卡面**输入框（顶栏搜索框）的配色规则。
-
-    它和快捷语音指令条（``speaker_bar.SpeakerBar``）、状态胶囊、卡片是同一种东西：
-    一张半透明小卡片浮在背景上。所以底色直接取 ``pal.card``，不漏一档推导——
-    从 ``pal.bg`` 混 5% 文字色出来的那支"浅灰"，在渐变上既不白也不透，读起来像
-    贴了一张纸（用户 2026-11-17 连问两次「搜索设备框没有半透明」）。
-
-    半透明一律走 ``fill_qss``/``qss_alpha``（QSS 背景画两遍）；描边跟着 ``card_alpha``
-    一起透、比底色实一档，和指令条那条边是同一个配方。
-    """
-    fill = p.card
-    return _field_rules(p, selector, fill, field_border(p, fill),
-                        radius=radius, padding=padding, font_size=font_size,
-                        alpha=p.card_alpha)
-
-
 def _field_rules(
     p: Palette,
     selector: str,
@@ -936,7 +912,7 @@ def _field_rules(
     font_size: int,
     alpha: float | None,
 ) -> str:
-    """``field_qss`` / ``card_field_qss`` 共用的那一段 QSS 文本。
+    """``field_qss`` 用的那一段 QSS 文本。
 
     分开只为"底色从哪来"有两套说法，画法本身必须只有一份——否则改了圆角、焦点色
     必然会漏掉一处。
@@ -1204,7 +1180,6 @@ __all__ = [
     "app_qss",
     "apply_to_app",
     "blend",
-    "card_field_qss",
     "card_hover_color",
     "category_color",
     "chip_bg",

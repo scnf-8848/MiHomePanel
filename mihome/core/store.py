@@ -919,11 +919,13 @@ class Store:
         done: Callable[[list[Message] | None, BaseException | None], None],
         *,
         limit: int = DEFAULT_LIMIT,
+        home: str = "",
     ) -> None:
         """读一次消息中心，归一化后交给 ``done``（主线程回调）。
 
-        **不挂轮询**：消息中心只在用户打开那一屏时读，空闲时零请求。未读数角标
-        也暂不做——那需要一路常驻请求，而用户要的只是"点开看看有什么"。
+        **不挂轮询**：消息中心只在鼠标停在入口上时读一次，空闲时零请求。
+        ``home`` 给当前家庭：消息记录自带 ``home_id``，所以别家的通知不往这里混
+        （默认空串 = 不过滤，留给测试 / 排障用）。
 
         云端失败时 ``done(None, error)``，界面显示"读取失败"；空列表才显示
         "没有消息"。两者分开，不能混成一句。
@@ -934,7 +936,9 @@ class Store:
             priority=PRIORITY_DATA,
             label="messages",
             callback=lambda payload, error: done(
-                None if error is not None else parse_messages(payload, self.message_names()),
+                None
+                if error is not None
+                else parse_messages(payload, self.message_names(), home=home),
                 error,
             ),
         )

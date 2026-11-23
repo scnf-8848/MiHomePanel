@@ -965,9 +965,10 @@ class Client:
         用户会以为手机里也没消息。异常由 ``core/jobs.py`` 转成回调的 ``error``，
         界面据此显示"读取失败"。
 
-        两个已知限制（同类项目真机实测，见
+        两个已知限制（2026-11-23 本机只读实测，见
         ``docs/reference/mihome-pc-unofficial.md`` §4.5）：这个接口**没有游标**，
-        ``limit`` 就是上限，更早的消息拿不到；``ctime`` 是 unix **秒**。
+        ``limit`` / ``type`` / ``home_id`` / ``timestamp`` 传什么都不改变结果；
+        ``ctime`` 是 unix **秒**。返回的每条都带整数 ``home_id``，可以按家庭过滤。
         """
         data: dict[str, Any] = {
             "timestamp": int(time.time() * 1000),

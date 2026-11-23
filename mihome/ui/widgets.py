@@ -348,15 +348,24 @@ def paint_chip_glyph(p: QPainter, box: QRectF, kind: str, color: QColor) -> None
     if kind == "bell":
         # 钟体：肩上两段圆弧 + 两侧直边 + 底部向外撇出的喇叭口，整只**只描边**。
         # 10px 宽里填实会糊成一块墨点；描边 1.3px 是这个尺寸下还看得出"钟形"的下限。
+        #
+        # 坐标**必须基于 box**，不能写 1.5 / 9.4 这种绝对值——第一版就是这么写的，
+        # 结果整只钟贴着胶囊上沿画（box 的 top 是 8.5，绝对坐标把它当成了 0），
+        # 用户 2026-11-23 的截图里"铃铛错位"就是这个。同时宽度收到 ±3.4：
+        # 原来 ±3.0 出来的墨迹只有 8px，比房子（10px）窄一圈，看着像缩了一号。
         cx = box.center().x()
+        top = box.top() + 0.8
+        flare = box.bottom() - 2.8
+        shoulder = top + (flare - top) * 0.42
+        w = 2.6
         bell = QPainterPath()
-        bell.moveTo(cx - 3.0, 9.4)
-        bell.cubicTo(cx - 2.4, 8.7, cx - 2.2, 8.0, cx - 2.2, 6.6)
-        bell.lineTo(cx - 2.2, 4.5)
-        bell.cubicTo(cx - 2.2, 2.5, cx - 1.2, 1.5, cx, 1.5)
-        bell.cubicTo(cx + 1.2, 1.5, cx + 2.2, 2.5, cx + 2.2, 4.5)
-        bell.lineTo(cx + 2.2, 6.6)
-        bell.cubicTo(cx + 2.2, 8.0, cx + 2.4, 8.7, cx + 3.0, 9.4)
+        bell.moveTo(cx - w - 1.2, flare)
+        bell.lineTo(cx - w, flare - 0.9)
+        bell.lineTo(cx - w, shoulder)
+        bell.cubicTo(cx - w, top + 1.0, cx - 1.2, top, cx, top)
+        bell.cubicTo(cx + 1.2, top, cx + w, top + 1.0, cx + w, shoulder)
+        bell.lineTo(cx + w, flare - 0.9)
+        bell.lineTo(cx + w + 1.2, flare)
         bell.closeSubpath()
         p.setPen(QPen(color, 1.3, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
         p.setBrush(Qt.NoBrush)
@@ -364,7 +373,7 @@ def paint_chip_glyph(p: QPainter, box: QRectF, kind: str, color: QColor) -> None
         # 铃舌：底边下面那颗实心小圆
         p.setPen(Qt.NoPen)
         p.setBrush(color)
-        p.drawEllipse(QPointF(cx, 11.0), 0.95, 0.95)
+        p.drawEllipse(QPointF(cx, flare + 1.5), 0.95, 0.95)
         return
     if kind == "droplet":
         cx = box.center().x()

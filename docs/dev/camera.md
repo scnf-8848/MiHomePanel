@@ -268,7 +268,7 @@ Go 1.27.3、两个补丁各自作用、构建日期、实测首帧区间、安�
 播放 / 关掉那个窗口即可回到这里」；墙上不再有"活动卡"，滚出视野也不会误停这条会话。
 
 **回程**：详情页关窗时发 `about_to_stop(did)`，`MainWindow` 接到
-`wall.adopt_back(did)`——卡片**还看得见**（`_card_on_screen`：可见、没被搜索过滤、
+`wall.adopt_back(did)`——卡片**还看得见**（`_card_on_screen`：可见、
 与视口相交）就 `move(card.view, "wall")` 收回去，同一个播放器、帧号连续、声音状态不变；
 看不见就不收，交给 `release` 结束，绝不把一条看不见的会话留在墙上占观看位。
 收回之后要调 `WallCameraController.take_back()` 重新登记成活动卡，否则"滚出视野就停"

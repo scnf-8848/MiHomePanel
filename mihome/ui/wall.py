@@ -8,12 +8,14 @@
 传感器房间更是没有"开关"这个概念。真要一键，用顶部的场景栏——场景是用户自己
 定义过语义的，点错的风险由用户自己控制。
 
-工程上有三条约束：
+工程上有两条约束：
 
 * 卡片对象必须复用。轮询每 3 秒回来一次，如果每次重建 QWidget，滚动位置和
   鼠标悬停都会被打断，长跑还会内存抖动。
 * 房间分组只在**拓扑变化**时重建。设备状态变化走 ``update_cards(dids)``。
-* 搜索过滤不能重建卡片，只切 ``setVisible``；``FlowLayout`` 会自动跳过隐藏项。
+
+（顶栏那口搜索框 2026-11-23 撤掉了，连同这里的按名过滤一起删——几十台设备靠
+房间分组和滚动就够找。要找回旧实现看 11-23 之前的提交。）
 """
 
 from __future__ import annotations
@@ -43,7 +45,7 @@ from PySide6.QtWidgets import (
 
 from ..core.camera import is_camera
 from ..core.geek import Entry
-from ..core.store import DeviceState, RoomView, Store
+from ..core.store import RoomView, Store
 from ..core.tree import UNASSIGNED_ROOM_LABEL
 from . import theme, tooltip
 from .camera_card import CameraCard
@@ -56,15 +58,6 @@ from .dnd import DragGesture, DragGuard
 from .menu import Menu, add_choice, submenu
 from .scene_bar import SceneBar
 from .widgets import IconProvider, draw_text
-
-
-def matches(state: DeviceState, query: str) -> bool:
-    """设备名 / 房间 / 品类 / 型号 / 按键名 任一命中即算匹配。"""
-    if not query:
-        return True
-    fields = [state.name, state.room, state.card.profile.label, state.node.model]
-    fields += [g.label for g in state.card.gangs]
-    return any(query in f.lower() for f in fields if f)
 
 
 def rounded_shot(widget: QWidget) -> QPixmap:
@@ -396,7 +389,7 @@ class RoomSection(QWidget):
 
         分组（已隐藏设备）分区里一条 flow 只装一个房间的一部分，跨组拖动
         会让"顺序"和"房间归属"两件事混在一起；等隐藏列表也有独立排序入口
-        再放开。搜索过滤期间顺序不可见，同样不允许拖。
+        再放开。
         """
         return not self._groups and self.view.kind != "hidden"
 
@@ -412,8 +405,8 @@ class RoomSection(QWidget):
     def set_collapsed(self, collapsed: bool) -> None:
         """只改界面，**不落盘**。
 
-        写偏好是 ``WallView`` 的事：搜索时为了让人看到命中项会临时展开，
-        那种展开不该被记住。
+        写偏好是 ``WallView`` 的事：切主题 / 切家庭重建墙时要按偏好恢复，
+        用户在标题行上的点击才落盘。
         """
         collapsed = bool(collapsed) and self._collapsible
         if self._collapsed == collapsed:
@@ -444,7 +437,7 @@ class RoomSection(QWidget):
         (group[2] if group is not None else self.flow).addWidget(card)
 
     def invalidate_flows(self) -> None:
-        """所有卡片流重排（改样式、搜索过滤后都要走这一下）。"""
+        """所有卡片流重排（改样式后都要走这一下）。"""
         for flow in self.flows:
             flow.invalidate()
         self._body.updateGeometry()
@@ -454,35 +447,6 @@ class RoomSection(QWidget):
         self.header.set_palette(palette)
         for label, _host, _flow in self._groups.values():
             label.set_palette(palette)
-
-    def clear_filter(self) -> None:
-        """撤掉搜索：所有卡片和房间小标题都回来。"""
-        for card in self.cards.values():
-            card.setVisible(True)
-        for label, host, _flow in self._groups.values():
-            label.setVisible(True)
-            host.setVisible(True)
-        self.invalidate_flows()
-
-    def apply_filter(self, query: str) -> int:
-        """按查询词显示/隐藏卡片，返回可见卡片数。"""
-        shown = 0
-        per_room: dict[str, int] = {}
-        for card in self.cards.values():
-            hit = matches(card.state, query)
-            card.setVisible(hit)
-            if hit:
-                shown += 1
-                room_id = card.state.room_id
-                per_room[room_id] = per_room.get(room_id, 0) + 1
-        # 没有命中项的房间整块消失，不留一行孤零零的小标题
-        for room_id, (label, host, _flow) in self._groups.items():
-            on = per_room.get(room_id, 0) > 0
-            label.setVisible(on)
-            host.setVisible(on)
-        if shown:
-            self.invalidate_flows()
-        return shown
 
 
 class WallView(QScrollArea):
@@ -506,8 +470,6 @@ class WallView(QScrollArea):
         self._sections: list[RoomSection] = []
         self._cards: dict[str, DeviceCard] = {}
         self._home = ""
-        self._filter = ""
-        self._no_match: QWidget | None = None
 
         self.setWidgetResizable(True)
         self.setFrameShape(QFrame.NoFrame)
@@ -559,7 +521,6 @@ class WallView(QScrollArea):
         self._sections.clear()
         self._cards.clear()
         self.scene_bar = None
-        self._no_match = None
 
     def build(self) -> None:
         """拓扑 / 家庭 / 排序变化后重建整个墙。"""
@@ -626,8 +587,6 @@ class WallView(QScrollArea):
             self._col.addWidget(self._placeholder("没有找到设备"))
         else:
             self._col.addStretch(1)
-        if self._filter:
-            self.set_filter(self._filter)
 
     def _relayout(self) -> None:
         """让根布局重新分配各分区的高度。
@@ -790,52 +749,6 @@ class WallView(QScrollArea):
         self._col.addWidget(self._placeholder(text))
         self._col.addStretch(1)
 
-    # -- 搜索 ------------------------------------------------------------
-    def set_filter(self, text: str) -> None:
-        q = (text or "").strip().lower()
-        self._filter = q
-        if self.scene_bar is not None:
-            self.scene_bar.setVisible(not q)
-        if not q:
-            for section in self._sections:
-                section.setVisible(True)
-                # 搜索时的临时展开到这里收回，恢复到用户自己选的折叠状态
-                if section.collapsible:
-                    section.set_collapsed(self._store.prefs.hidden_collapsed)
-                section.clear_filter()
-            self._show_no_match(False)
-            self._relayout()
-            self._check_active_visible()
-            return
-        visible = 0
-        for section in self._sections:
-            # 收起的「已隐藏设备」里也可能有命中项：搜索期间临时展开，否则
-            # 搜到了却看不见。这个展开不写偏好，清空搜索后会自己收回去。
-            if section.collapsible:
-                section.set_collapsed(False)
-            shown = section.apply_filter(q)
-            section.setVisible(shown > 0)
-            visible += shown
-        self._show_no_match(visible == 0 and bool(self._sections))
-        self._relayout()
-        # 搜索期间一律停播（顺序和可见性都在变，继续播没有意义）
-        self._check_active_visible()
-
-    def _show_no_match(self, on: bool) -> None:
-        """搜不到东西时给一句提示，而不是留一片空白。"""
-        if on and self._no_match is None:
-            w = self._placeholder("没有匹配的设备")
-            self._col.insertWidget(max(0, self._col.count() - 1), w)
-            self._no_match = w
-        elif not on and self._no_match is not None:
-            self._no_match.setParent(None)
-            self._no_match.deleteLater()
-            self._no_match = None
-
-    @property
-    def filter_active(self) -> bool:
-        return bool(self._filter)
-
     # -- 增量刷新 --------------------------------------------------------
     def update_cards(self, dids: set[str]) -> None:
         for did in dids:
@@ -905,8 +818,8 @@ class WallView(QScrollArea):
     def adopt_back(self, did: str) -> bool:
         """把会话从详情页 / 独立窗口收回到墙上那张卡（同一个播放器，不重连）。
 
-        只在卡片**还看得见**时收回：滚出视野 / 当前有搜索过滤时收回来等于留下
-        一条看不见的会话，既占观看位又让"滚出去就停"的规矩失效，这时宁可结束它。
+        只在卡片**还看得见**时收回：滚出视野时收回来等于留下一条看不见的会话，
+        既占观看位又让"滚出去就停"的规矩失效，这时宁可结束它。
         """
         owner = playbacks()
         if not owner.active or owner.did != did:
@@ -944,9 +857,9 @@ class WallView(QScrollArea):
                 continue
 
     def _card_on_screen(self, card: DeviceCard) -> bool:
-        """卡片现在是不是真在可视区域里（隐藏 / 被搜索过滤掉都算不在）。"""
+        """卡片现在是不是真在可视区域里（隐藏算不在）。"""
         try:
-            if not card.isVisible() or self._filter:
+            if not card.isVisible():
                 return False
             top_left = card.mapTo(self.viewport(), QPoint(0, 0))
             return self.viewport().rect().intersects(QRect(top_left, card.size()))
@@ -957,7 +870,7 @@ class WallView(QScrollArea):
         card = self._camera_ctl.active_card
         if card is None:
             return
-        if not card.isVisible() or self._filter:
+        if not card.isVisible():
             self._camera_ctl.stop_active("卡片不可见")
             return
         vp = self.viewport().rect()
@@ -999,7 +912,6 @@ class WallView(QScrollArea):
         usable = (
             section is not None
             and section.draggable
-            and not self._filter
             and not self._drag_started
             and not card.interactive_at(event.position().toPoint())
         )
@@ -1181,4 +1093,4 @@ class WallView(QScrollArea):
             self.build()
 
 
-__all__ = ["DragGhost", "WallView", "matches", "rounded_shot"]
+__all__ = ["DragGhost", "WallView", "rounded_shot"]

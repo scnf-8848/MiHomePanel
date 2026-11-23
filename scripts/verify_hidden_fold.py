@@ -10,9 +10,7 @@
    点它不会把一整个房间收掉；
 3. **收起后只剩标题行高**（``_RoomHeader.H``），卡片流不占位，这才是加它的理由；
 4. **落盘 / 重读 / 重建墙后仍收起**——切主题、切家庭都会重建，记不住等于没有；
-5. **搜索时临时展开**，否则命中项藏在收起的分区里，搜到了却看不见；
-   清空搜索要回到用户自己选的状态，而不是"搜过一次就永久展开"；
-6. **坏数据当 False**——"yes" / 1 这类值不该让人一开就看不见设备。
+5. **坏数据当 False**——"yes" / 1 这类值不该让人一开就看不见设备。
 
 中文在 offscreen 平台渲染成豆腐块，这里只量状态与几何，不读文字。
 """
@@ -274,22 +272,7 @@ def main() -> int:
     check("重建墙（切主题/家庭会走这条）后仍收起", rebuilt._sections[2].collapsed, True)
     check("重建后卡片对象照样建出来", len(rebuilt._sections[2].cards), 2)
 
-    print("\n4) 搜索：临时展开，清空后收回")
-    wall.set_filter("旧台灯")
-    QApplication.processEvents()
-    check("命中项在收起的分区里也搜得到", wall._sections[2].collapsed, False)
-    check_true("分区可见", wall._sections[2].isVisible())
-    check("临时展开不写偏好", p.hidden_collapsed, True)
-    groups = wall._sections[2]._groups
-    check("没命中的房间小标题也藏起来",
-          [groups[r][0].isVisible() for r in ("客厅", "餐厅")], [True, False])
-    wall.set_filter("")
-    QApplication.processEvents()
-    check("清空搜索回到用户选的折叠态", wall._sections[2].collapsed, True)
-    check("清空搜索后房间小标题全回来",
-          [groups[r][0].isHidden() for r in ("客厅", "餐厅")], [False, False])
-
-    print("\n5) 展开 / 再收起，信号只从可折叠分区发出")
+    print("\n4) 展开 / 再收起，信号只从可折叠分区发出")
     got: list[bool] = []
     sections = wall._sections
     for s in sections:
@@ -305,7 +288,7 @@ def main() -> int:
     QApplication.processEvents()
     check("再收起", (sections[2].collapsed, p.hidden_collapsed), (True, True))
 
-    print("\n6) 收起态在深色主题下同样成立")
+    print("\n5) 收起态在深色主题下同样成立")
     wall.set_palette(theme.DARK)
     wall.rebuild_palette(theme.DARK)
     wall.show()
