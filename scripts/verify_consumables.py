@@ -39,8 +39,13 @@ from mihome.core import consumables as model  # noqa: E402
 from mihome.core.api import HomeNode, PropRef, RoomNode, Topology  # noqa: E402
 from mihome.core.consumables import Consumable  # noqa: E402
 from mihome.core.prefs import PREFS_VERSION, Prefs  # noqa: E402
-from mihome.core.spec import PropertySpec  # noqa: E402
-from mihome.core.store import DeviceState, Store, build_card_empty  # noqa: E402
+from mihome.core.spec import PropertySpec, ValueOption  # noqa: E402
+from mihome.core.store import (  # noqa: E402
+    DeviceState,
+    Store,
+    _register_keys,
+    build_card_empty,
+)
 from mihome.core.tree import DeviceNode  # noqa: E402
 from mihome.ui import theme  # noqa: E402
 from mihome.ui.consumables_page import (  # noqa: E402
@@ -114,6 +119,17 @@ FILTER = prop(2, 9, "滤芯剩余")
 WATER = prop(3, 1, "洗衣液", span=(0, 500, 1))     # 非百分数：靠值域折算
 BATTERY = prop(4, 1, "电量")
 
+#: 洗衣液的真实形态：枚举（1=低 / 2=标准），没有百分比。云端台账对它是
+#: ``inadeq = {"val":"1","type":"list"}``，语义是"读到 1 就该换"。
+DETERGENT = PropertySpec(
+    siid=6, piid=1, name="detergent-left-level", urn="urn:test:6:1",
+    description="清洁剂剩余量", comment="清洁剂剩余量", format="uint8",
+    access=("read", "notify"), unit=None, value_range=None,
+    value_list=(ValueOption(1, "Low", "Low", "低"),
+                ValueOption(2, "Normal", "Normal", "标准")),
+    service="detergent-management", service_label="洗涤剂", label_short="洗衣液",
+)
+
 
 class _Caps:
     def save(self) -> None:
@@ -159,9 +175,9 @@ def make_store(tmp: Path) -> Store:
     store.topology = Topology(homes, devices)
     specs = {
         "d1": [FILTER, BATTERY],
-        "d2": [WATER],
+        "d2": [WATER, DETERGENT],
     }
-    values = {"d1": {(2, 9): 15, (4, 1): 88}, "d2": {(3, 1): 20}}
+    values = {"d1": {(2, 9): 15, (4, 1): 88}, "d2": {(3, 1): 20, (6, 1): 1}}
     for node in devices:
         props = specs[node.did]
         store.devices[node.did] = DeviceState(
@@ -243,6 +259,23 @@ def main() -> int:
     store.prefs.remove_consumable("d1:2.9")
     after = {(r.did, r.siid, r.piid) for r in store.poll_refs()}
     check("删掉监控项后不再为它轮询", (before, len(after)), (1, 0))
+
+    # 2026-11-24 修的坑：耗材项指向"卡片没画"的属性时，以前 keys 里没有它，
+    # poll_refs 用 keys 反查寻址 → 请求从来没发出去，界面永远「暂时读不到这个属性」。
+    # 鹿客 V6 Max 的大电池（10.1，实测读得到 61%）就是这么被漏掉的。
+    bare = DeviceState(
+        node=store.devices["d2"].node,
+        spec=SimpleNamespace(properties=[WATER, DETERGENT]),
+        card=build_card_empty(store.devices["d2"].node),
+        keys={},
+    )
+    _register_keys(bare, "d2", [
+        Consumable(did="d2", siid=6, piid=1, low=1),   # 枚举属性，卡片没画
+        Consumable(did="d2", siid=9, piid=9),          # 规格里没有：不发请求
+        Consumable(did="d1", siid=3, piid=1),          # 别台设备的
+    ])
+    check("卡片没画的耗材属性也登记进寻址（不然永远不发请求）",
+          sorted(bare.keys), [(6, 1)])
 
     print("\n4) 页面：空态 / 卡片 / 排序 / 分组 / 计数")
     store.prefs = Prefs(tmp / "prefs3.json")
@@ -954,17 +987,22 @@ def main() -> int:
     }
 
     cloud = model.cloud_items(payload)
-    check("三组 state 全部收（不只第一组）", len(cloud.get("d9", [])), 3)
+    check("三组 state 全部收（不只第一组）", len(cloud.get("d9", [])), 4)
     check("双电池的两条 details 都收", [c.label for c in cloud.get("d8", [])],
           ["5号电池", "锂电池"])
-    check("prop 解不出的条目跳过，不猜", [c.method for c in cloud.get("d9", [])],
-          ["4.1", "2.1003", "13.1"])
+    # 拆不出的不再静默丢掉：列出来、标成不可添加（老门锁 prop.electricity 那种），
+    # 少一条用户只会以为"米家不认这台"，其实是我们寻不到地址
+    check("prop 解不出的也列，但标成不可添加",
+          [(c.method, c.readable) for c in cloud["d9"]],
+          [("4.1", True), ("2.1003", True), ("13.1", True), ("0.0", False)])
     check("同一 siid.piid 去重（留先到的那条）",
           [(c.method, c.value) for c in cloud.get("d7", [])], [("6.1", "")])
     check("百分比阈值收进 warn / 耗尽 0% 当没设", 
           (cloud["d9"][0].warn, cloud["d9"][0].crit), (5, None))
     check("洗衣液那种档位阈值不硬套成数字",
           (cloud["d7"][0].warn, cloud["d7"][0].crit), (None, None))
+    check("档位阈值收进 low，kind 标成 level",
+          (cloud["d7"][0].low, cloud["d7"][0].kind), (1, "level"))
     check("候选按钮的文案", cloud["d9"][0].summary(), "滤芯 · 剩余 17% · 不足 5%")
     check("没读数时不写「剩余」", model.CloudItem("d1", 1, 1, "洗衣液").summary(),
           "洗衣液")
@@ -974,50 +1012,113 @@ def main() -> int:
            "warn": 5, "crit": None})
     check("坏 payload 不炸", model.cloud_items(None), {})
 
-    # -- 弹窗：空壳才有候选，点一下填好，已配过的不再建议 -------------------
+    # -- 弹窗：两个 tab 各走各的路（2026-11-24 用户定） -------------------
     store3 = make_store(Path(tempfile.mkdtemp()))
-    shell3 = model.unset("d1")
-    store3.prefs.add_consumable(shell3)
-    dlg = ConsumableDialog(store3, theme.LIGHT, item=shell3)
-    check("云端没有记录时说清楚，而不是留一片空白",
-          dlg._cloud_note.text().startswith("云端没有"), True)  # noqa: SLF001
+    store3.prefs.add_consumable(model.parse({"did": "d1", "siid": 2, "piid": 9}))
+    dlg = ConsumableDialog(store3, theme.LIGHT)
+    check("默认停在「米家耗材」", dlg.stack.currentIndex(), 0)
+    check_true("米家 tab 显示「添加到耗材页」", dlg.btn_add.isVisibleTo(dlg))
+    check("自选 tab 的「下一步」不占位置", dlg.btn_next.isVisibleTo(dlg), False)
 
-    cands = [model.CloudItem("d1", 2, 9, "滤芯", "17", 5, None),
-             model.CloudItem("d1", 4, 1, "5号电池", "48", 10, None)]
-    dlg._on_cloud({"d1": cands}, None)  # noqa: SLF001
-    buttons = [b for b in dlg.findChildren(QPushButton)
-               if b.objectName() == "Candidate"]
-    check("有几条候选就几个按钮", len(buttons), 2)
-    check("按钮上写着剩余量和云端阈值",
-          [b.text() for b in buttons], ["滤芯 · 剩余 17% · 不足 5%",
-                                        "5号电池 · 剩余 48% · 不足 10%"])
-    check_true("有候选时不再留「云端没有」那句", dlg._cloud_note.isHidden())  # noqa: SLF001
+    cands = {
+        "d1": [model.CloudItem("d1", 2, 9, "滤芯", "17", 5, None),          # 已配过
+               model.CloudItem("d1", 4, 1, "5号电池", "48", 10, None)],
+        "d2": [model.CloudItem("d2", 3, 1, "洗衣液", "", None, None, 1, "level")],
+    }
+    dlg._on_cloud_loaded(cands, None)  # noqa: SLF001
+    tops = dlg.tree_cloud.topLevelItemCount()
+    check("一台设备一个父节点", tops, 2)
+    listed = [dlg.tree_cloud.topLevelItem(i).child(j)
+              for i in range(tops)
+              for j in range(dlg.tree_cloud.topLevelItem(i).childCount())]
+    check("已经配过的那条不列，档位类的写「到不足档时提醒」",
+          [r.text(0) for r in listed],
+          ["5号电池 · 剩余 48% · 不足 10%", "洗衣液 · 到不足档时提醒"])
 
-    buttons[0].click()
-    check("点一下属性就选中了", dlg.cb_prop.currentData(), (2, 9))
-    check("名称用云端那个更细的名字", dlg.ed_name.text(), "滤芯")
-    check("两档阈值按云端填；耗尽 0% 那档留空（我们这里 0 = 不启用）",
-          (dlg.ed_warn.text(), dlg.ed_crit.text()), ("5", ""))
+    dlg._on_cloud_clicked(listed[0], 0)  # noqa: SLF001
+    check_true("选中一行后「添加」才可用", dlg.btn_add.isEnabled())
+    dlg._on_add_cloud()  # noqa: SLF001
+    got = [c for c in store3.prefs.consumables if c.did == "d1" and c.siid == 4]
+    check("落卡用云端的名字（规格里两块电池都叫电池电量）",
+          [c.label for c in got], ["5号电池"])
+    check("阈值也按云端：耗尽 0% 在我们这里等于不启用",
+          [(c.warn, c.crit, c.low) for c in got], [(10, None, None)])
 
-    buttons[1].click()
-    check("换一条候选：属性和名字都跟着换",
-          (dlg.cb_prop.currentData(), dlg.ed_name.text()), ((4, 1), "5号电池"))
+    dlg2 = ConsumableDialog(store3, theme.LIGHT)
+    dlg2._on_cloud_loaded(  # noqa: SLF001
+        {"d1": [model.CloudItem("d1", 0, 0, "老门锁电池", "49",
+                                raw_prop="prop.electricity")]}, None)
+    check("全是拆不出地址的：说清有几项读不到，不静默少一条",
+          "读不到" in dlg2._cloud_note.text(), True)  # noqa: SLF001
+    dlg2.close()
 
-    store3.prefs.add_consumable(model.parse({"did": "d1", "siid": 4, "piid": 1}))
-    dlg._on_cloud({"d1": cands}, None)  # noqa: SLF001
-    check("已经配过的那条不再出现在候选里",
-          [b.text() for b in dlg.findChildren(QPushButton)
-           if b.objectName() == "Candidate"], ["滤芯 · 剩余 17% · 不足 5%"])
-
-    dlg._use_cloud(model.CloudItem("d1", 9, 9, "幽灵耗材", "", None, None))  # noqa: SLF001
-    check("属性不在这台设备的规格里：不改上一次点好的选择",
-          dlg.cb_prop.currentData(), (4, 1))
-    check_true("并且说一句为什么没填", not dlg.lbl_err.isHidden())
-
-    dlg._on_cloud(None, RuntimeError("网络断了"))  # noqa: SLF001
+    dlg3 = ConsumableDialog(store3, theme.LIGHT)
+    dlg3._on_cloud_loaded(None, RuntimeError("网络断了"))  # noqa: SLF001
     check("读取失败与「没有记录」分开写",
-          dlg._cloud_note.text().startswith("读取失败"), True)  # noqa: SLF001
-    dlg.close()
+          dlg3._cloud_note.text().startswith("读取失败"), True)  # noqa: SLF001
+    dlg3.close()
+
+    # -- 枚举耗材（洗衣液）：显示「不足档位」，不套百分比 ------------------
+    enum_item = model.parse({"did": "d2", "siid": 6, "piid": 1,
+                             "label": "洗衣液", "low": 1})
+    dlg4 = ConsumableDialog(store3, theme.LIGHT, item=enum_item)
+    check("枚举项：属性下拉里认得出它（不再说「规格里已没有」）",
+          dlg4.cb_prop.currentData(), (6, 1))
+    check_true("枚举项显示「不足档位」", dlg4._low_widget.isVisibleTo(dlg4))  # noqa: SLF001
+    check("枚举项不显示两档百分比",
+          dlg4._warn_widget.isVisibleTo(dlg4), False)  # noqa: SLF001
+    check("档位下拉选中落盘那一档", dlg4.cb_low.currentData(), 1)
+    built = dlg4._build()  # noqa: SLF001
+    check("保存的是档位，不是百分比",
+          (built.low, built.warn, built.crit), (1, None, None))
+
+    # 2026-11-24 踩的坑：窗口高度原来读 ``body.sizeHint()``，而 body 被 setGeometry
+    # 钉死，报的是"窗口能给的"——枚举表单把「不足档位」压成一条缝（下拉只有 8px）。
+    num_item = model.parse({"did": "d2", "siid": 3, "piid": 1, "warn": 20, "crit": 10})
+    dlg6 = ConsumableDialog(store3, theme.LIGHT, item=num_item)
+    check_true("枚举表单的档位行有正常高度（不是被压成一条缝）",
+               dlg4._low_widget.sizeHint().height() >= 40,  # noqa: SLF001
+               str(dlg4._low_widget.sizeHint().height()))   # noqa: SLF001
+    check_true("数值表单比枚举表单高一行阈值",
+               dlg6.height() > dlg4.height(),
+               f"{dlg6.height()} vs {dlg4.height()}")
+    dlg6.close()
+    dlg4.close()
+
+    store3.prefs.add_consumable(enum_item)
+    page3 = ConsumablesPage(store3, theme.LIGHT)
+    row = next(r for r in page3._rows if r.item.siid == 6)
+    check("卡片上写档位文字，不写百分比", (row.state_text, row.percent), ("低", 50.0))
+    check("读到不足那档算轻提醒", row.level, model.LEVEL_WARN)
+    check("档位序号与总数给卡片画分段条", (row.state_index, row.state_count), (0, 2))
+
+    # 档位卡在三种样式下都不许画"进度"：两档里的"低"按比例是 50%，半满的环 / 染了
+    # 一半的卡会被读成"还剩一半洗衣液"，而这页要说的只是"到不足那档了"。
+    from mihome.ui.consumables_page import ConsumableCard  # noqa: PLC0415
+    ring_row = next(r for r in page3._rows if r.item.siid == 6)
+    ring_row.style = model.STYLE_RING
+    ring_img = ConsumableCard(ring_row, theme.LIGHT).grab().toImage()
+    probe = ring_img.pixelColor(RING_X + RING_D - RING_W // 2, RING_Y + RING_D // 2)
+    check_true("圆环样式：档位卡不画半满的弧",
+               probe.name().upper() != ring_row.color.upper(), probe.name())
+    fill_row = next(r for r in page3._rows if r.item.siid == 6)
+    fill_row.style = model.STYLE_FILL
+    fill_img = ConsumableCard(fill_row, theme.LIGHT).grab().toImage()
+    left = fill_img.pixelColor(8, 60)
+    right = fill_img.pixelColor(fill_img.width() - 8, 60)
+    check("整卡染色样式：档位卡两边同色（没按档位比例染）",
+          (left.name().upper(), right.name().upper()),
+          (left.name().upper(), left.name().upper()))
+
+    # -- 自选设备：老路一个字没动，也不再塞云端候选 -----------------------
+    dlg5 = ConsumableDialog(store3, theme.LIGHT)
+    dlg5._on_tab(1)  # noqa: SLF001
+    check("切到自选：显示「下一步」", dlg5.btn_next.isVisibleTo(dlg5), True)
+    check_true("自选树里有设备", dlg5.tree_device.topLevelItemCount() > 0)
+    check("上一版的云端候选按钮已经删干净",
+          [b for b in dlg5.findChildren(QPushButton)
+           if b.objectName() == "Candidate"], [])
+    dlg5.close()
 
     print()
     if FAILS:

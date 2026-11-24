@@ -361,7 +361,7 @@ class Store:
                         spec, did=node.did, model=node.model,
                         gang_names=node.gang_names, gang_rooms=node.gang_rooms
                     )
-                _register_keys(prev, node.did)
+                _register_keys(prev, node.did, self.prefs.consumables)
                 devices[node.did] = prev
                 continue
             card = (
@@ -381,8 +381,8 @@ class Store:
                 # 这里只存读过的属性，不会随规格膨胀
                 st.stamps = dict(prev.stamps)
                 st.updated_at = prev.updated_at
-            # 预先登记卡片属性的完整寻址
-            _register_keys(st, node.did)
+            # 预先登记卡片属性与耗材页订阅属性的完整寻址
+            _register_keys(st, node.did, self.prefs.consumables)
             devices[node.did] = st
         # 结构变化（增删设备）+ 状态变化（在线/改名）都要让界面知道
         changed = set(old) ^ set(devices)
@@ -929,9 +929,9 @@ class Store:
     ) -> None:
         """读一次云端耗材台账，按 ``did`` 分组交给 ``done``（主线程回调）。
 
-        **只读、按需**：只在「配置监控项」弹窗里问一次，不挂轮询——电池 / 滤芯是几天才
-        动一个百分点的量，而这一页的读数本来就走属性轮询。也**不做缓存**：用户配完
-        回头再看时，看到上一次的旧值比多等半秒更糟。
+        **只读、按需**：只在「添加设备 → 米家耗材」tab 打开时问一次，不挂轮询——
+        电池 / 滤芯是几天才动一个百分点的量，而这一页的读数本来就走属性轮询。
+        也**不做缓存**：用户配完回头再看时，看到上一次的旧值比多等半秒更糟。
 
         云端失败 ``done(None, error)``，界面据此显示"读取失败"；空 dict 才是"这台
         设备云端没有登记耗材"（这两件事不能混成一句）。
@@ -1547,17 +1547,40 @@ def _card_props(card: CardSpec) -> list[tuple[tuple[int, int], Any]]:
     return out
 
 
-def _register_keys(st: DeviceState, did: str) -> None:
-    """登记卡片各属性的完整寻址。
+def _register_keys(
+    st: DeviceState,
+    did: str,
+    consumables: Iterable[Any] = (),
+) -> None:
+    """登记卡片各属性的完整寻址，外加**耗材页订阅的属性**。
 
     controls / metrics / gangs / extra 参与轮询；advanced 不参与轮询（展开详情页
     才按需读），但也要登记——不然「更多功能」里的控件连写都写不出去
     （``set_value`` 查不到 ref）。
+
+    耗材项必须在这里一起登记（2026-11-24 修）：以前只登记卡片声明过的属性，而
+    ``poll_refs`` 靠 ``st.keys.get(key)`` 反查寻址——耗材项指向一个"卡片没画"的
+    属性时查不到 ref，于是**请求从来没发出去**，界面永远写「暂时读不到这个属性」。
+    鹿客 V6 Max 的大电池（``10.1``）就是这样：卡片只画了小电池（``4.1003``），
+    可实测 ``10.1`` 读得到 61%，只是没人问过。洗衣液（``6.1``）、老门锁的第二块
+    电池同理。登记之后回填也走 ``st.keys``，一并通了。
     """
     for key, prop in _card_props(st.card):
         st.keys[key] = PropRef(did, prop.siid, prop.piid)
     for prop in st.card.advanced:
         st.keys[(prop.siid, prop.piid)] = PropRef(did, prop.siid, prop.piid)
+    if st.spec is None:
+        return
+    spec_keys = {p.key for p in st.spec.properties}
+    for item in consumables:
+        if item.did != did or not item.is_configured:
+            continue
+        key = (item.siid, item.piid)
+        # 规格里没有的属性不登记：那多半是用户配过、后来设备换了型号，发出去只会
+        # 换回一个 -704042011，白白占一轮请求
+        if key in st.keys or key not in spec_keys:
+            continue
+        st.keys[key] = PropRef(did, item.siid, item.piid)
 
 
 def _card_keys(card: CardSpec) -> set[tuple[int, int]]:

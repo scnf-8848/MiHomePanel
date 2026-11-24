@@ -57,6 +57,16 @@ LEVEL_CRIT = 2
 KEY_UNSET = 0
 
 
+def _as_int(value: Any) -> int | None:
+    """尽量转成整数。枚举档位允许 0（有的设备 0 才是耗尽），不能用"真假值"判断。"""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _clamp_threshold(value: Any) -> int | None:
     """把落盘的阈值收敛成 ``None``（这一档没开）或 ``THRESHOLD_MIN..MAX``。
 
@@ -86,6 +96,11 @@ class Consumable:
     label: str = ""
     warn: int | None = WARN_DEFAULT
     crit: int | None = CRIT_DEFAULT
+    #: **枚举属性的"不足"档取值**（洗衣液：``1`` = 低）。这类属性只有档位没有百分比，
+    #: 两个数字阈值套不上（套了就是"剩 1 档才提醒"），所以单独存一个"读到哪个值算要
+    #: 换"。判档见 :func:`level_of_state`；``warn`` / ``crit`` 在这种情况下落盘为
+    #: ``None``，两套判法不会打架。
+    low: int | None = None
 
     @property
     def id(self) -> str:
@@ -102,10 +117,16 @@ class Consumable:
 
     @property
     def has_thresholds(self) -> bool:
-        return self.warn is not None or self.crit is not None
+        """有没有任何一条"该换了"的判据（百分比阈值或枚举不足档）。"""
+        return self.warn is not None or self.crit is not None or self.low is not None
+
+    @property
+    def is_level(self) -> bool:
+        """这条按**档位**判，不按百分比。档位值不落盘时只能靠 ``low`` 认出来。"""
+        return self.low is not None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        out = {
             "did": self.did,
             "siid": self.siid,
             "piid": self.piid,
@@ -113,6 +134,10 @@ class Consumable:
             "warn": self.warn,
             "crit": self.crit,
         }
+        # 枚举不足档只在真有时写：老条目 / 数值条目落盘保持原样，不凭空多一个 null
+        if self.low is not None:
+            out["low"] = self.low
+        return out
 
     def with_changes(self, **changes: Any) -> Consumable:
         """改一份副本。``replace`` 放在这里，界面层就不用 import dataclasses。"""
@@ -140,10 +165,14 @@ def parse(value: Any) -> Consumable | None:
         return None
     warn = _clamp_threshold(value.get("warn"))
     crit = _clamp_threshold(value.get("crit"))
+    low = _as_int(value.get("low"))
     if siid == 0:
         # 空壳不判档：带着阈值落盘只会让人以为"已经设好了"
         return Consumable(did=did, siid=KEY_UNSET, piid=KEY_UNSET,
                           label=str(value.get("label") or "").strip())
+    # 枚举项只按档位判：两档百分比留着没有意义，界面会显示成"20%"这种看不懂的数
+    if low is not None:
+        warn = crit = None
     # 两档都开时保证"红比橙更严"：用户把 10/20 填反了也按"橙 20 / 红 10"理解，
     # 否则会出现"变红的门槛比变橙还高"，永远到不了红色
     if warn is not None and crit is not None and crit >= warn:
@@ -157,6 +186,7 @@ def parse(value: Any) -> Consumable | None:
         label=str(value.get("label") or "").strip(),
         warn=warn,
         crit=crit,
+        low=low,
     )
 
 
@@ -166,7 +196,7 @@ def unset(did: str) -> Consumable:
 
 
 # ---------------------------------------------------------------------------
-# 云端耗材台账（只当候选清单，不自动落卡）
+# 云端耗材台账（「米家耗材」tab 用它直选，落卡后取值仍走属性轮询）
 # ---------------------------------------------------------------------------
 
 
@@ -190,22 +220,58 @@ def parse_prop(prop: Any) -> tuple[int, int] | None:
     return siid, piid
 
 
-def _cloud_threshold(raw: Any) -> int | None:
-    """云端 ``inadeq`` / ``exhaust`` → 阈值。只收百分比。
+def _cloud_obj(raw: Any) -> dict[str, Any]:
+    """云端 ``inadeq`` / ``exhaust`` 是 **JSON 字符串**（不是对象）。
 
-    这两个字段是 **JSON 字符串**（不是对象）：``{"val":"20","unit":"percentage",
-    "type":"range"}``。洗衣机洗衣液是 ``{"val":"1","type":"list"}``——那是档位不是
-    百分比，套两个数字阈值会变成"洗衣液剩 1 档才提醒"，所以只认 ``unit == percentage``。
-    ``val`` 为 0 时的结果与手工配置一致：这一档不启用（见 ``_clamp_threshold``）。
+    ``{"val":"20","unit":"percentage","type":"range"}`` / ``{"val":"1","type":"list"}``。
+    解析不出来一律当空对象——坏数据不该让整条耗材消失。
     """
-    if isinstance(raw, str):
-        try:
-            raw = json.loads(raw or "{}")
-        except ValueError:
-            return None
-    if not isinstance(raw, dict) or raw.get("unit") != "percentage":
+    if isinstance(raw, dict):
+        return raw
+    if not isinstance(raw, str):
+        return {}
+    try:
+        obj = json.loads(raw or "{}")
+    except ValueError:
+        return {}
+    return obj if isinstance(obj, dict) else {}
+
+
+def _cloud_threshold(raw: Any) -> int | None:
+    """云端 ``inadeq`` / ``exhaust`` → 百分比阈值。**只收 percentage**。
+
+    洗衣机洗衣液是 ``{"val":"1","type":"list"}``——那是档位不是百分比，套两个数字
+    阈值会变成"洗衣液剩 1 档才提醒"，所以这里只认 ``unit == percentage``；档位那条
+    走 :func:`_cloud_level`。``val`` 为 0 时的结果与手工配置一致：这一档不启用
+    （见 ``_clamp_threshold``）。
+    """
+    obj = _cloud_obj(raw)
+    if obj.get("unit") != "percentage":
         return None
-    return _clamp_threshold(raw.get("val"))
+    return _clamp_threshold(obj.get("val"))
+
+
+def _cloud_level(raw: Any) -> int | None:
+    """云端 ``inadeq`` 的**档位**阈值：``{"val":"1","type":"list"}`` → ``1``。
+
+    语义是"读到 1 就算不足"，与百分比无关。只有 ``type == "list"`` 才算；其余
+    （``range`` / ``value`` / 空对象）返回 ``None``。
+    """
+    obj = _cloud_obj(raw)
+    if obj.get("type") != "list":
+        return None
+    return _as_int(obj.get("val"))
+
+
+def _cloud_kind(inadeq: Any, exhaust: Any) -> str:
+    """这条耗材按什么判：``percent``（百分比）/ ``level``（档位）/ ``""``（不知道）。"""
+    for raw in (inadeq, exhaust):
+        obj = _cloud_obj(raw)
+        if obj.get("type") == "list":
+            return "level"
+        if obj.get("unit") == "percentage":
+            return "percent"
+    return ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -213,9 +279,9 @@ class CloudItem:
     """云端耗材台账里的一条。
 
     和 :class:`Consumable` 的关系：这条**不是用户配的**，是米家 App「耗材」页的数据。
-    只当候选清单——用户点它才经 :meth:`consumable` 转成监控项落盘（2026-11-24 用户
-    选定的形态）。**别拿它直接替换耗材页的数据源**：只有百分比、没有时间序列，
-    还会丢掉用户自定义的阈值与排序。
+    用来在「米家耗材」tab 里列出"云端认为这台设备有哪些耗材"（2026-11-24 用户定的
+    形态：两个 tab，各走各的路）。**别拿它替换耗材页的数据源**：台账只有百分比 / 档位、
+    没有时间序列，还会丢掉用户自定义的阈值与排序。
     """
 
     did: str
@@ -224,10 +290,17 @@ class CloudItem:
     #: 云端 description：比规格属性名细得多（同一块 ``battery-level`` 会写「5号电池」
     #: 「锂电池」「小电池」「大电池」，洗衣机写「洗衣液」）。
     label: str = ""
-    #: 剩余量，**字符串**百分比（``"17"``）。空串 = 这次没有读数（``state`` 2/3 那两组）。
+    #: 剩余量，**字符串**百分比（``"17"``）。空串 = 这次没有读数（档位类常年为空）。
     value: str = ""
     warn: int | None = None
     crit: int | None = None
+    #: 档位类的"不足"档（``low``）：读到它就算要换。与 ``warn`` / ``crit`` 二选一。
+    low: int | None = None
+    #: ``percent`` / ``level`` / ``""``。决定落卡后按哪种方式判档。
+    kind: str = ""
+    #: 原始 ``prop`` 串。拆不成 ``siid.piid`` 时（老门锁 ``prop.electricity`` /
+    #: ``prop.4106``）``siid`` / ``piid`` 是 0，只能列出来、加不了——报错比猜错好。
+    raw_prop: str = ""
 
     @property
     def key(self) -> tuple[int, int]:
@@ -237,20 +310,30 @@ class CloudItem:
     def method(self) -> str:
         return f"{self.siid}.{self.piid}"
 
+    @property
+    def readable(self) -> bool:
+        """能不能落成一条监控项（规格里有可寻址的属性）。"""
+        return self.siid > 0 and self.piid > 0
+
     def consumable(self) -> Consumable:
-        """转成一条可直接落盘的监控项（名称与阈值都带上，用户可再改）。"""
+        """转成一条可直接落盘的监控项（名称与判档方式都带上）。"""
         return Consumable(
             did=self.did, siid=self.siid, piid=self.piid,
-            label=self.label, warn=self.warn, crit=self.crit,
+            label=self.label, low=self.low,
+            warn=self.warn, crit=self.crit,
         )
 
     def summary(self) -> str:
-        """一行「滤芯 · 剩余 17% · 不足 5%」，给候选按钮用。"""
-        parts = [self.label or self.method]
+        """一行「滤芯 · 剩余 17% · 不足 5%」，给候选按钮 / 列表用。"""
+        parts = [self.label or self.method or self.raw_prop]
         if self.value:
             parts.append(f"剩余 {self.value}%")
         if self.warn is not None:
             parts.append(f"不足 {self.warn}%")
+        elif self.low is not None:
+            # 档位类的"阈值"是个取值而不是门槛（洗衣液：读到「低」就提醒），
+            # 说成"不足 1%"会被当成百分比
+            parts.append("到不足档时提醒")
         return " · ".join(parts)
 
 
@@ -261,8 +344,11 @@ def cloud_items(payload: Any) -> dict[str, list[CloudItem]]:
 
     **必须遍历所有 ``items`` 分组**：云端按 ``state`` 把条目分成几组（本机实测 1/2/3
     三组，2/3 组的 ``value`` 是空串），上游 mijiaAPI 只取 ``items[0]``，会漏掉另外两组。
-    ``details`` 是**列表**（单电池 1 条、门锁双电池 2 条）。同一 ``(siid, piid)`` 只留一条，
-    免得候选里出现两个一样的按钮。
+    ``details`` 是**列表**（单电池 1 条、门锁双电池 2 条）。
+
+    ``prop`` 拆不成 ``siid.piid`` 的**也收进来**（``siid = piid = 0``）：那台设备的
+    耗材在米家 App 里是有的，只是我们寻不到地址，列出来并写明原因，比悄悄少一条好。
+    同一 ``(siid, piid)`` 只留一条，免得列表里出现两个一样的。
     """
     out: dict[str, list[CloudItem]] = {}
     if not isinstance(payload, dict):
@@ -287,11 +373,12 @@ def cloud_items(payload: Any) -> dict[str, list[CloudItem]]:
                 for detail in details:
                     if not isinstance(detail, dict):
                         continue
-                    key = parse_prop(detail.get("prop"))
-                    if key is None:
-                        continue
+                    raw_prop = str(detail.get("prop") or "")
+                    key = parse_prop(raw_prop) or (0, 0)
+                    inadeq = detail.get("inadeq")
+                    exhaust = detail.get("exhaust")
                     rows = out.setdefault(did, [])
-                    if any(c.key == key for c in rows):
+                    if key != (0, 0) and any(c.key == key for c in rows):
                         continue
                     rows.append(
                         CloudItem(
@@ -300,8 +387,11 @@ def cloud_items(payload: Any) -> dict[str, list[CloudItem]]:
                             piid=key[1],
                             label=str(detail.get("description") or "").strip(),
                             value=str(detail.get("value") or "").strip(),
-                            warn=_cloud_threshold(detail.get("inadeq")),
-                            crit=_cloud_threshold(detail.get("exhaust")),
+                            warn=_cloud_threshold(inadeq),
+                            crit=_cloud_threshold(exhaust),
+                            low=_cloud_level(inadeq),
+                            kind=_cloud_kind(inadeq, exhaust),
+                            raw_prop=raw_prop,
                         )
                     )
     return out
@@ -352,6 +442,39 @@ def level_color_key(level: int) -> str:
     return {LEVEL_CRIT: "crit", LEVEL_WARN: "warn"}.get(level, "ok")
 
 
+def level_of_state(value: Any, low: int | None) -> int:
+    """按**枚举档位**判档：读到 ``low`` 那档才算要换（``LEVEL_WARN``）。
+
+    洗衣液这类属性只有 1/2 两档（低 / 标准），没有百分比可比。云端把它写成
+    ``inadeq = {"val":"1","type":"list"}``，含义就是"读到 1 就该换"。``low`` 为空
+    → 永不提醒，卡片只显示档位文字（用户 2026-11-24：非数值的也要能表达出来）。
+    """
+    if low is None or value is None or isinstance(value, bool):
+        return LEVEL_NONE
+    if _as_int(value) == low:
+        return LEVEL_WARN
+    return LEVEL_NONE
+
+
+def state_text(prop: Any, value: Any) -> str:
+    """枚举读数 → 中文短名（「低」「标准」）。翻不出来就退回原始值。
+
+    ``prop`` 传 ``PropertySpec``（它有 ``option``）；拿不到规格时退回 ``str(value)``，
+    总比不显示强——"读到 1"至少说明数据来了。
+    """
+    if value is None:
+        return ""
+    option = None
+    if prop is not None:
+        try:
+            option = prop.option(value)
+        except AttributeError:
+            option = None
+    if option is not None:
+        return option.display_short
+    return str(value)
+
+
 __all__ = [
     "CRIT_DEFAULT",
     "CloudItem",
@@ -371,7 +494,9 @@ __all__ = [
     "fill_percent",
     "level_color_key",
     "level_of",
+    "level_of_state",
     "parse",
     "parse_prop",
+    "state_text",
     "unset",
 ]

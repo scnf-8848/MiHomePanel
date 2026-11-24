@@ -394,7 +394,8 @@ mihome/
     relay.py    摄像头跨网：云端 P2P 授权、小米 relay 握手、本机 UDP 代理（无新依赖）
     catalog.py  品类 → 卡片形态映射（26 个品类 + 槽位候选表）
     consumables.py 耗材监控项：一条 = 设备的一个属性 + 两档阈值（阈值 / 余量换算 / 判档），
-                外加云端耗材台账的归一化 `cloud_items()`——只当候选清单，不自动落卡
+                枚举属性（洗衣液）用 `low`（不足档）判、不套百分比；
+                外加云端台账归一化 `cloud_items()`——「米家耗材」tab 用它直选
     enum_text.py 云端文案 → 界面短名：全局词汇 + 规则 + 兜底，三层查找的入口（原文保留在 ValueOption.label）
     freshness.py 读数陈旧判定：updateTime 距今多久，阈值与文案（阈值见 scripts/probe_staleness.py）
     spec.py     MIoT-Spec 原始规格解析（单位、事件、中文 comment、access）
@@ -427,8 +428,8 @@ mihome/
     detail.py       设备详情页（模式行以 scene-mode 为准的型号适配也在这里）
     consumables_page.py 耗材页：卡片墙（横条 / 整卡染色 / 圆环三选一）+ 三种排序 +
                     跨家庭分组 + 侧栏两档圆点的计数来源
-    consumable_dialog.py 耗材监控项配置弹窗：两步（只选设备 → 配属性 / 阈值），
-                    空卡那一步会列「云端耗材」建议（点一下填好属性 / 名称 / 阈值）
+    consumable_dialog.py 耗材监控项配置弹窗：添加时两个 tab（「米家耗材」按云端台账选、
+                    「自选设备」走原树）；编辑时配属性 / 阈值，枚举属性换成「不足档位」
     camera_view.py  详情页实时画面：QMediaPlayer + 自绘圆角，含加载 / 错误态
     camera_card.py  摄像头卡片：外壳还是 DeviceCard，内容带换成 CameraView（2×2 样式）
     camera_wall.py  墙面取流仲裁：同时只允许一张卡片播放，滚出屏 / 切换即 stop

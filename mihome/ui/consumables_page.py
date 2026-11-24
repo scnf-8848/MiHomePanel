@@ -156,6 +156,15 @@ class Row:
     level: int
     #: 读数本身（``"78%"`` / ``"—"``）。拿不到数值时只显示这个，不参与变色。
     value_text: str
+    #: **档位读数的中文短名**（「低」「标准」），只有枚举类耗材（洗衣液）才有。
+    #: 非空表示"这条量的不是百分比"：卡片不画血条 / 环弧，改画文字，判档走
+    #: :func:`core.consumables.level_of_state`。和 ``percent is None``（读不到）必须
+    #: 区分开——一个是"没有这个数"，一个是"这个数不是百分比"。
+    state_text: str = ""
+    #: 档位序号（0 起）与档位总数。``state_count > 1`` 时血条改画**分段档位条**，
+    #: 一眼能看出这不是百分比——不然一条 50% 的横条会被读成"还剩一半洗衣液"。
+    state_index: int = -1
+    state_count: int = 0
     #: 卡片画法。**整页一个**（``prefs.consumable_style``），放在行里只是让卡片
     #: 绘制时不用回头查 store；换样式时页面把每行的这个字段统一改掉再重画。
     style: str = model.STYLE_DEFAULT
@@ -215,6 +224,10 @@ class Row:
         # 因为连"该不该换"都还谈不上
         if self.is_shell:
             return (2, 999.0)
+        # 档位类先判：它的 ``percent`` 只是"第几档 / 共几档"的折算（两档里的低 =
+        # 50%），拿它排会把"已经该换了"排到 60% 后面
+        if self.state_text:
+            return (0, 0.0) if self.level > 0 else (1, 0.0)
         if self.percent is None:
             return (1, 999.0)
         return (0, self.percent)
@@ -270,6 +283,9 @@ class ConsumableCard(QWidget):
         # 卡片上写不下的部分在悬停时给全：设备 / 位置 / 属性三段用同一个分隔符
         # （副标题那条里 ``|`` 只隔位置和属性名，混进 tooltip 会有两种竖线）
         tip = "｜".join(p for p in (row.device, row.place_text, row.name) if p)
+        if row.state_text:
+            # 档位类没有百分比，悬停时把"这是档位不是余量"说清楚
+            tip += f"｜档位：{row.state_text}"
         # 卡片右下角只写「3 天前更新」，悬停补一句说清是哪个数
         if row.updated:
             tip += f"｜读数：{row.updated}"
@@ -348,10 +364,13 @@ class ConsumableCard(QWidget):
             self._paint_shell(p, rect, row)
             p.end()
             return
-        if row.style == model.STYLE_FILL:
+        if row.style == model.STYLE_FILL and not row.state_text:
             # 整卡当轨道：从左往右按比例染，颜色跟着档位走。底色压得很淡
             # （0.16），卡上的字仍然是正文色——染得太重会读不清，而这页的字
             # 就是读数本身。
+            #
+            # 档位类（``state_text``）**不染**：两档里"低"占 50%，染半张卡会被读成
+            # "还剩一半洗衣液"。它没有进度可言，靠右上角的文字表达。
             p.save()
             p.setClipPath(path)
             if ratio > 0:
@@ -387,9 +406,10 @@ class ConsumableCard(QWidget):
         elif row.style == model.STYLE_RING:
             self._paint_ring(p, ratio, row)
 
-        if row.percent is None and row.style != model.STYLE_RING:
+        if row.percent is None and not row.state_text and row.style != model.STYLE_RING:
             # 横卡读不到值：给一句话，别让空白像"坏了"。圆环卡不需要——圆心那个
-            # 大破折号本身就是"没读到"，再塞一句话反而挤掉环。
+            # 大破折号本身就是"没读到"，再塞一句话反而挤掉环。档位类也不用：右上角
+            # 写着「低 / 标准」，那是读到了，只是量的不是百分比。
             draw_text(p, QRect(PAD, self.height() - BAR_BOTTOM - 24, 160, 16),
                       "暂时读不到这个属性", size=11, color=self._p.text_mute)
 
@@ -437,9 +457,26 @@ class ConsumableCard(QWidget):
         p.drawLine(cx, cy - 5, cx, cy + 5)
 
     def _paint_bar(self, p: QPainter, ratio: float, row: Row) -> None:
-        """底部横条（"血条"）。**轨道永远画满**，只有填充随比例缩短。"""
+        """底部横条（"血条"）。**轨道永远画满**，只有填充随比例缩短。
+
+        档位类耗材（``state_count > 1``）画成**分段**：有几档就几段，当前档及更差的
+        档染色。不画成分段的话，两档里的"低"会显示成 50%，会被读成"还剩一半"。
+        """
         track = QRectF(PAD, self.height() - BAR_BOTTOM - BAR_H,
                        self.width() - PAD * 2, BAR_H)
+        if row.state_count > 1:
+            count = row.state_count
+            gap = 3.0
+            seg_w = (track.width() - gap * (count - 1)) / count
+            for i in range(count):
+                seg = QRectF(track.left() + i * (seg_w + gap), track.top(), seg_w, BAR_H)
+                # 已到的档（含当前）染档位色，其余是空轨道；顺序从左到右 = 从差到好，
+                # 这样"往右长"和百分比条的直觉一致
+                filled = i <= row.state_index
+                p.setBrush(QColor(row.color) if filled
+                           else QColor(theme.blend(self._p.card, self._p.text, 0.12)))
+                p.drawRoundedRect(seg, BAR_H / 2, BAR_H / 2)
+            return
         p.setPen(Qt.NoPen)
         p.setBrush(QColor(theme.blend(self._p.card, self._p.text, 0.12)))
         p.drawRoundedRect(track, BAR_H / 2, BAR_H / 2)
@@ -478,17 +515,27 @@ class ConsumableCard(QWidget):
         p.setPen(QPen(QColor(theme.blend(self._p.card, self._p.text, 0.12)),
                       RING_W, Qt.SolidLine, Qt.FlatCap))
         p.drawArc(track, start * 16, span * 16)
-        if row.percent is not None and ratio > 0:
+        if row.percent is not None and ratio > 0 and not row.state_text:
+            # 档位类不画弧：两档里的"低"按比例是 50%，一根半满的环会被读成"还有一半"。
+            # 环心那个「低 / 标准」才是这条要表达的东西。
             p.setPen(QPen(QColor(row.color), RING_W, Qt.SolidLine, Qt.FlatCap))
             p.drawArc(track, start * 16, int(span * 16 * ratio))
 
         # 环心两行：百分比在上、属性名在下，整体相对环心上抬（见 RING_CENTER_LIFT）。
         cx = outer.center().x()
         cy = outer.center().y()
-        text = "—" if row.percent is None else f"{row.percent:.0f}%"
+        # 环心第一行：档位类写文字（「低」），其余写百分比。档位文字两个字，
+        # 用 18px 会顶到环线上，降两号；颜色仍按档位走。
+        if row.state_text:
+            text = row.state_text
+            size = RING_CENTER_SIZE - 2
+        else:
+            text = "—" if row.percent is None else f"{row.percent:.0f}%"
+            size = RING_CENTER_SIZE
         draw_text(p, QRect(int(cx) - 60, int(cy - RING_CENTER_LIFT) - 12, 120, 24), text,
-                  size=RING_CENTER_SIZE,
-                  color=(self._p.text_mute if row.percent is None else row.color),
+                  size=size,
+                  color=(self._p.text_mute if row.percent is None and not row.state_text
+                         else row.color),
                   weight=QFont.DemiBold, align=Qt.AlignCenter, elide=False)
         if row.name:
             # 宽度取标签**下沿**那一层的弦长再留 4px：环越往下越窄，按中线算会把
@@ -747,6 +794,25 @@ class ConsumablesPage(QWidget):
             value = st.get(item.siid, item.piid)
             span = prop.value_range[:2] if prop is not None and prop.value_range else None
             percent = model.fill_percent(value, span)
+            level = model.level_of(percent, item.warn, item.crit)
+            text = "—" if percent is None else f"{percent:.0f}%"
+            state, state_index, state_count = "", -1, 0
+            if prop is not None and prop.kind == "enum":
+                # 档位类耗材（洗衣液：「低 / 标准」）：这条量的不是百分比，血条画不出来，
+                # 改在卡片上写档位文字、血条改画分段档位条，判档看"有没有到云端说的
+                # 不足那档"。2026-11-24 用户报的问题：洗衣液被硬当百分数、属性还选错。
+                state = model.state_text(prop, value)
+                state_count = len(prop.value_list)
+                state_index = next(
+                    (i for i, o in enumerate(prop.value_list) if o.value == value), -1
+                )
+                text = state or "—"
+                percent = (
+                    (state_index + 1) * 100.0 / state_count
+                    if state_index >= 0 and state_count
+                    else None
+                )
+                level = model.level_of_state(value, item.low)
             names = name_cache.get(item.did)
             if names is None:
                 names = name_cache[item.did] = (
@@ -765,8 +831,11 @@ class ConsumablesPage(QWidget):
                     device=st.name,
                     room=st.room,
                     percent=percent,
-                    level=model.level_of(percent, item.warn, item.crit),
-                    value_text="—" if percent is None else f"{percent:.0f}%",
+                    level=level,
+                    value_text=text,
+                    state_text=state,
+                    state_index=state_index,
+                    state_count=state_count,
                     style=style,
                     updated=note,
                     stale=stale,
