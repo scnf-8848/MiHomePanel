@@ -852,26 +852,45 @@ class ConsumablesPage(QWidget):
             return sorted(rows, key=lambda r: (r.sort_key, r.name))
         if mode == "room":
             order = self._room_order()
-            return sorted(rows, key=lambda r: (order.get(r.place_key, 999), r.sort_key, r.name))
+            # 仍查不到序号的（设备已删、房间也删了、家庭 id 为空）不能都落到
+            # 同一个兜底值：桶内会退化成"按余量全局排"，同一间房的卡被别的房间
+            # 插开，组头重复。给它们按**首次出现**的顺序编号，保证同 place_key
+            # 一定相邻（顺序就是 prefs 里的添加顺序，稳定）。
+            extra: dict[tuple[str, str], int] = {}
+            base = len(order)
+
+            def block(r: Row) -> int:
+                rank = order.get(r.place_key)
+                if rank is not None:
+                    return rank
+                if r.place_key not in extra:
+                    extra[r.place_key] = base + len(extra)
+                return extra[r.place_key]
+
+            return sorted(rows, key=lambda r: (block(r), r.sort_key, r.name))
         return rows
 
     def _room_order(self) -> dict[tuple[str, str], int]:
         """``(家庭 id, 房间 id)`` → 序号，顺序 = 家庭顺序 → 家内房间顺序。
 
-        用 ``store.rooms()`` **不传参**：它返回全部家庭，而且已经按
-        ``prefs.order_homes`` + 每家的 ``prefs.order_rooms`` 排过——和顶栏、侧栏
-        是同一套顺序，不用自己拼。
+        用 ``store.homes()`` 里的**全部房间**，**不用 ``store.rooms()``**：那个只
+        返回"有设备、且设备没被隐藏"的房间（见它的 ``if items``）。被隐藏设备的
+        房间查不到序号，于是和"设备未分房间"一样全落进兜底值；同一兜底值之间
+        排序退化成"全局按余量"，**同一间房的卡会被别的房间插开**，组头跟着重复
+        ——2026-11-24 用户报的"同一台门锁的两块电池各成一组、中间夹着别的房间"，
+        真因就是这两个房间的设备都在「隐藏」分组里（``rooms()`` 里它们是空的）。
 
         键必须是 id 对，不能是房间名：两个家都可能有"客厅"，按名字分组会把它们
         并成一组（2026-11-21 前就是按名字）。
-
-        注意 ``rooms()`` 只返回**有设备**的房间（且过滤了隐藏设备），所以被隐藏
-        设备的耗材在这里查不到 → 落到 999 排最后。这是既有行为，不是这次引入的。
         """
         order: dict[tuple[str, str], int] = {}
         try:
-            for index, room in enumerate(self.store.rooms()):
-                order.setdefault((room.home, room.room), index)
+            index = 0
+            for home in self.store.homes():
+                ids = [room.id for room in home.rooms]
+                for room_id in self.store.prefs.order_rooms(home.id, ids):
+                    order[(home.id, room_id)] = index
+                    index += 1
         except Exception:  # 拓扑还没加载完：分组退化成"同序"，不影响显示
             return {}
         return order
@@ -1026,9 +1045,18 @@ class ConsumablesPage(QWidget):
     def _reflow(self) -> None:
         cols = self._columns()
         self._cols = cols
-        # 清空布局（保留控件，稍后重新 addWidget）
+        # 清空布局：**卡片留着复用**（在 ``self._cards`` 里，稍后重新 addWidget），
+        # 别的（组头 QLabel）必须真删。组头是每次 reflow 现造的，只 ``takeAt``
+        # 不销毁的话它就脱离布局、按上一次的坐标继续画在画布上——每 resize /
+        # 重排一次多一整套，用户看到的是"同一个房间被分成两组"（2026-11-24：
+        # 同一台门锁的两块电池各成一组，中间还夹着别的房间）。
+        keep = {id(card) for card in self._cards.values()}
         while self._grid.count():
-            self._grid.takeAt(0)
+            item = self._grid.takeAt(0)
+            widget = item.widget()
+            if widget is not None and id(widget) not in keep:
+                widget.setParent(None)
+                widget.deleteLater()
         for column in range(self._grid.columnCount() + 1):
             self._grid.setColumnStretch(column, 0)
 

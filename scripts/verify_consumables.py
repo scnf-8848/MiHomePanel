@@ -1110,6 +1110,57 @@ def main() -> int:
           (left.name().upper(), right.name().upper()),
           (left.name().upper(), left.name().upper()))
 
+    # -- 按房间分组：同一间房只许有一个组头（2026-11-24 用户报的）-----------
+    # 现象：同一台门锁的两块电池（同 did、两个 siid）各带一个组头，中间还夹着
+    # 别的房间。真因不在排序（同一 did 的 place_key 必然相同），而是
+    # ``_reflow`` 每次现造组头 QLabel、清布局时只 takeAt 不销毁：旧组头脱离布局
+    # 后按上一次的坐标继续画在画布上，每 resize / 重排一次就多一整套。
+    store5 = make_store(Path(tempfile.mkdtemp()))
+    store5.prefs.set_consumable_sort("room")
+    for d, s, p, label in [("d1", 2, 9, "滤芯"), ("d1", 4, 1, "电池"),
+                           ("d2", 3, 1, "用水"), ("d2", 6, 1, "洗衣液")]:
+        store5.prefs.add_consumable(
+            model.parse({"did": d, "siid": s, "piid": p, "label": label}))
+    wall5 = ConsumablesPage(store5, theme.LIGHT)
+    wall5.resize(900, 700)
+    wall5.show()
+    QApplication.processEvents()
+
+    def _headers() -> list[str]:
+        return [w.text() for w in wall5._canvas.findChildren(QLabel)  # noqa: SLF001
+                if w.objectName() == "RoomHeader" and w.isVisible()]
+
+    check("同一台设备的两条耗材归同一个组头",
+          _headers(), ["我的家 · 客厅", "我的家 · 阳台"])
+    wall5._reflow()  # noqa: SLF001 只重排不重建，最容易漏删组头的一条路
+    QApplication.processEvents()
+    check("重排一次不会多出一套组头",
+          _headers(), ["我的家 · 客厅", "我的家 · 阳台"])
+    wall5.resize(520, 700)
+    QApplication.processEvents()
+    check("缩窗换列数也不残留", len(_headers()), 2)
+    wall5.deleteLater()
+
+    # 隐性坑：``store.rooms()`` 只返回"有设备、且设备没被隐藏"的房间。排序若按它
+    # 取序号，被隐藏设备的房间就查不到 → 和别的查不到的房间共用一个兜底值，
+    # 桶内按余量混排，同一间房的卡被插开（设备被隐藏的那两间房各有一条耗材，
+    # 都被塞进同一个兜底桶，于是两条同房耗材各成一组）。
+    store6 = make_store(Path(tempfile.mkdtemp()))
+    store6.prefs.set_consumable_sort("room")
+    for d, s, p, label in [("d1", 2, 9, "滤芯"), ("d1", 4, 1, "电池"),
+                           ("d2", 3, 1, "用水"), ("d2", 6, 1, "洗衣液")]:
+        store6.prefs.add_consumable(
+            model.parse({"did": d, "siid": s, "piid": p, "label": label}))
+    store6.prefs.set_hidden("d2", True)   # 阳台整间从 rooms() 里消失
+    wall6 = ConsumablesPage(store6, theme.LIGHT)
+    order6 = wall6._room_order()  # noqa: SLF001
+    check("隐藏设备的房间仍占一个序号（不塌进兜底桶）",
+          (store6.prefs.is_hidden("d2"), len(order6)), (True, 2))
+    check("同一间房的两条在顺序里挨着",
+          [r.place_key for r in wall6._rows],  # noqa: SLF001
+          [("h1", "r1"), ("h1", "r1"), ("h1", "r2"), ("h1", "r2")])
+    wall6.deleteLater()
+
     # -- 米家耗材加进来的项：必须落卡、必须去读（2026-11-24 用户报的 bug）----
     # 现象：弹窗里点「添加到耗材页」后，prefs 有这条、弹窗里也不再列（被 taken
     # 过滤），唯独墙上没卡。两个原因都在这段盯着：①add_item 只认 selected_did，

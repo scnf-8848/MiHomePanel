@@ -133,7 +133,13 @@
   云端这条路没有它 → 添加成功却直接 return，prefs 里有、弹窗里不再列、墙上没卡；再加
   `Store.register_consumables()` 做增量登记（`_register_keys` 只在重建拓扑时跑），
   `refresh()` 开头整体对一遍自愈旧项，否则新属性一次也不会被轮询（卡片停在「—」）。
-  验证 `verify_consumables.py` 224 项。接口实测见
+  **同日再修「按房间分组被拆开」**：`_room_order` 原来按 `store.rooms()` 取序号，而那
+  个只返回"有设备、且设备没被隐藏"的房间——隐藏设备的房间查不到 → 与其它查不到的一起
+  共用一个兜底值，桶内退化成按余量排，同房间的卡被别的房间插开、组头重复（同一台
+  门锁的两块电池因此各成一组、中间夹着别的房间）。改成用 `homes()` 的全部房间编号，
+  `_ordered` 对仍查不到的按首次出现顺序兜底；顺带修 `_reflow` 不清旧组头
+  （每重排一次多一套）。
+  验证 `verify_consumables.py` 224 → 229 项。接口实测见
   `docs/reference/mijia-api-ecosystem-research.md` §3.4，界面口径见
   `docs/dev/ui.md`「添加设备：『米家耗材』/『自选设备』两个 tab」。
 
