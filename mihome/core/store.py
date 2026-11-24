@@ -38,6 +38,7 @@ from .api import (
     explain,
 )
 from .catalog import CardSpec, build_card, summary_line
+from .consumables import CloudItem, cloud_items
 from .geek import Entry as GeekEntry
 from .geek import GeekError
 from .geek import candidates as geek_candidates
@@ -921,6 +922,29 @@ class Store:
             if name:
                 out[did] = name
         return out
+
+    def fetch_consumable_items(
+        self,
+        done: Callable[[dict[str, list[CloudItem]] | None, BaseException | None], None],
+    ) -> None:
+        """读一次云端耗材台账，按 ``did`` 分组交给 ``done``（主线程回调）。
+
+        **只读、按需**：只在「配置监控项」弹窗里问一次，不挂轮询——电池 / 滤芯是几天才
+        动一个百分点的量，而这一页的读数本来就走属性轮询。也**不做缓存**：用户配完
+        回头再看时，看到上一次的旧值比多等半秒更糟。
+
+        云端失败 ``done(None, error)``，界面据此显示"读取失败"；空 dict 才是"这台
+        设备云端没有登记耗材"（这两件事不能混成一句）。
+        """
+        self.worker.submit(
+            self.client.consumable_items,
+            (),
+            priority=PRIORITY_DATA,
+            label="consumables",
+            callback=lambda payload, error: done(
+                None if error is not None else cloud_items(payload), error
+            ),
+        )
 
     def fetch_messages(
         self,

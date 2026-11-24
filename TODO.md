@@ -19,17 +19,7 @@
 > **监控页已落地**（2026-11-19）：三种入口都接了页面，「功能区收尾」只剩图标 / 排布 /
 > 常驻这些视觉待定，不再占 A 段条目，见「最近完成」。
 
-## B. 待排期：想法已记、明确暂不做（5 条）
-
-- **耗材用云端清单当候选**（2026-11-24 提，接口已实测）：`/v2/home/standard_consumable_items`
-  能直接列出"云端认为这台设备有哪些耗材"，本机 2 家 14 台 / 17 条，`prop` 15 条能拆成
-  `siid.piid`（剩下两条是老门锁的 `prop.electricity` / `prop.4106`），还自带
-  `inadeq`/`exhaust` 阈值与「5号电池 / 锂电池 / 洗衣液」这种细名字。推荐形态：**在
-  「添加设备 / 添加耗材」里多一列候选**，点一下自动填 `did:siid.piid` + 名称 + 阈值，
-  仍由用户确认落卡——**不推翻"用户自选属性、不做全屋自动扫描"**；不建议整页改成直读台账
-  （会丢自定义阈值 / 排序 / 三种样式，而且只有百分比没有时间序列）。
-  结论与限制见 `docs/reference/mijia-api-ecosystem-research.md` §3.4，探针
-  `scripts/probe_consumables.py`。等用户决定要不要做。
+## B. 待排期：想法已记、明确暂不做（4 条）
 
 - **多账号**：超出米家原版；方案已写（`<data>/accounts/<uid>/auth.json` + 换 Client 重建
   Store），注意 `capabilities` / `icons` / `prefs` 按账号隔离
@@ -125,7 +115,17 @@
 进程 CPU，记「点第一格 → 六格全出画」的秒数；若选源栏掉帧就把 `THUMB_REFRESH_SECONDS`
 调大或改成"只更新内存、停播时才写盘"。
 
-## 最近完成（2026-11-15 ~ 11-23）
+## 最近完成（2026-11-15 ~ 11-24）
+
+- **耗材：云端台账当候选清单（2026-11-24）**：早上先实测 `/v2/home/standard_consumable_items`
+  （只读，2 家 14 台 / 17 条，`prop` 15 条能拆成 `siid.piid`，自带 `inadeq`/`exhaust`
+  阈值；`items` 按 `state` 分三组、上游只取第一组会漏），用户当天定"只当候选、不自动落卡"。
+  落地：`core/consumables.py`（`CloudItem` / `parse_prop` / `cloud_items`）、
+  `Client.consumable_items`、`Store.fetch_consumable_items`（打开弹窗读一次，不轮询不缓存）、
+  配置弹窗空卡时的「云端耗材」建议（点一下填属性 / 名称 / 阈值，已配过的不再出现）。
+  验证 `verify_consumables.py` 第 11 组（现 203 项）。接口实测见
+  `docs/reference/mijia-api-ecosystem-research.md` §3.4，界面口径见
+  `docs/dev/ui.md`「第二步的『云端耗材』建议」。
 
 - **消息中心（只读，2026-11-23，当晚改形态）**：顶栏温湿度右边多一颗「消息」胶囊（铃铛，
   占的是原搜索框的位置），**鼠标停上去浮出一张列表、移开 260 ms 收起**，不再点开对话框。

@@ -33,6 +33,7 @@ from PySide6.QtWidgets import (
     QLayout,
     QLineEdit,
     QPushButton,
+    QSizePolicy,
     QTreeWidgetItem,
     QVBoxLayout,
     QWidget,
@@ -85,6 +86,12 @@ def _qss(p: theme.Palette) -> str:
         border-radius: 9px; padding: 0 12px; min-height: 32px; font-size: 13px;
     }}
     QPushButton#Danger:hover {{ border-color: {theme.DANGER}; }}
+    QPushButton#Candidate {{
+        background: transparent; color: {p.text}; border: 1px dashed {p.border};
+        border-radius: 8px; padding: 0 10px; min-height: 26px; font-size: 12px;
+        text-align: left;
+    }}
+    QPushButton#Candidate:hover {{ border-color: {p.accent}; color: {p.accent}; }}
     """
 
 
@@ -127,6 +134,8 @@ class ConsumableDialog(QDialog):
         self.added: Consumable | None = None
         #: 用户点了删除
         self.deleted = False
+        #: 窗已经关掉。取数回调可能晚到，那时再碰控件就是访问已销毁对象
+        self._closed = False
 
         if item is None:
             self.setWindowTitle("添加设备")
@@ -166,6 +175,8 @@ class ConsumableDialog(QDialog):
         self.ed_crit: QLineEdit | None = None
         self.btn_save: QPushButton | None = None
         self.lbl_err: QLabel | None = None
+        self._cloud_note: QLabel | None = None
+        self._cloud_list: QVBoxLayout | None = None
 
         if item is None:
             self._build_picker(body, col)
@@ -195,7 +206,8 @@ class ConsumableDialog(QDialog):
         box.addWidget(self.tree_device)
         tip = QLabel(
             "选一台设备，墙上会先落一张空卡；点那张卡再挑属性和阈值。"
-            "按家庭列出所有含可监控数值属性的设备，离线设备也能选。",
+            "按家庭列出所有含可监控数值属性的设备，离线设备也能选。"
+            "云端登记过耗材的设备（滤芯、电池、洗衣液），第二步会先给出几条建议。",
             body,
         )
         tip.setObjectName("Hint")
@@ -321,6 +333,11 @@ class ConsumableDialog(QDialog):
             name = state.name
         col.addLayout(self._row("设备", self._fixed(name)))
 
+        # 云端耗材候选只出现在**空壳**上：已经配好的条目不需要建议，而用户点开空卡
+        # 的那一刻正是"这台设备该监控哪个属性"的唯一时刻。
+        if not item.is_configured and state is not None:
+            self._build_cloud(body, col)
+
         # 属性一律给下拉，配好之后也还能改：门锁那种「两块电池都叫电量」的设备，
         # 第一次多半是猜的，锁死等于让人删了重来
         self.cb_prop = Combo(self._p)
@@ -393,6 +410,101 @@ class ConsumableDialog(QDialog):
         col.addLayout(row)
 
     # -- 构件 ------------------------------------------------------------
+    def _build_cloud(self, body: QWidget, col: QVBoxLayout) -> None:
+        """「云端认为这台设备有哪些耗材」——候选按钮，点一下把属性 / 名称 / 阈值填好。
+
+        数据来自 ``/v2/home/standard_consumable_items``（米家 App「耗材」页的台账），
+        2026-11-24 用户选定"当候选清单用"：**只建议、不落卡**，仍然要按保存才生效。
+        为什么值得加：云端知道哪些属性算耗材（用户得在几十个数值属性里翻）、能给双电池
+        分出「5号电池 / 锂电池」，还自带"不足 / 耗尽"阈值——正是手配最费劲的三步。
+
+        只在打开弹窗时读一次，不缓存（见 ``Store.fetch_consumable_items``）。
+        """
+        box = QVBoxLayout()
+        box.setContentsMargins(0, 0, 0, 0)
+        box.setSpacing(4)
+        self._cloud_note = QLabel("读取中…", body)
+        self._cloud_note.setObjectName("Hint")
+        box.addWidget(self._cloud_note)
+        self._cloud_list = QVBoxLayout()
+        self._cloud_list.setContentsMargins(0, 0, 0, 0)
+        self._cloud_list.setSpacing(4)
+        box.addLayout(self._cloud_list)
+        # 自己拼这一行而不是走 ``_row``：``_row`` 末尾有 stretch，候选按钮只会缩到
+        # 文字宽度，几条长短不一会参差；这里让它们撑满整行，读起来像一列候选项。
+        line = QHBoxLayout()
+        line.setSpacing(10)
+        title = QLabel("云端耗材")
+        title.setObjectName("FieldLabel")
+        title.setFixedWidth(96)
+        line.addWidget(title, 0, Qt.AlignTop)
+        line.addLayout(box, 1)
+        col.addLayout(line)
+        self.store.fetch_consumable_items(self._on_cloud)
+
+    def _on_cloud(
+        self,
+        rows: dict[str, list[model.CloudItem]] | None,
+        error: BaseException | None,
+    ) -> None:
+        if self._closed:
+            return          # 窗已经关掉：一个控件都别碰
+        note, listing = self._cloud_note, self._cloud_list
+        if note is None or listing is None or self._item is None:
+            return
+        # 先清掉上一轮的按钮：失败重试或再取一次时不清，就会在下面叠出一排一样的
+        while listing.count():
+            item = listing.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.setParent(None)
+                widget.deleteLater()
+        if error is not None:
+            # 失败与"没有登记"分开写：前者是这条路断了，后者是云端确实不管这台设备
+            note.setText("读取失败，可以手工选属性")
+            note.show()
+            return
+        did = self._item.did
+        # 已经配过的那条不给建议：点了也只会撞"这个属性已经有一条了"
+        taken = {(c.siid, c.piid) for c in self.store.prefs.consumables if c.did == did}
+        cands = [c for c in (rows or {}).get(did, []) if c.key not in taken]
+        if not cands:
+            note.setText("云端没有这台设备的耗材记录（灯、插座这类本来就没有）")
+            note.show()
+            return
+        note.hide()
+        for cand in cands:
+            btn = QPushButton(cand.summary())
+            btn.setObjectName("Candidate")
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            btn.setToolTip("点一下把属性、名称、阈值都填好，再按保存生效。")
+            btn.clicked.connect(lambda _=False, c=cand: self._use_cloud(c))
+            listing.addWidget(btn)
+
+    def _use_cloud(self, cand: model.CloudItem) -> None:
+        """把云端这一条填进表单。**属性对不上就不填**——宁可让人手工选。"""
+        if self.cb_prop is None:
+            return
+        for index in range(self.cb_prop.count()):
+            if self.cb_prop.itemData(index) == cand.key:
+                self.cb_prop.setCurrentIndex(index)
+                break
+        else:
+            # 规格更新过 / 这个属性不可读：下拉里根本没有它
+            self._show_error("云端这条耗材对应的属性不在这台设备的规格里，只能手工选。")
+            return
+        if self.lbl_err is not None:
+            self.lbl_err.hide()
+        if cand.label and self.ed_name is not None:
+            self.ed_name.setText(cand.label)
+        if cand.warn is not None and self.ed_warn is not None:
+            self.ed_warn.setText(str(cand.warn))
+        if self.ed_crit is not None:
+            # 云端"耗尽为 0%"在我们这里等价于不启用红档（阈值从 1 起），
+            # 所以照实清空，不拿默认的 10 冒充云端的判断
+            self.ed_crit.setText("" if cand.crit is None else str(cand.crit))
+
     @staticmethod
     def _fixed(text: str) -> QLabel:
         lab = QLabel(text)
@@ -542,3 +654,8 @@ class ConsumableDialog(QDialog):
         self.store.prefs.remove_consumable(self._item.id)
         self.deleted = True
         self.accept()
+
+    def done(self, result: int) -> None:
+        """保存 / 取消 / Esc / 关闭都走这里：先立旗，晚到的取数回调就不会再碰控件。"""
+        self._closed = True
+        super().done(result)

@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -164,6 +165,149 @@ def unset(did: str) -> Consumable:
     return Consumable(did=did, siid=KEY_UNSET, piid=KEY_UNSET, warn=None, crit=None)
 
 
+# ---------------------------------------------------------------------------
+# 云端耗材台账（只当候选清单，不自动落卡）
+# ---------------------------------------------------------------------------
+
+
+def parse_prop(prop: Any) -> tuple[int, int] | None:
+    """云端耗材条目的 ``prop`` → ``(siid, piid)``。对不上返回 ``None``。
+
+    实测绝大多数是 ``prop.6.1`` / ``prop.2.1003`` 这种"siid.piid"直写；老门锁
+    ``loock.lock.t1pro`` 还有两种写法：``prop.electricity``（按名字）与 ``prop.4106``
+    （疑似 siid+piid 拼接，但规格里 siid 4 只有 ``4.1``）。**这两种不猜**——猜错了会把
+    监控项指到另一个量上，比"不显示"糟得多。见
+    ``docs/reference/mijia-api-ecosystem-research.md`` §3.4。
+    """
+    if not isinstance(prop, str) or not prop.startswith("prop."):
+        return None
+    head, sep, tail = prop[5:].partition(".")
+    if not sep or not head.isdigit() or not tail.isdigit():
+        return None
+    siid, piid = int(head), int(tail)
+    if siid < 1 or piid < 1:
+        return None
+    return siid, piid
+
+
+def _cloud_threshold(raw: Any) -> int | None:
+    """云端 ``inadeq`` / ``exhaust`` → 阈值。只收百分比。
+
+    这两个字段是 **JSON 字符串**（不是对象）：``{"val":"20","unit":"percentage",
+    "type":"range"}``。洗衣机洗衣液是 ``{"val":"1","type":"list"}``——那是档位不是
+    百分比，套两个数字阈值会变成"洗衣液剩 1 档才提醒"，所以只认 ``unit == percentage``。
+    ``val`` 为 0 时的结果与手工配置一致：这一档不启用（见 ``_clamp_threshold``）。
+    """
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw or "{}")
+        except ValueError:
+            return None
+    if not isinstance(raw, dict) or raw.get("unit") != "percentage":
+        return None
+    return _clamp_threshold(raw.get("val"))
+
+
+@dataclass(frozen=True, slots=True)
+class CloudItem:
+    """云端耗材台账里的一条。
+
+    和 :class:`Consumable` 的关系：这条**不是用户配的**，是米家 App「耗材」页的数据。
+    只当候选清单——用户点它才经 :meth:`consumable` 转成监控项落盘（2026-11-24 用户
+    选定的形态）。**别拿它直接替换耗材页的数据源**：只有百分比、没有时间序列，
+    还会丢掉用户自定义的阈值与排序。
+    """
+
+    did: str
+    siid: int
+    piid: int
+    #: 云端 description：比规格属性名细得多（同一块 ``battery-level`` 会写「5号电池」
+    #: 「锂电池」「小电池」「大电池」，洗衣机写「洗衣液」）。
+    label: str = ""
+    #: 剩余量，**字符串**百分比（``"17"``）。空串 = 这次没有读数（``state`` 2/3 那两组）。
+    value: str = ""
+    warn: int | None = None
+    crit: int | None = None
+
+    @property
+    def key(self) -> tuple[int, int]:
+        return self.siid, self.piid
+
+    @property
+    def method(self) -> str:
+        return f"{self.siid}.{self.piid}"
+
+    def consumable(self) -> Consumable:
+        """转成一条可直接落盘的监控项（名称与阈值都带上，用户可再改）。"""
+        return Consumable(
+            did=self.did, siid=self.siid, piid=self.piid,
+            label=self.label, warn=self.warn, crit=self.crit,
+        )
+
+    def summary(self) -> str:
+        """一行「滤芯 · 剩余 17% · 不足 5%」，给候选按钮用。"""
+        parts = [self.label or self.method]
+        if self.value:
+            parts.append(f"剩余 {self.value}%")
+        if self.warn is not None:
+            parts.append(f"不足 {self.warn}%")
+        return " · ".join(parts)
+
+
+def cloud_items(payload: Any) -> dict[str, list[CloudItem]]:
+    """云端耗材清单 → ``{did: [CloudItem, ...]}``。
+
+    ``payload`` 是 ``Client.consumable_items()`` 的返回（``{home_id: 原始 payload}``）。
+
+    **必须遍历所有 ``items`` 分组**：云端按 ``state`` 把条目分成几组（本机实测 1/2/3
+    三组，2/3 组的 ``value`` 是空串），上游 mijiaAPI 只取 ``items[0]``，会漏掉另外两组。
+    ``details`` 是**列表**（单电池 1 条、门锁双电池 2 条）。同一 ``(siid, piid)`` 只留一条，
+    免得候选里出现两个一样的按钮。
+    """
+    out: dict[str, list[CloudItem]] = {}
+    if not isinstance(payload, dict):
+        return out
+    for ret in payload.values():
+        if not isinstance(ret, dict):
+            continue
+        for group in ret.get("items") or []:
+            if not isinstance(group, dict):
+                continue
+            for row in group.get("consumes_data") or []:
+                if not isinstance(row, dict):
+                    continue
+                did = str(row.get("did") or "")
+                if not did:
+                    continue
+                details = row.get("details")
+                if isinstance(details, dict):   # 上游会把"只有一条"的拆成对象
+                    details = [details]
+                if not isinstance(details, list):
+                    continue
+                for detail in details:
+                    if not isinstance(detail, dict):
+                        continue
+                    key = parse_prop(detail.get("prop"))
+                    if key is None:
+                        continue
+                    rows = out.setdefault(did, [])
+                    if any(c.key == key for c in rows):
+                        continue
+                    rows.append(
+                        CloudItem(
+                            did=did,
+                            siid=key[0],
+                            piid=key[1],
+                            label=str(detail.get("description") or "").strip(),
+                            value=str(detail.get("value") or "").strip(),
+                            warn=_cloud_threshold(detail.get("inadeq")),
+                            crit=_cloud_threshold(detail.get("exhaust")),
+                        )
+                    )
+    return out
+
+
+
 def fill_percent(value: Any, span: tuple[float, float] | None) -> float | None:
     """把读数换算成 0–100 的余量。拿不到数值就返回 ``None``。
 
@@ -210,6 +354,7 @@ def level_color_key(level: int) -> str:
 
 __all__ = [
     "CRIT_DEFAULT",
+    "CloudItem",
     "Consumable",
     "KEY_UNSET",
     "LEVEL_CRIT",
@@ -222,9 +367,11 @@ __all__ = [
     "THRESHOLD_MAX",
     "THRESHOLD_MIN",
     "WARN_DEFAULT",
+    "cloud_items",
     "fill_percent",
     "level_color_key",
     "level_of",
     "parse",
+    "parse_prop",
     "unset",
 ]

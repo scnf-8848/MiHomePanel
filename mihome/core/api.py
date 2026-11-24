@@ -979,6 +979,52 @@ class Client:
             ret = self._api._request("/v2/message/v2/typelist", data)
         return ret if isinstance(ret, dict) else {}
 
+    def consumable_items(self) -> dict[str, Any]:
+        """读一次云端耗材清单：每家一次 ``POST /v2/home/standard_consumable_items``。
+
+        **只读**：这是米家 App「耗材」页背后的台账（滤芯该换了、哪块电池剩多少），
+        没有对应的写接口，我们也不写。返回 ``{home_id: 云端原始 payload}``，
+        归一化交给 :func:`mihome.core.consumables.cloud_items`。
+
+        三个实测细节（2026-11-24，见 ``docs/reference/mijia-api-ecosystem-research.md``
+        §3.4）：``owner_id`` 要的是**家庭所有者**的 uid（共享家庭也是），所以用拓扑
+        加载时记下的 ``home_id → uid``，别用账号自己的；一家里有耗材的只有十几条；
+        一家失败不影响别家（共享家庭拿不到就跳过），**全失败才抛**——``Store``
+        那边把异常转成"读取失败"，与"没有耗材"分开。
+        """
+        owners = dict(self._owners)
+        if not owners:
+            with self._lock:
+                homes_raw = self._api.get_homes_list()
+            owners = {
+                str(h.get("id") or ""): int(h.get("uid") or 0)
+                for h in homes_raw
+                if h.get("id")
+            }
+            self._owners = owners
+
+        out: dict[str, Any] = {}
+        last: Exception | None = None
+        for home_id, owner in owners.items():
+            if not owner:
+                continue
+            data = {
+                "home_id": int(home_id) if home_id.isdigit() else home_id,
+                "owner_id": owner,
+                "filter_ignore": True,
+            }
+            with self._lock:
+                try:
+                    ret = self._api._request("/v2/home/standard_consumable_items", data)
+                except Exception as exc:  # noqa: BLE001  网络层什么都可能抛
+                    last = exc
+                    self.last_error = f"读取耗材清单失败: {exc}"
+                    continue
+            out[home_id] = ret if isinstance(ret, dict) else {}
+        if not out and last is not None:
+            raise last
+        return out
+
     # -- 杂务 ------------------------------------------------------------
     def flush(self) -> None:
         """把能力账本落盘（退出前 / 定时调用）。"""

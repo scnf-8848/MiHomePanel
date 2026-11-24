@@ -33,7 +33,7 @@ from types import SimpleNamespace
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtWidgets import QApplication, QLabel  # noqa: E402
+from PySide6.QtWidgets import QApplication, QLabel, QPushButton  # noqa: E402
 
 from mihome.core import consumables as model  # noqa: E402
 from mihome.core.api import HomeNode, PropRef, RoomNode, Topology  # noqa: E402
@@ -123,10 +123,31 @@ class _Caps:
 class _Client:
     capabilities = _Caps()
 
+    def consumable_items(self) -> dict:
+        """云端耗材台账。默认空 = 每台设备都"云端没有记录"，候选块不出现按钮。"""
+        return {}
+
+
+class _Worker:
+    """同步假 worker：提交的活立刻跑完、回调立刻调（测试不等线程）。
+
+    弹窗里的"云端耗材"是异步取数的，同步执行才能在同一段测试里断言结果。
+    """
+
+    def submit(self, fn, args=(), *, kwargs=None, callback=None, priority=0, label=""):
+        try:
+            result = fn(*args, **(kwargs or {}))
+        except BaseException as exc:  # noqa: BLE001
+            if callback is not None:
+                callback(None, exc)
+            return
+        if callback is not None:
+            callback(result, None)
+
 
 def make_store(tmp: Path) -> Store:
     """两台设备：净化器（滤芯 15% → 轻提醒）与洗衣机（洗衣液 20/500 → 4% → 重提醒）。"""
-    store = Store(_Client(), None)  # type: ignore[arg-type]
+    store = Store(_Client(), _Worker())  # type: ignore[arg-type]
     store.prefs = Prefs(tmp / "prefs.json")
     homes = [HomeNode("h1", "我的家", [RoomNode("r1", "客厅"), RoomNode("r2", "阳台")])]
     devices = [
@@ -671,7 +692,7 @@ def main() -> int:
     check("侧栏圆点是全家庭计数，不随切家庭归零", page2.counts(), (1, 0))
     store2.active_home = "h1"
 
-    empty_store = Store(_Client(), None)  # type: ignore[arg-type]
+    empty_store = Store(_Client(), _Worker())  # type: ignore[arg-type]
     empty_store.prefs = Prefs(Path(tempfile.mkdtemp()) / "prefs.json")
     empty_store.topology = Topology(
         [HomeNode("h1", "我的家", [RoomNode("r1", "客厅")])], [bool_node])
@@ -688,7 +709,7 @@ def main() -> int:
 
     def make_lock(props: list) -> Store:
         """一台门锁：两块电池属性同名（``battery-level``），只有服务注释不同。"""
-        s = Store(_Client(), None)  # type: ignore[arg-type]
+        s = Store(_Client(), _Worker())  # type: ignore[arg-type]
         s.prefs = Prefs(Path(tempfile.mkdtemp()) / "prefs.json")
         node = DeviceNode("d5", "门锁", "m", "xiaomi.lock.s1", home="我的家",
                           room="客厅", home_id="h1", room_id="r1")
@@ -877,6 +898,126 @@ def main() -> int:
     app.processEvents()
     check("离线且从没读到过：不写时间，也不硬编「未知」",
           note_of("净化器"), ("", False))
+
+    print()
+    print("\n11) 云端耗材只当候选清单：prop 拆 siid.piid / 阈值 / 点一下填好")
+    check("prop.6.1 拆成 siid.piid", model.parse_prop("prop.6.1"), (6, 1))
+    check("prop.2.1003 也拆得开", model.parse_prop("prop.2.1003"), (2, 1003))
+    check("老门锁的 prop.electricity 不猜", model.parse_prop("prop.electricity"), None)
+    check("疑似拼接的 prop.4106 也不猜（规格里 siid 4 只有 4.1）",
+          model.parse_prop("prop.4106"), None)
+    check("不是 prop 前缀", model.parse_prop("6.1"), None)
+    check("少一段", model.parse_prop("prop.6"), None)
+    check("空值", model.parse_prop(None), None)
+
+    def det(prop_: str, desc: str, value: str, inadeq: str = "",
+            exhaust: str = "") -> dict:
+        return {"prop": prop_, "description": desc, "value": value,
+                "inadeq": inadeq, "exhaust": exhaust, "consumable_type": ""}
+
+    def row(did: str, details: list) -> dict:
+        return {"did": did, "name": "设备", "model": "m", "details": details,
+                "is_ignore": False, "is_online": True}
+
+    pct5 = '{"val":"5","unit":"percentage","type":"range"}'
+    pct0 = '{"val":"0","unit":"percentage","type":"range"}'
+    payload = {
+        "h1": {
+            "items": [
+                # 云端按 state 分三组：只取第一组会漏掉后两组（上游 mijiaAPI 就是这么漏的）
+                {"state": 1, "count": 2, "ignore_count": 0, "consumes_data": [
+                    row("d9", [det("prop.4.1", "滤芯", "17", pct5, pct0)]),
+                    row("d9", [det("prop.2.1003", "5号电池", "48", pct5, pct0)]),
+                ]},
+                {"state": 2, "count": 1, "ignore_count": 0, "consumes_data": [
+                    row("d9", [det("prop.13.1", "锂电池", "61", pct5, pct0)]),
+                ]},
+                {"state": 3, "count": 1, "ignore_count": 0, "consumes_data": [
+                    row("d9", [det("prop.electricity", "老门锁电池", "49")]),
+                ]},
+            ]
+        },
+        "h2": {
+            "items": [
+                {"state": 1, "count": 2, "ignore_count": 0, "consumes_data": [
+                    # details 是列表：门锁双电池一次给两条
+                    row("d8", [det("prop.6.1003", "5号电池", "100", pct5, pct0),
+                                det("prop.4.1003", "锂电池", "93", pct5, pct0)]),
+                    # 洗衣液是 {val, type:list}，没有 unit：不是百分比，两档都不该收
+                    row("d7", [det("prop.6.1", "洗衣液", "",
+                                   '{"val":"1","type":"list"}', "{}")]),
+                    # 同一 (siid, piid) 再来一条：去重
+                    row("d7", [det("prop.6.1", "洗衣液（重复）", "3", pct5, pct0)]),
+                ]}
+            ]
+        },
+    }
+
+    cloud = model.cloud_items(payload)
+    check("三组 state 全部收（不只第一组）", len(cloud.get("d9", [])), 3)
+    check("双电池的两条 details 都收", [c.label for c in cloud.get("d8", [])],
+          ["5号电池", "锂电池"])
+    check("prop 解不出的条目跳过，不猜", [c.method for c in cloud.get("d9", [])],
+          ["4.1", "2.1003", "13.1"])
+    check("同一 siid.piid 去重（留先到的那条）",
+          [(c.method, c.value) for c in cloud.get("d7", [])], [("6.1", "")])
+    check("百分比阈值收进 warn / 耗尽 0% 当没设", 
+          (cloud["d9"][0].warn, cloud["d9"][0].crit), (5, None))
+    check("洗衣液那种档位阈值不硬套成数字",
+          (cloud["d7"][0].warn, cloud["d7"][0].crit), (None, None))
+    check("候选按钮的文案", cloud["d9"][0].summary(), "滤芯 · 剩余 17% · 不足 5%")
+    check("没读数时不写「剩余」", model.CloudItem("d1", 1, 1, "洗衣液").summary(),
+          "洗衣液")
+    check("转成监控项时名称与阈值都带上",
+          cloud["d9"][0].consumable().to_dict(),
+          {"did": "d9", "siid": 4, "piid": 1, "label": "滤芯",
+           "warn": 5, "crit": None})
+    check("坏 payload 不炸", model.cloud_items(None), {})
+
+    # -- 弹窗：空壳才有候选，点一下填好，已配过的不再建议 -------------------
+    store3 = make_store(Path(tempfile.mkdtemp()))
+    shell3 = model.unset("d1")
+    store3.prefs.add_consumable(shell3)
+    dlg = ConsumableDialog(store3, theme.LIGHT, item=shell3)
+    check("云端没有记录时说清楚，而不是留一片空白",
+          dlg._cloud_note.text().startswith("云端没有"), True)  # noqa: SLF001
+
+    cands = [model.CloudItem("d1", 2, 9, "滤芯", "17", 5, None),
+             model.CloudItem("d1", 4, 1, "5号电池", "48", 10, None)]
+    dlg._on_cloud({"d1": cands}, None)  # noqa: SLF001
+    buttons = [b for b in dlg.findChildren(QPushButton)
+               if b.objectName() == "Candidate"]
+    check("有几条候选就几个按钮", len(buttons), 2)
+    check("按钮上写着剩余量和云端阈值",
+          [b.text() for b in buttons], ["滤芯 · 剩余 17% · 不足 5%",
+                                        "5号电池 · 剩余 48% · 不足 10%"])
+    check_true("有候选时不再留「云端没有」那句", dlg._cloud_note.isHidden())  # noqa: SLF001
+
+    buttons[0].click()
+    check("点一下属性就选中了", dlg.cb_prop.currentData(), (2, 9))
+    check("名称用云端那个更细的名字", dlg.ed_name.text(), "滤芯")
+    check("两档阈值按云端填；耗尽 0% 那档留空（我们这里 0 = 不启用）",
+          (dlg.ed_warn.text(), dlg.ed_crit.text()), ("5", ""))
+
+    buttons[1].click()
+    check("换一条候选：属性和名字都跟着换",
+          (dlg.cb_prop.currentData(), dlg.ed_name.text()), ((4, 1), "5号电池"))
+
+    store3.prefs.add_consumable(model.parse({"did": "d1", "siid": 4, "piid": 1}))
+    dlg._on_cloud({"d1": cands}, None)  # noqa: SLF001
+    check("已经配过的那条不再出现在候选里",
+          [b.text() for b in dlg.findChildren(QPushButton)
+           if b.objectName() == "Candidate"], ["滤芯 · 剩余 17% · 不足 5%"])
+
+    dlg._use_cloud(model.CloudItem("d1", 9, 9, "幽灵耗材", "", None, None))  # noqa: SLF001
+    check("属性不在这台设备的规格里：不改上一次点好的选择",
+          dlg.cb_prop.currentData(), (4, 1))
+    check_true("并且说一句为什么没填", not dlg.lbl_err.isHidden())
+
+    dlg._on_cloud(None, RuntimeError("网络断了"))  # noqa: SLF001
+    check("读取失败与「没有记录」分开写",
+          dlg._cloud_note.text().startswith("读取失败"), True)  # noqa: SLF001
+    dlg.close()
 
     print()
     if FAILS:
