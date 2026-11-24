@@ -894,6 +894,10 @@ class ConsumablesPage(QWidget):
         无关（见 ``_rows_from_store``）。
         """
         keep = self.scroll.verticalScrollBar().value() if preserve_scroll else None
+        # 顺手对一遍轮询登记：耗材项可能是从弹窗、备份恢复进来的，没走过
+        # ``rebuild_topology``。缺登记 = 这个属性永远不被请求 = 卡片一直「—」
+        # （2026-11-24）。很便宜：几十条 × 设备数，只写 st.keys。
+        self.store.register_consumables()
         rows = self._rows_from_store()
         self._rows = self._ordered(rows)
         self._rebuild()
@@ -1110,6 +1114,15 @@ class ConsumablesPage(QWidget):
             self._run_dialog(dialog)
         else:
             dialog.exec()
+        if dialog.added is not None:
+            # 「米家耗材」tab 走这条：属性、名称、判档方式在弹窗里就已经定好并写进
+            # ``prefs``，**没有「先落空卡再配」这一步**，所以 ``selected_did`` 是空的。
+            # 以前这里只看 ``selected_did``，于是添加成功却被当成"没选设备"直接
+            # 返回：prefs 里有这条、弹窗里也不再列（被 taken 过滤），唯独墙上没卡
+            # （2026-11-24 用户报的现象）。补登记寻址再刷新，下一轮就有读数。
+            self.store.register_consumables([dialog.added])
+            self.refresh()
+            return
         did = dialog.selected_did
         if not did:
             return
@@ -1133,6 +1146,10 @@ class ConsumablesPage(QWidget):
         else:
             dialog.exec()
         if dialog.deleted or dialog.added is not None:
+            # 改属性（含空壳第一次配）也可能指向一个卡片没画过的属性：同样要补
+            # 登记，否则新地址没人问、卡片停在「—」。删掉的那条留着登记无害。
+            if dialog.added is not None:
+                self.store.register_consumables([dialog.added])
             self.refresh()
 
     # -- 拖动排序（和主页卡片墙同一套交互）-------------------------------

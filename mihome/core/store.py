@@ -746,6 +746,23 @@ class Store:
         }
 
     # -- 轮询 ------------------------------------------------------------
+    def register_consumables(self, items: Iterable[Any] = ()) -> None:
+        """把（新加的）监控项属性登记进 ``st.keys``，下一轮就有人去读。
+
+        ``_register_keys`` 只在 ``rebuild_topology`` 里跑，而用户添加 / 改监控项
+        不会重建拓扑。少了这一步，``poll_refs`` 里 ``st.keys.get(key)`` 查不到
+        ref，这个属性**一次也不会被请求**——卡落到墙上就一直是「—」，看起来像
+        "添加了但没数据"（2026-11-24 实测：云端台账加进来的项全中这条）。
+
+        传空 = 把``prefs.consumables`` 整个过一遍（改属性、恢复备份后用）。
+        """
+        items = list(items) or list(self.prefs.consumables)
+        for item in items:
+            st = self.devices.get(getattr(item, "did", ""))
+            if st is None:
+                continue
+            _register_keys(st, item.did, [item])
+
     def poll_refs(self) -> list[PropRef]:
         """这一轮要读的属性：**卡片用到的** + **耗材页订阅的**。
 

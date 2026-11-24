@@ -1110,6 +1110,47 @@ def main() -> int:
           (left.name().upper(), right.name().upper()),
           (left.name().upper(), left.name().upper()))
 
+    # -- 米家耗材加进来的项：必须落卡、必须去读（2026-11-24 用户报的 bug）----
+    # 现象：弹窗里点「添加到耗材页」后，prefs 有这条、弹窗里也不再列（被 taken
+    # 过滤），唯独墙上没卡。两个原因都在这段盯着：①add_item 只认 selected_did，
+    # 云端这条路没有它 → 直接 return，不刷新；②登记只在 rebuild_topology 里做，
+    # 新属性没进 st.keys → poll_refs 查不到 ref，一次也不读。
+    store4 = make_store(Path(tempfile.mkdtemp()))
+    page4 = ConsumablesPage(store4, theme.LIGHT)
+    # 挑一个"卡片没画过"的属性：模拟滤芯寿命那种只读量
+    store4.devices["d1"].keys.pop((4, 1), None)
+    before = len(store4.prefs.consumables)
+
+    def _add_via_cloud(dlg: ConsumableDialog) -> None:
+        dlg._on_cloud_loaded(  # noqa: SLF001
+            {"d1": [model.CloudItem("d1", 4, 1, "5号电池", "48", 10, None)]}, None)
+        leaf = dlg.tree_cloud.topLevelItem(0).child(0)
+        dlg._on_cloud_clicked(leaf, 0)  # noqa: SLF001
+        dlg._on_add_cloud()  # noqa: SLF001
+        dlg.close()
+
+    page4._run_dialog = _add_via_cloud  # noqa: SLF001
+    page4.add_item()  # noqa: SLF001
+    check("云端添加后清单里多一条",
+          [c.id for c in store4.prefs.consumables], ["d1:4.1"])
+    check("而且墙上真的出现这张卡（前端没刷新就会少一张）",
+          ("d1:4.1" in page4._cards, len(page4._rows)),  # noqa: SLF001
+          (True, before + 1))
+    check("新属性登记进轮询了，否则卡片永远是「—」",
+          store4.devices["d1"].keys.get((4, 1)) is not None, True)
+    check("这一轮确实会去读它",
+          (4, 1) in [(r.siid, r.piid) for r in store4.poll_refs()], True)
+    check("卡上用的是云端的名字与阈值",
+          [(r.item.label, r.item.warn) for r in page4._rows  # noqa: SLF001
+           if r.item.id == "d1:4.1"], [("5号电池", 10)])
+    # 历史遗留：prefs 里已经有这条、可 keys 没登记（本次修复前加进去的那些）。
+    # 页面对一遍登记就能自愈，不必重建拓扑 / 重启
+    store4.devices["d1"].keys.pop((4, 1), None)
+    page4.refresh()
+    check("刷新页面会补登记（旧配置不用等重构拓扑）",
+          store4.devices["d1"].keys.get((4, 1)) is not None, True)
+    page4.deleteLater()
+
     # -- 自选设备：老路一个字没动，也不再塞云端候选 -----------------------
     dlg5 = ConsumableDialog(store3, theme.LIGHT)
     dlg5._on_tab(1)  # noqa: SLF001

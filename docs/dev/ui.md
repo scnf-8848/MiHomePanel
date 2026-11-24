@@ -1738,6 +1738,18 @@ K 台离线 · H 台已隐藏」）→ 两颗温湿度胶囊（`ClimateStrip`）
 - 已经配过的 `(did, siid, piid)` 不出现在列表里；一条都加不了时说明是"都在清单里了"
   还是"读不到对应属性"，两件事分开写。
 
+**两个"加完没卡"的坑**（2026-11-24 用户实测报上来的）：
+
+1. `ConsumablesPage.add_item()` 只看 `dialog.selected_did`——那是「自选设备」的产物。
+   「米家耗材」在弹窗里就已经写完 `prefs` 并把 `dialog.added` 交出来，没有
+   `selected_did`，于是被当成"没选设备"**直接 return，页面不刷新**：清单里有这条、
+   弹窗里也不再列（被 `taken` 过滤），唯独墙上没卡。现在先判 `dialog.added` → 刷新。
+2. `_register_keys` 只在 `rebuild_topology` 里跑，而添加 / 改属性不会重建拓扑。
+   不补登记 → `st.keys` 里没有新地址 → `poll_refs` 拿不到 ref → **一次也不读**，
+   卡片永远「—」。`Store.register_consumables()` 负责增量补登记；`add_item` /
+   `_edit` 加完立刻调一次，`refresh()` 开头还会**整体对一遍**（自愈历史遗留项，
+   不必等拓扑刷新或重启）。
+
 接口本身的实测（返回结构、覆盖率、`filter_ignore`）在
 `docs/reference/mijia-api-ecosystem-research.md` §3.4，探针 `scripts/probe_consumables.py`。
 

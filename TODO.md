@@ -129,7 +129,11 @@
   61%）；②洗衣液 `6.1` 是**枚举**（1=低 / 2=标准），没百分比、也没进属性下拉。
   卡片因此多一种**档位态**：`Consumable.low` 存"不足档"，横条画分段、整卡不染、圆环不画弧
   （免得 50% 被读成"还剩一半"）。
-  验证 `verify_consumables.py` 216 项。接口实测见
+  **当晚补修「加了不落卡」**：`add_item()` 只认 `dialog.selected_did`（自选设备才有的），
+  云端这条路没有它 → 添加成功却直接 return，prefs 里有、弹窗里不再列、墙上没卡；再加
+  `Store.register_consumables()` 做增量登记（`_register_keys` 只在重建拓扑时跑），
+  `refresh()` 开头整体对一遍自愈旧项，否则新属性一次也不会被轮询（卡片停在「—」）。
+  验证 `verify_consumables.py` 224 项。接口实测见
   `docs/reference/mijia-api-ecosystem-research.md` §3.4，界面口径见
   `docs/dev/ui.md`「添加设备：『米家耗材』/『自选设备』两个 tab」。
 
