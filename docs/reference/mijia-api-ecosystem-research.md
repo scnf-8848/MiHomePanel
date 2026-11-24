@@ -40,7 +40,7 @@
 | **P0** | `/miotspec/event/get` 设备事件轮询 | **本项目已实测，生产未接**（`poll_events` 表已留位、无消费者） | 把“米家 → 电脑”从 3 秒属性轮询提升到“轮询间隔 + 0.4 秒”，能拿到单击 / 开锁 / 门铃 / 人体等**瞬时事件** | 低～中：一个只读 RPC + 去重 + 规格映射 | 只保留“最近一次”，不能计数 / 回看；频控未知；共享家庭只读，安全 |
 | **P0** | `GetSceneList` 读全家自动化 | **探针已通，生产未接**（生产只用 `GetSimpleSceneList` 读手动场景） | 展示已有自动化、看清虚拟事件被谁监听、辅助“发虚拟事件” | 低：一个只读 RPC | 私有接口，`app_version` 可能变；不要用它改自动化 |
 | **P1** | `/v2/user/statistics` 统计接口 | **已实测（2026-11-23，只读）**：接口可用，但覆盖有限 | 能耗 / 电量历史；另有 1 台温湿度传感器能取到温湿度历史 | 中：按型号 / key 建能力表、300 点翻页、单位校准 | 多数温度 / 湿度 / 电池 / 电压没有统计；同一属性名的数值单位不统一，必须按型号校准 |
-| **P1** | `/v2/home/standard_consumable_items` 耗材清单 | **上游已封装，本项目未用** | 可以自动发现“哪些设备有耗材” | 低 | **与本项目已定产品决策冲突**：耗材页明确“不做全屋自动扫描、由用户自选属性”。建议不做 |
+| **P1** | `/v2/home/standard_consumable_items` 耗材清单 | **已实测（2026-11-24，只读）**：可用；2 家 14 台 / 17 条，`prop` 15 条能对到 `siid.piid`，自带阈值 | 自动发现“哪些设备有耗材”、给双电池分名字（5号电池 / 锂电池）、给默认阈值 | 低：一个只读 RPC，两家 3 秒内 | 覆盖只到“云端登记过耗材”的型号（本机 14 / 64，其余本来无耗材）；两种 `prop` 写法未解。**建议当“候选清单”，不推翻“用户自选属性”** |
 | **P2** | 房间 / 设备管理写接口（改名、搬家、房间 CRUD） | **同类项目已验证，本项目未用** | 补全“管理”能力 | 中 | 写账号配置，风险高于写设备属性；**只能用于用户自己创建的家庭** |
 | **P2** | 中枢网关本地 MQTT | **官方 HA 已实现，本项目未验证** | 局域网内低延迟推送 / 控制，覆盖 BLE / ZigBee 子设备 | 高：官方协议未公开、实现专有许可、需要中枢网关 | 许可证与逆向风险都高；不建议现在做 |
 | **不做** | 云端插件包 `/v2/plugin/fetch_plugin`（仅枚举文案） | **已实测（2026-11-23，只读）**：16 个型号中 11 个有包；spec 的 `comment` 已覆盖枚举中文 | 插件只多 UI 文案 / 多语言 / 故障码；故障码本次不做 | 低～中：按型号离线提取 + 人工筛选 | 覆盖按型号；文案不是协议枚举的 1:1 映射；专有内容不可分发。**枚举文案不值得做，故障码另议** |
@@ -51,7 +51,7 @@
 
 ### 0.2 一句话建议
 
-先把 **事件轮询（P0）** 接进现有 `poll_events` 需求表，再把 **GetSceneList（P0）** 作为只读能力接上。统计接口已完成逐设备只读探针：**能源历史只对 4～6 台有计量配置的设备成立；温湿度历史只有独立温湿度传感器成立**，空调 / 净化器 / 开关的温度和湿度、电池电量、灯的电量都没有统计。插件包也已完成只读探针和 locale 对比：**spec 的 `comment` 已经够枚举中文，`locale=zh_CN` 只影响设备列表名；故障码之外，插件包不值得做**。耗材自动扫描、场景 / 自动化写、本地 MQTT、LAN miIO 都不建议动。
+先把 **事件轮询（P0）** 接进现有 `poll_events` 需求表，再把 **GetSceneList（P0）** 作为只读能力接上。统计接口已完成逐设备只读探针：**能源历史只对 4～6 台有计量配置的设备成立；温湿度历史只有独立温湿度传感器成立**，空调 / 净化器 / 开关的温度和湿度、电池电量、灯的电量都没有统计。插件包也已完成只读探针和 locale 对比：**spec 的 `comment` 已经够枚举中文，`locale=zh_CN` 只影响设备列表名；故障码之外，插件包不值得做**。**耗材清单已实测可用**（§3.4）：能自动发现耗材、`prop` 多数能对到 `siid.piid`、还自带阈值，推荐当“候选清单”用。场景 / 自动化写、本地 MQTT、LAN miIO 都不建议动。
 
 ---
 
@@ -263,13 +263,51 @@
 
 ### 3.4 P1：耗材清单 `/v2/home/standard_consumable_items`
 
-**状态：接口存在，上游已封装；本项目未用；建议不做。**
+**状态：2026-11-24 用本机账号只读实测通过。接口可用，数据比预期好；接不接、怎么接待用户定。**
 
-证据：
-- 上游 `mijiaAPI/apis.py:385-396` 的 `_get_consumable_items()`：`POST /v2/home/standard_consumable_items`，参数 `home_id`、`owner_id`、`filter_ignore`；返回 `items[0]["consumes_data"]`。
-- 本项目耗材页是**用户手动选属性**：`mihome/core/consumables.py` 开头明确写“不按型号预设哪些属性算耗材，用户手动选属性”，并且历史规划明确“不做全屋自动扫描、不自动识别哪些是耗材”（`docs/archive/todo-2026-11-15-full.md:1155-1157`）。
+上一版这一节只读了上游源码就下"建议不做"的结论，那次是错的判断依据——实测后发现三条当时不知道的事实（见下"实测"第 3、4、5 条），所以结论从"建议不做"改成"能力已确认，形态待定"。
 
-**判断**：接口本身没问题，但它与本项目已经拍板的产品决策冲突。自动扫描会把“用户自选”变成“云端说什么是耗材”，还会引入型号覆盖不全、文案不可控的问题。**建议不做**；除非用户明确改变“手动选属性”的决定，才考虑把它当“候选清单”而不是自动落卡。
+接口：`POST /v2/home/standard_consumable_items`，body `{home_id: int, owner_id: int, filter_ignore: bool}`。
+`owner_id` 就是家庭列表里的 `uid`（共享家庭也是，直接取 `home["uid"]`，别用账号自己的 uid）。
+探针：`scripts/probe_consumables.py`（只读，落 `scripts/out/consumable_items.json`）。
+
+**实测（2026-11-24，2 个家庭 / 64 台设备）**
+
+1. 返回 `{"items": [...]}`。`items` **按 `state` 分组**（不是按设备、也不是按房间），每组
+   `{state, count, ignore_count, consumes_data: [...]}`。本机三组：`state=1` 12 条（有读数）、
+   `state=2` 1 条、`state=3` 1 条（后两组 `value` 都是空串，语义云端没有文档，**别当结论**）。
+   → 上游 `apis.py:385` 只取 `items[0]`，**会漏掉另外两组**；正确做法是遍历所有 `items`。
+2. 条目 `consumes_data[i]`：`did / name / model / sub_class / room_id / is_online / is_ignore /
+   skip_rpc / ble_gateway / start_time / time_stamp / details`。
+3. `details` **是列表**（一台设备一块电池时 1 条，门锁双电池时 2 条），每项：
+   `id / description / value / update_time / state / inadeq / exhaust / prop / consumable_type /
+   total_life / intro / pic_urls / reset_method / change_instruction / reset_state /
+   type_name / extra_url / left_time / wechat_path`。
+   - `value` 是**百分比字符串**（`"17"` / `"100"`），不是数值。
+   - `inadeq` / `exhaust` 是**JSON 字符串**（`{"val":"20","unit":"percentage","type":"range"}`），
+     即云端自带的"不足 / 耗尽"阈值——正好能当 `warn` / `crit` 的默认值。
+   - `description` 比规格属性名细得多：门锁同一块 `battery-level` 分别写「5号电池」「锂电池」
+     「小电池」「大电池」，洗衣机写「洗衣液」（规格里是 `detergent-left-level`）。
+4. **`prop` 能对到设备规格的 `siid.piid`**：`prop.6.1` / `prop.2.1003` → 直接拆。
+   本机 17 条详情里 **15 条命中**，属性名全部是 `battery-level` / `filter-life-level` /
+   `detergent-left-level`，与 `description` 语义一致 → **可以直接喂给现有耗材页的
+   `did:siid.piid` 模型**。两种对不上的写法都在老门锁 `loock.lock.t1pro`：`prop.electricity`
+   （按名字）与 `prop.4106`（疑似 siid+piid 拼接，规格里 siid 4 只有 `4.1`）。
+5. **覆盖 14 台 / 64 台**，剩下 50 台涉及的 38 个型号是灯、插座、摄像头、浴霸这类
+   **本来就没有耗材**的设备——所以"覆盖面小"不是缺陷；真正的耗材设备（净化器滤芯、
+   各类电池、门锁双电池、洗衣机洗衣液、空调滤网）基本都在里面。
+6. `filter_ignore` 实测**无差异**（`True` / `False` 都是 12 + 2 条），因为本账号
+   `ignore_count` 全为 0，**没有忽略项样本**，参数语义仍未验证。
+
+**判断**：这是"云端耗材台账"，和耗材页现在做的事（用户手挑 spec 属性 + 自己填阈值）
+不是替代关系，而是能补上后者最费劲的三步：**找哪些属性算耗材、给双电池分名字、给阈值**。
+推荐形态是**当候选清单**——「添加设备 / 添加耗材」时多一列「云端认为的耗材」，点一下
+自动填好 `did:siid.piid` + 名称 + 阈值，仍然由用户确认后才落卡（不推翻"不做全屋自动扫描"
+的决策）；**不建议**整页改成直读云端台账——那样会丢掉用户自定义阈值、排序、三种卡片
+样式，而且 `value` 只有百分比、没有时间序列。
+
+**已知限制**：`prop` 的两种非标准写法没解；`state` 语义未知；`filter_ignore` 未验证；
+条目没有 `room_name`（只有 `room_id`，要自己映射）。
 
 ### 3.5 P2：房间 / 设备管理写接口
 
@@ -681,6 +719,7 @@ spec comment / description  →  原始中文 / 英文（兜底）
 | 事件轮询占位 | `mihome/ui/main_window.py:466-470`；`mihome/core/poll_demand.py:13-14` |
 | 消息中心只读 | `mihome/core/messages.py`、`mihome/core/api.py:958-980` |
 | 统计接口实测（可用性 / 覆盖 / 粒度 / 翻页 / 单位） | 探针脚本与原始输出未入库，仅本地留存 |
+| 耗材清单实测（§3.4） | `scripts/probe_consumables.py`；原始结构落 `scripts/out/consumable_items.json`（含 did，已 gitignore） |
 | 插件包实测（端点 / 覆盖 / 包结构 / 故障码表 / i18n） | 探针脚本与原始输出未入库，仅本地留存 |
 | locale / spec 对比（`zh` 作用域、spec 字段语言、spec vs 插件） | 原始输出未入库，仅本地留存 |
 | 同类项目对照 | `docs/reference/mihome-pc-unofficial.md`、`docs/reference/openmexia-notes.md` |
@@ -688,6 +727,8 @@ spec comment / description  →  原始中文 / 英文（兜底）
 ### 6.4 “社区声称存在但本项目未验证”的清单
 
 - **统计接口在共享家庭 / 其他账号 / 其他地区**：本次只测了自有家庭 1 个，共享家庭整组跳过；其他账号、地区、型号的覆盖未验证。
+- **耗材清单的 `state` / `filter_ignore`**：`state` 2 / 3 两组只有 2 条样本且 `value` 为空，语义无文档；`filter_ignore` 因本账号无忽略项而看不出差异。
+- **耗材 `prop` 的两种非标准写法**：`prop.electricity`（按名字）与 `prop.4106`（疑似拼接）只在老门锁 `loock.lock.t1pro` 出现，按要求没有去猜。
 - **房间 / 设备管理写接口**：同类项目说“已通”，本项目没有自己验证；共享家庭边界也没有在代码里统一拦截。
 - **中枢网关本地 MQTT**：官方 HA 已实现，但官方没有公开协议；本项目没有验证过鉴权、主题、报文。
 - **场景 / 自动化编辑**：社区提到 `AppSceneService/Edit`，本项目明确未验证，且不建议做。
