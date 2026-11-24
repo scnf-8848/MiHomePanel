@@ -424,14 +424,10 @@ class Prefs:
         self.device_order = _order_map(data.get("device_order"))
         self.scene_order = _order_map(data.get("scene_order"))
         self.hidden = _str_list(data.get("hidden"))
-        # 隐藏设备的 did 可能还留在顺序表里。读入时顺手清掉，
-        # 让「顺序表 = 可见设备」从启动那一刻起就成立。
-        for key, dids in list(self.device_order.items()):
-            kept = [d for d in dids if d not in self.hidden]
-            if kept:
-                self.device_order[key] = kept
-            else:
-                self.device_order.pop(key, None)
+        # 顺序表**故意不清隐藏项**（2026-11-24 口径）：隐藏只是不在卡片墙上
+        # 显示，设备还在、房间还在，用户排过的位置也该留着。读入时清掉的话，
+        # 一重启就丢，恢复显示只能落到末尾。``apply_order`` 只排传入的 items，
+        # 表里多出来的 did 被忽略，带着无害。
         self.hidden_scenes = _str_list(data.get("hidden_scenes"))
         self.card_styles = _card_style_map(data.get("card_styles"))
         # 耗材监控项：坏条目直接丢，重复 id 只留第一条（同一个属性两张卡会抢值）
@@ -663,7 +659,7 @@ class Prefs:
         self, home_id: str, room_id: str, dids: Sequence[str],
     ) -> None:
         key = self.room_key(home_id, room_id)
-        self.device_order[key] = self._only_visible(dids)
+        self.device_order[key] = self._merge_device_order(key, dids)
         self.save()
 
     def set_scene_order(self, home_id: str, scene_ids: Sequence[str]) -> None:
@@ -691,7 +687,7 @@ class Prefs:
         if device_orders:
             for (home_id, room_id), dids in device_orders.items():
                 key = self.room_key(home_id, room_id)
-                self.device_order[key] = self._only_visible(dids)
+                self.device_order[key] = self._merge_device_order(key, dids)
         if scene_orders:
             for home_id, ids in scene_orders.items():
                 self.scene_order[home_id] = list(ids)
@@ -1122,9 +1118,11 @@ class Prefs:
     ) -> bool:
         """返回是否真的产生了变化，方便界面判断要不要重建。
 
-        「顺序表 = 可见设备」是唯一不变量：藏起来时把 did 从顺序表里删掉，
-        恢复时再追加到所在房间的末尾。``home`` / ``room`` 由 ``Store`` 提供
-        （``Prefs`` 不知道设备归属），不传时只能保证不残留隐藏项。
+        隐藏只改 ``hidden`` 这一个列表，**不动顺序表**：设备还在、房间还在、
+        用户排过的位置也在，墙上不画而已。写顺序表时由 ``_merge_device_order``
+        把隐藏项接在可见项后面，两边不会打架。``home`` / ``room`` 由 ``Store``
+        提供（``Prefs`` 不知道设备归属），恢复时要靠它把"换过房间"的设备补进
+        新房间的表。
         """
         did = str(did)
         if not did:
@@ -1133,13 +1131,12 @@ class Prefs:
             if did in self.hidden:
                 return False
             self.hidden.append(did)
-            self._forget_device_order(did)
         else:
             if did not in self.hidden:
                 return False
             self.hidden.remove(did)
             if home:
-                self._append_device_order(home, room, did)
+                self._restore_device_order(home, room, did)
         self.save()
         return True
 
@@ -1191,11 +1188,29 @@ class Prefs:
         self.save()
         return True
 
-    # -- 顺序表的可见性约束 ----------------------------------------------
-    def _only_visible(self, dids: Sequence[str]) -> list[str]:
-        """写入口统一剔除已隐藏设备，保证顺序表里只装可见设备。"""
+    # -- 顺序表与隐藏项 --------------------------------------------------
+    def _merge_device_order(self, key: str, dids: Sequence[str]) -> list[str]:
+        """写入口：可见设备按传入顺序在前，表里原有的隐藏设备接在后面。
+
+        **隐藏只是不在卡片墙上显示，不是"这台设备不存在"**（2026-11-24 定的
+        口径）。所以隐藏期间用户在墙上拖了别的卡，也不能把藏起来那几台的顺序
+        位置抹掉——否则一"恢复显示"，它就莫名其妙跳到末尾，等于偷偷改了用户
+        排过的东西。
+
+        精确原位是不可能的（墙上根本没有它这一格，插入点无从得知），统一接在
+        可见项后面：顺序本身保住了，位置可预期。
+
+        传入的 ``dids`` 原样保留（调用方可能传全量，比如设置页的树）；只补
+        旧表里有、这次没传的隐藏项。
+        """
         hidden = self.hidden_set
-        return [d for d in dids if d not in hidden]
+        wanted = list(dids)
+        seen = set(wanted)
+        kept = [
+            d for d in self.device_order.get(key, ())
+            if d in hidden and d not in seen
+        ]
+        return wanted + kept
 
     def _append_device_order(self, home_id: str, room_id: str, did: str) -> None:
         """把一台设备追加到房间末尾；先去掉可能残留的同一 did。"""
@@ -1206,19 +1221,44 @@ class Prefs:
         order.append(did)
         self.device_order[key] = order
 
-    def _forget_device_order(self, did: str) -> int:
-        """把这台设备从各房间的顺序表里删掉，返回命中了几张表。"""
+    def _restore_device_order(self, home_id: str, room_id: str, did: str) -> None:
+        """恢复显示：顺序表里还留着它就原地不动。
+
+        只有"换过房间"（新房间的表里没有它）或"本来就不在表里"（新设备、顺序
+        被重置过）才追加到当前房间末尾；无论哪种，别的房间表里的残留都要清掉，
+        否则同一台设备会在两张表里各占一个位置。
+        """
+        if not did:
+            return
+        key = self.room_key(home_id, room_id)
+        if did in self.device_order.get(key, ()):
+            self._forget_device_order(did, keep=key)
+            return
+        self._forget_device_order(did)
+        self._append_device_order(home_id, room_id, did)
+
+    def _forget_device_order(self, did: str, *, keep: str = "") -> int:
+        """把这台设备从各房间的顺序表里删掉，返回命中了几张表。
+
+        ``keep`` 指定的那张表跳过——恢复显示时要留住它原来的位置。
+        """
         hits = 0
         for key, dids in list(self.device_order.items()):
+            if key == keep:
+                continue
             if did in dids:
                 self.device_order[key] = [d for d in dids if d != did]
                 hits += 1
         return hits
 
     def append_device_orders(self, slots: Iterable[tuple[str, str, str]]) -> None:
-        """批量恢复到所在房间末尾（「全部恢复显示」用），只落一次盘。"""
+        """批量恢复显示（「全部恢复显示」用），只落一次盘。
+
+        注意不是无脑追加：表里还留着位置的设备保持原位，只有真正缺位置的才
+        补到房间末尾（见 :meth:`_restore_device_order`）。
+        """
         for home, room, did in slots:
-            self._append_device_order(home, room, did)
+            self._restore_device_order(home, room, did)
         self.save()
 
     # -- 内部 ------------------------------------------------------------

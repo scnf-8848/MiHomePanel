@@ -430,10 +430,16 @@ class Store:
         return self._home_id_of(st), room_id
 
     def rooms(self, home_id: str | None = None) -> list[RoomView]:
-        """输出某个家庭的 房间 → 设备，顺序是"用户排过的在前，其余跟云端"。
+        """**卡片墙的视图**：房间 → 可见设备，顺序是"用户排过的在前，其余跟云端"。
 
         ``hidden`` 分组的设备不会出现在自己的房间里，而是集中到末尾一组，
         这样卡片墙只留真正会去点的东西。
+
+        注意它回答的是"墙上画什么"，**不是"有哪些房间"**：一间房的设备全被
+        隐藏时，这里不会有它的分区（这是对的，画出来是空白）。要房间清单请用
+        :meth:`room_entries`；要连隐藏设备一起拿请用 :meth:`device_states` /
+        :meth:`home_devices`。历史上把这两个问题混在一起过两次（耗材页按房间
+        分组、设置页台数），改调用方前先想清楚要的是哪一个（2026-11-24）。
         """
         homes = self.homes()
         if home_id:
@@ -610,11 +616,13 @@ class Store:
     def set_device_order(
         self, home_id: str, room_id: str, dids: Sequence[str], *, notify: bool = True
     ) -> None:
-        """写入房间内的卡片顺序（只含可见设备）。
+        """写入房间内的卡片顺序。
 
         主界面拖动排序时传 ``notify=False``：布局项已经当场挪好了，再广播一次
         ``on_layout_changed`` 会把整面墙重建，滚动位置和刚放下的卡片都会跳。
-        隐藏设备不在顺序表里，这一点由 ``Prefs`` 的写入口统一保证。
+
+        传进来的是**墙上看得见的那些**（拖动只可能拿到可见卡片）；表里原有的
+        隐藏设备由 ``Prefs`` 的写入口接在后面，不会被这次覆盖抹掉。
         """
         self.prefs.set_device_order(home_id, room_id, dids)
         if notify:
@@ -625,8 +633,8 @@ class Store:
         self._layout_changed()
 
     def set_hidden(self, did: str, hidden: bool) -> None:
-        # 恢复显示时要把 did 追加回它所在房间的末尾；隐藏时 Prefs 会把它
-        # 从顺序表里剔除，保证「顺序表 = 可见设备」。
+        # 隐藏只改 prefs.hidden，顺序表里的位置留着（隐藏≠不存在）。
+        # 恢复时要传房间，因为设备可能在这期间换过房间，得补进新房间的表。
         slot = self.device_room(did) if not hidden else None
         home, room = slot if slot is not None else ("", "")
         if not self.prefs.set_hidden(did, hidden, home=home, room=room):

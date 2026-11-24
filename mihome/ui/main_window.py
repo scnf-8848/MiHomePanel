@@ -601,6 +601,11 @@ class MainWindow(QMainWindow):
         只有恢复开关打开、且记录的家庭就是当前家庭时才用 ``last_room``；
         其余情况（开关关掉、家庭已不存在、房间被删 / id 对不上）一律回该家庭
         第一个普通房间。没有普通房间时退回"全部设备"，不报错也不卡住。
+
+        用 ``rooms()`` 而不是 ``room_entries()`` 是有意的：这里的候选是"墙上
+        真能滚过去的分区"。设备全被隐藏的房间在墙上没有分区（隐藏项集中在
+        末尾那组），落进去只会看到一片空白，所以它不参与启动落点——**这不
+        等于房间不存在**，房间仍在 ``room_entries()`` 里，设置页照样能管理。
         """
         rooms = [v.room for v in self.store.rooms(home) if v.kind == "room"]
         if (self.prefs.restore_last_page and self.prefs.last_home == home):

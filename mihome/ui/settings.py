@@ -194,6 +194,22 @@ def dialog_qss(p: theme.Palette) -> str:
     """
 
 
+def room_count_note(states, prefs) -> str:
+    """房间行右侧的台数：**全部**设备，另有隐藏的补一句。
+
+    隐藏只是不在卡片墙上显示，房间和里面的设备都还在（2026-11-24 定的口径）。
+    早先这里只数可见设备，"整间房都藏起来"就显示成「0 台」，看起来像房间被
+    清空了。数字按全量算以后，再补一句藏了几台，免得跟墙上看到的台数对不上。
+
+    抽成模块级函数是为了能单测：这个口径被改错过一次，不想再靠肉眼。
+    """
+    hidden = sum(1 for st in states if prefs.is_hidden(st.did))
+    note = f"{len(states)} 台"
+    if hidden:
+        note += f" · {hidden} 隐藏"
+    return note
+
+
 class _PresetSwatch(QWidget):
     """背景预设色块：按**当前明暗档**画真实底色 / 渐变，并示意卡片与透明度。
 
@@ -851,16 +867,14 @@ class SettingsDialog(QDialog):
                 None, home.display_name, {"kind": "home", "key": home.id}
             )
             for room_id, room_name in self.store.room_entries(home.id):
-                # 台数只数可见设备：顺序表的含义是「可见设备的顺序」，
-                # 隐藏项不在表里，也不该算进这个数字里。
-                states = [
-                    st for st in self.store.device_states(home.id, room_id)
-                    if not self.store.prefs.is_hidden(st.did)
-                ]
+                # 台数算**全部**设备：隐藏只是不在卡片墙上显示，房间和里面的
+                # 设备都还在——这里写成「0 台」会让人以为这间房被清空了
+                # （2026-11-24 定的口径）。口径与算法见 ``room_count_note``。
+                states = self.store.device_states(home.id, room_id)
                 self.tree_rooms.add_row(
                     h_item, room_name,
                     {"kind": "room", "home": home.id, "room": room_id},
-                    suffix=f"{len(states)} 台",
+                    suffix=room_count_note(states, self.store.prefs),
                 )
 
             s_item = self.tree_scenes.add_row(

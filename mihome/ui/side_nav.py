@@ -139,6 +139,10 @@ class SideNav(QWidget):
         rows.append(_Row("all", "全部设备", len(items), "", "*", y))
         y += ITEM_H + 4
 
+        # 房间行来自 ``rooms()``，也就是"墙上真有的分区"：设备全被隐藏的房间
+        # 在墙上没有分区，这里也就不列（点进去是空白，比不列更糟）。房间本身
+        # 没消失——设置页仍按 ``room_entries()`` 列出全部房间，隐藏项也仍在
+        # 末尾那组里能看到、能恢复。
         for view in store.rooms(home_id):
             rows.append(
                 _Row("hidden" if view.kind == "hidden" else "room",
