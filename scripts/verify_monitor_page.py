@@ -338,11 +338,47 @@ def main() -> int:
           (dict(page._pending), page._poll.isActive()), ({}, False))
     check("失败写进格子里，而不是卡在取流", cell2._message, "模拟失败")
 
-    print("\n7) 双击放大：只留这一格，再双击还原")
-    page._on_zoom_cell(page._cells[2])
+    print("\n7) 双击放大：这一格拉满整块画面区，再双击还原")
+    zoom = page._cells[2]
+    before = zoom.size()
+    check("放大前这一格只是四宫格的一角", before.width() < page._grid_host.width(), True)
+    page._on_zoom_cell(zoom)
+    app.processEvents()
+    page._grid.activate()
     check("放大时只显示一格", sum(1 for c in page._cells if not c.isHidden()), 1)
-    page._on_zoom_cell(page._cells[2])
+    idx = page._grid.indexOf(zoom)
+    check("放大这一格还在布局里", idx >= 0, True)
+    # 2026-11-25 用户报的就是这里：旧实现只把别的格 setVisible(False)，
+    # 藏起来的格仍占着自己的格位，放大那格的尺寸一点没变
+    check("在布局里跨满全部行列（0,0,2 行 2 列）",
+          page._grid.getItemPosition(idx), (0, 0, 2, 2))
+    check("宽高真的等于整块画面区", (zoom.width(), zoom.height()),
+          (page._grid_host.width(), page._grid_host.height()))
+    check("比放大前大（不再保持原样）",
+          (zoom.width() > before.width(), zoom.height() > before.height()),
+          (True, True))
+    page._on_zoom_cell(zoom)
+    app.processEvents()
+    page._grid.activate()
     check("还原后四格都在", sum(1 for c in page._cells if not c.isHidden()), 4)
+    check("还原后尺寸回到原来那样", zoom.size(), before)
+    check("还原后每格回到预设坐标",
+          [page._grid.getItemPosition(page._grid.indexOf(c))[:2] for c in page._cells],
+          [(0, 0), (0, 1), (1, 0), (1, 1)])
+
+    print("\n7b) 放大时点源 / 清空：只作用在看得见的那一格")
+    page._on_zoom_cell(page._cells[2])
+    app.processEvents()
+    page._start = lambda cell: None  # type: ignore[method-assign]
+    page._on_source_clicked("c1")
+    check("点源换的是放大这一路，没塞进藏着的空格",
+          [c.did for c in page._cells], ["", "", "c1", "c3"])
+    page._on_clear_cell(page._cells[2])
+    app.processEvents()
+    check("清空放大那一格 → 自动还原成网格",
+          (page._zoomed, sum(1 for c in page._cells if not c.isHidden())), (None, 4))
+    page._on_source_clicked("c1")
+    check("还原后单击回到「放第一个空格」", [c.did for c in page._cells][0], "c1")
 
     print("\n8) 多路仲裁：monitor 面单独放宽，其余面仍是单槽")
     owner = PlaybackOwnership()

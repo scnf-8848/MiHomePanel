@@ -621,6 +621,12 @@ class MonitorPage(QWidget):
         self._drag_cell: CameraCell | None = None
         #: 双击放大的那一格（``None`` = 正常网格）
         self._zoomed: CameraCell | None = None
+        #: 当前预设 + 它的行列数。放大要按「整块」跨全部行列重排，而
+        #: ``QGridLayout.rowCount()`` 在摘掉控件后不会缩回去（见 ``_build_cells``
+        #: 里清拉伸那段），不能拿它当行列数用
+        self._spec = LAYOUT_SPECS[MONITOR_LAYOUT_DEFAULT]
+        self._grid_rows = self._spec.rows
+        self._grid_cols = self._spec.cols
         self._guard = DragGuard(self)
         self._guard.aborted.connect(self._on_drag_aborted)
 
@@ -762,6 +768,9 @@ class MonitorPage(QWidget):
         for i in range(self._grid.columnCount()):
             self._grid.setColumnStretch(i, 0)
         spec = LAYOUT_SPECS.get(layout, LAYOUT_SPECS[MONITOR_LAYOUT_DEFAULT])
+        self._spec = spec
+        self._grid_rows = spec.rows
+        self._grid_cols = spec.cols
         for i, (row, col, rspan, cspan) in enumerate(spec.cells):
             cell = CameraCell(self._p, self._grid_host)
             cell.clear_requested.connect(self._on_clear_cell)
@@ -808,6 +817,9 @@ class MonitorPage(QWidget):
             cell.set_device(state)
             # 封面在 ``set_device`` 之后给：格子换了设备就是换一张脸，别留在上一张上
             cell.set_poster(self._thumbs.get(state.did) if state is not None else None)
+        if self._zoomed is not None and not self._zoomed.did:
+            # 放大那一格被清空 / 换了家庭：留一块铺满画面区的空框没意义，还原成网格
+            self._unzoom()
 
     def _save_cells(self) -> None:
         dids = [cell.did for cell in self._cells]
@@ -951,6 +963,13 @@ class MonitorPage(QWidget):
     # -- 分配 ------------------------------------------------------------
     def _on_source_clicked(self, did: str) -> None:
         """单击 = 放进第一个空格；已经在某格里就什么都不做（别把它搬来搬去）。"""
+        if self._zoomed is not None:
+            # 放大时只有一格看得见：点源就是换这一路（拖放同理——``_cell_at``
+            # 跳过隐藏的格子，落点必然也是这一格）。还按"第一个空格"来，就会
+            # 塞进某个藏在后面的格子，画面上什么都没发生。
+            if self._zoomed.did != did:
+                self._assign(self._zoomed, did)
+            return
         if any(cell.did == did for cell in self._cells):
             return
         for cell in self._cells:
@@ -998,6 +1017,9 @@ class MonitorPage(QWidget):
     def _on_clear_cell(self, cell: CameraCell) -> None:
         self._stop_cell(cell)
         cell.set_device(None)
+        if self._zoomed is cell:
+            # 把放大那一格清空 = 剩一块巨大的空框，先还原成网格再让用户继续
+            self._unzoom()
         self._save_cells()
         self._update_hint()
 
@@ -1005,15 +1027,38 @@ class MonitorPage(QWidget):
         self._start(cell)
 
     def _on_zoom_cell(self, cell: CameraCell) -> None:
-        """双击放大：只留这一格，再双击还原。不改布局，只是把其它格藏起来。"""
+        """双击放大：这一格**拉满整块画面区**，再双击还原。
+
+        2026-11-25 用户报「双击后其它格是藏起来了，但画面还是原来那么大」——
+        旧实现只 ``setVisible(False)``，而藏起来的格子仍占着网格里自己的位置，
+        放大那一格的尺寸一点没变，等于双击白按。这里改成真的重排：把所有格从
+        布局里摘出来、只把这一格按「跨全部行列」加回去。
+
+        只动画面区，顶部工具栏与左侧选源栏保留——那两个是「换布局 / 全部停止 /
+        拖源」的唯一入口，藏起来用户就没法退出了（还靠再双击）。
+        """
         if self._zoomed is cell:
-            for item in self._cells:
-                item.setVisible(True)
-            self._zoomed = None
+            self._unzoom()
             return
+        if self._zoomed is not None:
+            self._unzoom()
         self._zoomed = cell
         for item in self._cells:
+            # 从布局摘出来：留着一个 hidden 的兄弟挂在同格位上，QGridLayout 仍按
+            # 旧坐标给整块分配空间，画面就还是原来那么大
+            self._grid.removeWidget(item)
             item.setVisible(item is cell)
+        self._grid.addWidget(cell, 0, 0, self._grid_rows, self._grid_cols)
+
+    def _unzoom(self) -> None:
+        """把放大那一格放回预设坐标，其余格恢复显示。"""
+        self._zoomed = None
+        for item in self._cells:
+            self._grid.removeWidget(item)
+        spec = self._spec
+        for cell, (row, col, rspan, cspan) in zip(self._cells, spec.cells):
+            self._grid.addWidget(cell, row, col, rspan, cspan)
+            cell.setVisible(True)
 
     # -- 播放 ------------------------------------------------------------
     def _stop_cell(self, cell: CameraCell) -> None:
