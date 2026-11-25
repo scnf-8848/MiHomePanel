@@ -1024,9 +1024,13 @@ def card_hover_color(base: str, p: Palette) -> str:
     return blend(base, "#FFFFFF" if p.is_dark else "#000000", 0.06 if p.is_dark else 0.035)
 
 
-# 字体：优先系统中文黑体。QSS 里的 font-family 只写一个名字就够，
-# Qt 会自己往下找。
-FONT_STACK = '"Microsoft YaHei UI", "Microsoft YaHei", "PingFang SC", "Noto Sans SC", sans-serif'
+# 字体**只由 `fonts.apply_to()` 下发**（QApplication.setFont），QSS 里不写
+# ``font-family``。2026-11-25 实测：在 ``*`` 里写五段字体栈，Qt 会为**每个控件**
+# 单独解析这串栈、各建一套字体引擎——143 个控件的真实主窗口，构造 + show 的私有
+# 内存从 30.8 MB 涨到 61.9 MB（工作集 63.7 → 132.0），整整一倍。
+# 换成 app 字体之后，"单族 + 无 QSS font-family" 才能复用同一套引擎；
+# **只去掉其中一个不起作用**（app 字体多族、或 QSS 仍写着栈，实测都是 60+ MB）。
+# 所以：要换字体改 `ui/fonts.py` 的 ``FAMILY`` / ``PIXEL_SIZE``，别加回这里。
 
 # ---------------------------------------------------------------------------
 # 设计 token（数值来自真机采集，见 docs/reference/米家App-UI风格参考.md）
@@ -1104,7 +1108,6 @@ def apply_to_app(p: Palette) -> None:
 def app_qss(p: Palette) -> str:
     return f"""
     * {{
-        font-family: {FONT_STACK};
         outline: none;
     }}
     /* 窗口底色由 WindowFrame 抗锯齿地铺（见 chrome.rounded_path），
@@ -1152,7 +1155,6 @@ __all__ = [
     "CARD_MIN_W",
     "CATEGORY_COLOR",
     "DARK",
-    "FONT_STACK",
     "FS_CARD_SUB",
     "FS_CARD_TITLE",
     "FS_METRIC",

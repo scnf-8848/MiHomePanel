@@ -19,8 +19,10 @@ import sys
 
 from PySide6.QtGui import QFont
 
-#: 界面统一字体与字号。换字体要同时改 :data:`theme.FONT_STACK`——后者经 QSS 的
-#: ``* { font-family }`` 下发，会盖掉这里设的 app 字体，只改一处会出现"部分控件还是旧字体"。
+#: 界面统一字体与字号。**这里是字体的唯一来源**（经 ``apply_to`` 设成 app 字体）。
+#: 2026-11-25 起 QSS 里不再写 ``font-family``：那个 ``*`` 规则会让 Qt 为每个控件
+#: 单独解析字体栈、各建一套字体引擎，143 个控件的主窗口因此多占 31 MB 私有内存
+#: （实测见 ``docs/dev/ui.md``「字体只由 app 下发」）。换字体只改这两个常量。
 FAMILY = "Microsoft YaHei UI"
 PIXEL_SIZE = 13
 

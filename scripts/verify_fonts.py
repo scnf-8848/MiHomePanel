@@ -110,14 +110,21 @@ finally:
 print()
 print("== 3. 基准字体 ==")
 font = fonts.make_font()
-check("字体名与 theme.FONT_STACK 首项一致", font.family(), fonts.FAMILY)
+check("字体名 = fonts.FAMILY", font.family(), fonts.FAMILY)
 check("字号", font.pixelSize(), fonts.PIXEL_SIZE)
 check_true(
     "带 NoSubpixelAntialias",
     font.styleStrategy() == QFont.NoSubpixelAntialias,
     f"got={font.styleStrategy()}",
 )
-check_true("FONT_STACK 里含 FAMILY", fonts.FAMILY in theme.FONT_STACK, theme.FONT_STACK)
+# 2026-11-25：QSS 里**不许**再出现 font-family。那个 `* { font-family: 字体栈 }`
+# 会让 Qt 给每个控件单独解析字体栈、各建一套字体引擎——真实主窗口实测多占
+# 31 MB 私有内存。字体只能由 `fonts.apply_to()` 下发。
+check_true(
+    "全局 QSS 里没有 font-family",
+    "font-family" not in theme.app_qss(theme.LIGHT),
+    theme.app_qss(theme.LIGHT)[:60].replace("\n", " "),
+)
 
 print()
 print("== 4. 装到应用后控件是否继承（QSS 不能吃掉策略）==")
@@ -130,7 +137,7 @@ check_true(
     f"got={app.font().styleStrategy()}",
 )
 
-# 真实路径：theme.apply_to_app 会设 `* { font-family: ... }`，这里必须复现
+# 真实路径：theme.apply_to_app 装调色板 + app 字体，QSS 里不再写 font-family
 theme.apply_to_app(theme.LIGHT)
 app.setStyleSheet(theme.app_qss(theme.LIGHT))
 

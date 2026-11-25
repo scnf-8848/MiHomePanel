@@ -23,13 +23,14 @@
 | 位置 | 内容 | 为什么必须管 |
 |---|---|---|
 | `mihome/ui/fonts.py` | `FAMILY` / `PIXEL_SIZE` / `make_font()`（带 `NoSubpixelAntialias`） | 唯一出口。`app.py` 两条启动路径都走 `fonts.apply_to(app)` |
-| `mihome/ui/theme.py` 的 `FONT_STACK` | 由 `app_qss()` 的 `* { font-family: … }` 下发 | **QSS 的 `*` 会盖掉 app 字体**，只改 `app.py` 不会生效 |
+| ~~`mihome/ui/theme.py` 的 `FONT_STACK`~~ | **2026-11-25 已删除**：QSS 不再下发 `font-family` | 那个 `*` 规则让 Qt 给每个控件各建一套字体引擎，真实主窗口多占 **31 MB 私有内存**（30.8 vs 61.9）。字体现在只剩 `fonts.py` 一处 |
 | `mihome/ui/fonts.py` 的 `prepare_engine()` | 在 `QApplication` 之前把 `QT_QPA_PLATFORM` 改成 `windows:fontengine=freetype` | 平台插件只在构造时读一次环境变量，顺序错了完全不报错、也没效果 |
 
 改动前是"三处各写一遍"（`app.py:390`、`app.py:173`、`theme.py` 的 `FONT_STACK`）；
-现在前两处合进 `fonts.py`，以后换字体改 `fonts.FAMILY` + `FONT_STACK` 首项两处即可。
-**`FONT_STACK` 没合并进来是有意的**：它服务于 QSS，而 QSS 里还要写英文 / 非 Windows
-的回退链，塞进 `fonts.py` 只会让两边都别扭。
+现在**只剩 `fonts.py` 一处**。2026-11-25 把 `FONT_STACK` 也删了：QSS 的 `*` 下发
+五段字体栈时，Qt 会为每个控件单独解析、各建一套字体引擎（实测 143 个控件的主窗口
+构造 + show 多 31 MB 私有内存）。回退能力交给 Qt 自己的字体替换，换字体改
+`fonts.FAMILY` 一处即可。
 
 旁支（不影响运行时，但改名后要一起扫）：
 

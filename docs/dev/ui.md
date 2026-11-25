@@ -1132,14 +1132,23 @@ ClearType 子像素彩边——13 px 中文笔画边上会带红蓝两色，放�
 - **它会跳过三种情况**：非 Windows、环境里已经写了 `fontengine=`、
   平台不是 `windows`（`offscreen` / `minimal` 原样放过——50 多个验证脚本靠这一条）。
 - **回退**：启动前设 `MIHOME_FONT_ENGINE=default` 即退回 DirectWrite，不改代码。
-- **QSS 不会吃掉策略**：`app_qss()` 的 `* { font-family }` 只重建字体族，
-  `NoSubpixelAntialias` 仍在控件上（`scripts/verify_fonts.py` 钉住）。
+- **QSS 里不再写 `font-family`**（2026-11-25，省 31 MB 私有内存）：以前
+  `app_qss()` 的 `* { font-family: 五段字体栈 }` 会让 Qt 给**每个控件**单独解析这串
+  栈、各建一套字体引擎。真实主窗口（1360×900、175% 缩放、143 个控件）实测：
+  保留那行时构造 + show 增量 **61.9 MB 私有 / 132.0 MB 工作集**，去掉后
+  **30.8 / 63.7**——整整一倍。字体现在**只由 `fonts.apply_to()`**（即 app 字体）
+  下发，`*` 里只留 `outline: none`。
+  两个坑：①**只去掉其中一个不管用**——app 字体多族、或 QSS 仍写着栈，实测都还是
+  60+ MB，必须"单族 + 无 QSS font-family"这一对；②别想着保留字体栈的兜底能力，
+  Qt 的字体替换会按字符补，真换字体改 `fonts.FAMILY`。
+  回归：`scripts/verify_fonts.py`「全局 QSS 里没有 font-family」。
+- **改字号 / 换字体前**：**只改 `ui/fonts.py` 的 `FAMILY` / `PIXEL_SIZE` 一处**——
+  2026-11-25 起 `theme.FONT_STACK` 已删除。字形的备选方案、体积与许可见
+  [font-swap.md](../reference/font-swap.md)。
 - **实测口径**（别凭印象改）：顶栏标题彩边最大 **176 → 9**、平均 **15.9 → 2.0**，
   明暗两档一致；笔画最深处落差 **233（浅）/ 219（深）前后不变**——所以不是"变淡"，
   只是边缘从"彩"变"灰"；13 px 行高不变（两侧都 16），整窗 **99.65 % 像素零位移**。
-- **改字号 / 换字体前**：`theme.FONT_STACK` 与 `fonts.FAMILY` 是两处，
-  只改一处会出现"部分控件还是旧字体"。字形的备选方案、体积与许可见
-  [font-swap.md](../reference/font-swap.md)。
+- **改字号 / 换字体**：见上面那两条——字体只有 `ui/fonts.py` 一处。
 
 ## 子窗口的浮窗形态：外圈阴影 + 内缩面板（2026-11-13）
 
