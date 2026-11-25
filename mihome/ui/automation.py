@@ -3,7 +3,8 @@
 
     ① 当以下情况发生时 —— 快捷键（录制 / 手动选键）+ 注册状态 + **冷静期**
     ② 满足全部 / 任一状态条件 —— 电脑条件行，可为空
-    ③ 则执行动作 —— 发虚拟事件 / 延迟 / 发音箱指令，按从上到下顺序执行，可加减与调序
+    ③ 则执行动作 —— 选设备做点什么（虚拟事件 / 唤醒 / 播报 / 文本指令）、执行快捷场景、
+       延迟，按从上到下顺序执行，可加减与调序
 
 ② 和 ③ 都只有**一枚**「＋ 添加…」按钮（11-13 用户第八条）：加出来的那一行落在空档
 「-」上，用户自己在下拉里挑类型，② 和 ③ 因此长得一样。空档是**还没选**，不是"类型
@@ -108,7 +109,8 @@ _ROW_INDENT = _INDEX_W + _ROW_GAP
 ELSE_HINT_READY = "可以留空：条件成立时照常执行上面的动作，不成立时什么都不做"
 ELSE_HINT_NO_COND = "② 里还没有条件：先加一条状态条件，才有「不成立」可走"
 #: ③ 空态。新建规则不再预置一行空档动作（11-14），所以这句要告诉用户入口在哪。
-ACTION_HINT_EMPTY = "还没有动作：点下面「＋ 选择设备」或「＋ 延迟」开始"
+ACTION_HINT_EMPTY = ("还没有动作：点下面「＋ 选择设备」「＋ 选择快捷场景」"
+                     "或「＋ 延迟」开始")
 
 
 def _rule(parent: QWidget) -> QFrame:
@@ -144,6 +146,8 @@ _HINT_TIPS = {
         f"（1.234 秒 = 1234 毫秒）",
     "要填延迟时间": "延迟必须有值；不想等待就删掉这一行动作",
     "要先选设备": "这一行还没选设备：点左边的设备名，从当前家庭的中枢网关 / 小爱音箱里挑一台",
+    "要先选快捷场景": "这一行还没选场景：点左边的场景名，从当前家庭的快捷场景里挑一个；"
+                 "没有场景先去米家 App 建一个",
     "要先选功能": "先选设备，再在右边挑这台设备要做什么（唤醒 / 播报文字 / 执行文本指令 / …）",
     # 「要填文字」「要填事件名」由功能元数据现拼，见 ActionRow.error_text
     "要填文字": "这一格是要发给设备的文字；不想说就删掉这一行动作",
@@ -931,6 +935,21 @@ def _action_devices(service: AutomationService) -> list[action_catalog.ActionDev
         return []
 
 
+def _scene_options(service: AutomationService) -> list[dict[str, Any]]:
+    """当前家庭的快捷场景（含隐藏 / 停用，界面自己标）；取不到就当没有。
+
+    吞异常的理由同 ``_action_devices``：这一层只决定"选择窗里有几条"，场景还没加载 /
+    离线验证的假 service 没有这个方法，都不该把编辑窗带崩。
+    """
+    getter = getattr(service, "scene_options", None)
+    if not callable(getter):
+        return []
+    try:
+        return list(getter())
+    except Exception:  # noqa: BLE001
+        return []
+
+
 def _new_delay() -> Action:
     """「＋ 延迟」加出来的行：默认 1 秒（和 ``_DELAY_DEFAULTS["ms"]`` 同一档），用户改。"""
     return Action("delay", ms=1000)
@@ -1065,6 +1084,142 @@ class DevicePicker(QDialog):
         return got
 
 
+class ScenePicker(QDialog):
+    """「选择快捷场景」窗：列出当前家庭的快捷场景，点一下就拿走。
+
+    和 ``DevicePicker`` 共用一套骨架（无边框窗 + 搜索 + 列表 + 单击即选中），差别只在
+    数据源：场景没有房间、没有在线状态，"状态"是**已隐藏 / 已停用**。
+
+    **连隐藏的场景一起列**：隐藏只是首页那排胶囊不画它（2026-11-24 定的口径），场景
+    本身还在。用户很可能正是"不想让它占首页、但仍要用热键唤起"才把它藏起来——
+    在这儿筛掉就等于把这条路堵了。列表里照实标注，用户自己判断。
+
+    停用的场景**不禁用**（仍可选中）：云端会在执行时拒绝，日志里写原因；比"选不到"
+    更好解释——用户可能只是还没去 App 里把它打开。
+    """
+
+    def __init__(self, scenes: list[dict[str, Any]],
+                 palette: theme.Palette, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._p = palette
+        self._scenes = list(scenes)
+        self._chosen: dict[str, Any] | None = None
+        self.setWindowTitle("选择快捷场景")
+        self.setWindowFlags(Qt.Dialog | Qt.FramelessWindowHint)
+        self._frame = WindowFrame(self, resizable=True,
+                                  radius=theme.RADIUS_CARD,
+                                  shadow=SHADOW_PAD,
+                                  shadow_alpha=shadow_alpha(self._p),
+                                  fill=lambda: surface_bg(self._p),
+                                  border=lambda: surface_border(self._p))
+        self.resize(*floating_size(420, fit_height(520, reserve=2 * SHADOW_PAD)))
+        self.setMinimumSize(*floating_size(360, 300))
+        self.setStyleSheet(_picker_qss(palette))
+
+        outer = QVBoxLayout(self._frame.body)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+        self.title_bar = TitleBar("选择快捷场景", palette,
+                                  subtitle="点一个场景，触发时由米家执行它",
+                                  buttons=("close",), variant="dialog",
+                                  frame=self._frame)
+        outer.addWidget(self.title_bar)
+
+        body = QWidget(self._frame.body)
+        col = QVBoxLayout(body)
+        col.setContentsMargins(16, 8, 16, 14)
+        col.setSpacing(10)
+
+        self.search = QLineEdit(body)
+        self.search.setObjectName("Field")
+        self.search.setPlaceholderText("搜索场景名")
+        self.search.setClearButtonEnabled(True)
+        self.search.textChanged.connect(self._apply_filter)
+        col.addWidget(self.search)
+
+        self.list = QListWidget(body)
+        self.list.setObjectName("PickerList")
+        self.list.setFrameShape(QFrame.NoFrame)
+        self.list.setUniformItemSizes(True)
+        self.list.setVerticalScrollMode(QListWidget.ScrollPerPixel)
+        self.list.itemClicked.connect(self._on_item)
+        self.list.itemActivated.connect(self._on_item)
+        for scene in self._scenes:
+            item = QListWidgetItem(self._row_text(scene))
+            item.setData(Qt.UserRole, str(scene.get("scene_id") or ""))
+            item.setToolTip(self._row_tip(scene))
+            self.list.addItem(item)
+        col.addWidget(self.list, 1)
+
+        self.empty = QLabel("当前家庭还没有快捷场景。", body)
+        self.empty.setObjectName("Hint")
+        self.empty.setWordWrap(True)
+        self.empty.setVisible(not self._scenes)
+        self.list.setVisible(bool(self._scenes))
+        col.addWidget(self.empty)
+        outer.addWidget(body, 1)
+        tab_focus_only(self)
+        if self._scenes:
+            self.list.setCurrentRow(0)
+
+    # -- 数据 ------------------------------------------------------------
+    @staticmethod
+    def _row_text(scene: dict[str, Any]) -> str:
+        """一行字：``场景名　　已隐藏 / 已停用``。两个状态可以同时出现。"""
+        marks: list[str] = []
+        if not scene.get("enabled", True):
+            marks.append("已停用")
+        if scene.get("hidden"):
+            marks.append("已隐藏")
+        return str(scene.get("name") or "") + ("　　" + "　".join(marks) if marks else "")
+
+    @staticmethod
+    def _row_tip(scene: dict[str, Any]) -> str:
+        bits = ["在米家 App 里定义的快捷场景"]
+        if scene.get("hidden"):
+            bits.append("首页不显示它（设置 → 隐藏 里可以恢复）")
+        if not scene.get("enabled", True):
+            bits.append("已停用：执行时云端会拒绝，先去 App 里启用")
+        return "\n".join(bits)
+
+    def chosen(self) -> dict[str, Any] | None:
+        return self._chosen
+
+    # -- 交互 ------------------------------------------------------------
+    def _on_item(self, item: QListWidgetItem) -> None:
+        sid = str(item.data(Qt.UserRole) or "")
+        self._chosen = next(
+            (s for s in self._scenes if str(s.get("scene_id") or "") == sid), None)
+        if self._chosen is not None:
+            self.accept()
+
+    def _apply_filter(self, text: str) -> None:
+        want = text.strip().lower()
+        shown = 0
+        for row, scene in enumerate(self._scenes):
+            hit = not want or want in str(scene.get("name") or "").lower()
+            self.list.item(row).setHidden(not hit)
+            shown += 1 if hit else 0
+        self.empty.setText("没有匹配的场景。" if want else "当前家庭还没有快捷场景。")
+        self.empty.setVisible(shown == 0)
+        self.list.setVisible(shown > 0)
+
+    @staticmethod
+    def pick(scenes: list[dict[str, Any]],
+             palette: theme.Palette, parent: QWidget | None = None):
+        """弹一次窗；选中返回场景信息字典，取消返回 ``None``。"""
+        if not scenes:
+            notice(parent, "没有可选场景",
+                   "当前家庭还没有快捷场景。先在米家 App 里建一个「手动执行」的场景，"
+                   "它就会出现在这里（首页那排胶囊也是同一批）。")
+            return None
+        dlg = ScenePicker(scenes, palette, parent)
+        ok = dlg.exec() == QDialog.Accepted
+        got = dlg.chosen() if ok else None
+        dlg.deleteLater()
+        return got
+
+
 class ActionRow(QWidget):
     """一行动作 = 序号 + 设备 + 功能 + 该功能的参数 + ↑↓×。
 
@@ -1099,6 +1254,7 @@ class ActionRow(QWidget):
         on_pick_device: Callable[[ActionRow], None] | None = None,
         devices: list[action_catalog.ActionDevice] | None = None,
         parent: QWidget | None = None,
+        on_pick_scene: Callable[[ActionRow], None] | None = None,
     ) -> None:
         super().__init__(parent)
         self._on_change = on_change
@@ -1106,8 +1262,13 @@ class ActionRow(QWidget):
         self._devices = {d.did: d for d in (devices or [])}
         self._did = action.did
         self._device_name = action.device
-        #: 行的形状：``delay`` 只有单位与数值；``device_action`` 才有设备 / 功能
-        self._type = "delay" if action.type == "delay" else "device_action"
+        #: 场景行动的三个快照（id / 名字 / 家庭）。名字只用于回显，重选时整组换掉。
+        self._scene_id = action.scene_id
+        self._scene_name = action.scene
+        self._scene_home = action.home
+        #: 行的形状：``delay`` 只有单位与数值；``scene`` 是"场景名 + 执行快捷场景"；
+        #: ``device_action`` 才有设备 / 功能 / 参数。
+        self._type = action.type if action.type in ("delay", "scene") else "device_action"
         self._prev_unit = action.unit if action.unit == "s" else "ms"
         #: "缺东西"的红字只在点过保存后才亮（``reveal_missing()``），理由同 ①②：
         #: 刚加一行就一片红是在骂人。填法错误（位数 / 超长 / 脏字符）例外——那是
@@ -1130,12 +1291,19 @@ class ActionRow(QWidget):
         self.device_btn.setFocusPolicy(Qt.TabFocus)
         self.device_btn.setCursor(Qt.PointingHandCursor)
         self.device_btn.setFixedWidth(_DEVICE_W)
-        self.device_btn.clicked.connect(
-            lambda: on_pick_device(self) if on_pick_device is not None else None)
+        self._on_pick_device = on_pick_device
+        self._on_pick_scene = on_pick_scene
+        self.device_btn.clicked.connect(self._on_device_clicked)
 
         # 功能（spec 里的 action 名）。候选跟着所选设备走，见 _fill_features
         self.kind = Combo(palette, self)
         self.kind.setFixedWidth(_FEATURE_W)
+
+        # 场景行只有一句固定说明，参数列全收掉。用 QLabel 而不是禁用下拉：灰着的下拉
+        # 会让人以为"这里还能改"，其实这一行只有场景可改（点左边的场景名重选）。
+        self.scene_kind = QLabel("执行快捷场景", self)
+        self.scene_kind.setObjectName("Hint")
+        self.scene_kind.setFixedWidth(_FEATURE_W)
 
         # 延迟的单位：同一份毫秒值的两把尺子
         self.unit = Combo(palette, self)
@@ -1175,6 +1343,7 @@ class ActionRow(QWidget):
         lay.addWidget(self.index_label)
         lay.addWidget(self.device_btn)
         lay.addWidget(self.kind)
+        lay.addWidget(self.scene_kind)
         lay.addWidget(self.unit)
         lay.addWidget(self.silent)
         lay.addWidget(self.value_edit, 1)
@@ -1212,7 +1381,7 @@ class ActionRow(QWidget):
         self._sync_placeholder()
         self.sync_hint()
 
-    # -- 设备 / 功能 ------------------------------------------------------
+    # -- 设备 / 场景 / 功能 ------------------------------------------------
     def device(self) -> action_catalog.ActionDevice | None:
         return self._devices.get(self._did)
 
@@ -1229,7 +1398,31 @@ class ActionRow(QWidget):
         self.sync_hint()
         self._on_change()
 
+    def set_scene(self, scene_id: str, name: str, home: str) -> None:
+        """换场景（行内点场景名重选）。三个快照一起换，别只改名字。"""
+        self._scene_id = scene_id
+        self._scene_name = name
+        self._scene_home = home
+        self._sync_device_button()
+        self.sync_hint()
+        self._on_change()
+
+    def _on_device_clicked(self) -> None:
+        """左边那个按钮：设备行换设备、场景行换场景。"""
+        if self._is_scene():
+            if self._on_pick_scene is not None:
+                self._on_pick_scene(self)
+            return
+        if self._on_pick_device is not None:
+            self._on_pick_device(self)
+
     def _sync_device_button(self) -> None:
+        if self._is_scene():
+            self.device_btn.setText(self._scene_name or "选择快捷场景")
+            self.device_btn.setToolTip(
+                "执行一个米家「快捷场景」\n点一下重新选择" if self._scene_name
+                else "还没有选场景：点一下从当前家庭的快捷场景里挑一个")
+            return
         dev = self.device()
         name = dev.label if dev is not None else (self._device_name or "选择设备")
         if dev is not None and not dev.online:
@@ -1308,12 +1501,15 @@ class ActionRow(QWidget):
     def _sync_columns(self) -> None:
         """按行的形状与功能的参数表显隐那几列。隐藏的控件在 QHBoxLayout 里不占位置。"""
         delay = self._is_delay()
-        feat = None if delay else self._feat()
+        scene = self._is_scene()
+        feat = None if (delay or scene) else self._feat()
         has_bool = feat is not None and any(p.kind == "bool" for p in feat.params)
         has_text = feat is not None and any(p.kind == "text" for p in feat.params)
 
+        # 设备名按钮在场景行也留着：它装的是场景名，位置不变，各行的列才对得齐
         self.device_btn.setVisible(not delay)
-        self.kind.setVisible(not delay)
+        self.kind.setVisible(not delay and not scene)
+        self.scene_kind.setVisible(scene)
         self.unit.setVisible(delay)
         self.silent.setVisible(has_bool)
         self.value_edit.setVisible(delay or has_text)
@@ -1411,6 +1607,11 @@ class ActionRow(QWidget):
                 return (f"不能超过 {MAX_DELAY_MS // 1000} 秒" if self._unit() == "s"
                         else f"不能超过 {MAX_DELAY_MS} 毫秒")
             return ""
+        if self._is_scene():
+            # 场景行没有可填的东西，唯一可能缺的是"还没选场景"；同样等点过保存才亮
+            if not self._show_missing:
+                return ""
+            return "" if self._scene_id else "要先选快捷场景"
         if not self._show_missing:
             return ""
         if not self._did:
@@ -1471,7 +1672,9 @@ class ActionRow(QWidget):
         self.down_btn.setToolTip("下移这条动作" if down else "已经是最后一条，按了也不会动")
 
     def focus_widget(self) -> QWidget:
-        """出错时焦点该给谁：没选设备 → 设备按钮；没选功能 → 功能下拉。"""
+        """出错时焦点该给谁：没选设备 / 场景 → 左边那个按钮；没选功能 → 功能下拉。"""
+        if self._is_scene():
+            return self.device_btn
         if not self._is_delay() and not self._did:
             return self.device_btn
         if not self._is_delay() and self._feat() is None:
@@ -1480,6 +1683,9 @@ class ActionRow(QWidget):
 
     def _is_delay(self) -> bool:
         return self._type == "delay"
+
+    def _is_scene(self) -> bool:
+        return self._type == "scene"
 
     def _unit(self) -> str:
         """当前录入刻度："ms" / "s"。存盘与校验一律用毫秒。"""
@@ -1490,6 +1696,9 @@ class ActionRow(QWidget):
         if self._is_delay():
             unit = self._unit()
             return Action("delay", ms=_delay_ms(self.value_edit.text(), unit), unit=unit)
+        if self._is_scene():
+            return Action("scene", scene_id=self._scene_id, scene=self._scene_name,
+                          home=self._scene_home)
         feat = self._feat()
         args: dict[str, Any] = {}
         if feat is not None:
@@ -1557,6 +1766,9 @@ class AutomationDialog(QDialog):
         #: 当前家庭里能执行动作的设备（中枢 + 音箱）。取一次就够——本窗是模态的，
         #: 开着的时候切不了家庭。行内换设备也在这一份里挑，所以两处永远一致。
         self._devices = _action_devices(service)
+        #: 当前家庭的快捷场景（含隐藏 / 停用）。同样取一次；「＋ 选择快捷场景」
+        #: 与行内重选都读这一份。
+        self._scenes = _scene_options(service)
 
         title = "新建规则" if self._is_new else "编辑规则"
         self.setWindowTitle(title)
@@ -1816,6 +2028,14 @@ class AutomationDialog(QDialog):
         pick_action.setToolTip("从当前家庭的中枢网关 / 小爱音箱里挑一台，再选它做什么")
         self.add_action_btn = pick_action
         pick_action.clicked.connect(lambda: self._pick_and_add())
+        # 2026-11-25：动作多了「执行快捷场景」这一类。它不是设备动作（没有"哪台设备"
+        # 也没有功能可挑），所以单独一枚按钮、选完直接成行。
+        pick_scene = QPushButton("＋ 选择快捷场景", action_btns)
+        pick_scene.setObjectName("Tool")
+        pick_scene.setCursor(Qt.PointingHandCursor)
+        pick_scene.setToolTip("选一个米家「快捷场景」，触发时由米家执行它（可含多台设备）")
+        self.add_scene_btn = pick_scene
+        pick_scene.clicked.connect(lambda: self._pick_scene_and_add())
         add_delay = QPushButton("＋ 延迟", action_btns)
         add_delay.setObjectName("Tool")
         add_delay.setCursor(Qt.PointingHandCursor)
@@ -1823,6 +2043,7 @@ class AutomationDialog(QDialog):
         self.add_delay_btn = add_delay
         add_delay.clicked.connect(lambda: self._add_action(_new_delay()))
         arow.addWidget(pick_action)
+        arow.addWidget(pick_scene)
         arow.addWidget(add_delay)
         arow.addStretch(1)
         card3.add_unit(action_btns)
@@ -1855,6 +2076,12 @@ class AutomationDialog(QDialog):
         pick_else.setToolTip("从当前家庭的中枢网关 / 小爱音箱里挑一台，再选它做什么")
         self.add_else_btn = pick_else
         pick_else.clicked.connect(lambda: self._pick_and_add(to_else=True))
+        pick_else_scene = QPushButton("＋ 选择快捷场景", else_btns)
+        pick_else_scene.setObjectName("Tool")
+        pick_else_scene.setCursor(Qt.PointingHandCursor)
+        pick_else_scene.setToolTip("选一个米家「快捷场景」，条件不成立时由米家执行它")
+        self.add_else_scene_btn = pick_else_scene
+        pick_else_scene.clicked.connect(lambda: self._pick_scene_and_add(to_else=True))
         add_else_delay = QPushButton("＋ 延迟", else_btns)
         add_else_delay.setObjectName("Tool")
         add_else_delay.setCursor(Qt.PointingHandCursor)
@@ -1863,6 +2090,7 @@ class AutomationDialog(QDialog):
         add_else_delay.clicked.connect(
             lambda: self._add_else_action(_new_delay()))
         erow.addWidget(pick_else)
+        erow.addWidget(pick_else_scene)
         erow.addWidget(add_else_delay)
         erow.addStretch(1)
         card4.add_unit(else_btns)
@@ -1994,7 +2222,8 @@ class AutomationDialog(QDialog):
                         self._remove_action, self._move_action,
                         on_pick_device=self._pick_device_for,
                         devices=self._devices,
-                        parent=self.action_box)
+                        parent=self.action_box,
+                        on_pick_scene=self._pick_scene_for)
         self.action_layout.addWidget(row)
         self._action_rows.append(row)
         self._renumber()
@@ -2031,6 +2260,31 @@ class AutomationDialog(QDialog):
         dev = DevicePicker.pick(self._devices, self._p, self)
         if dev is not None:
             row.set_device(dev)
+
+    def _pick_scene_and_add(self, *, to_else: bool = False) -> None:
+        """「＋ 选择快捷场景」：选完直接出一行。
+
+        不学设备动作那条"先选设备再选功能"：场景本身就是全部信息（不存在"对场景做
+        哪件事"），再让用户挑一次只是多一步。
+        """
+        scene = ScenePicker.pick(self._scenes, self._p, self)
+        if scene is None:
+            return
+        act = Action("scene", scene_id=str(scene.get("scene_id") or ""),
+                     scene=str(scene.get("name") or ""),
+                     home=self._draft.home or self._home)
+        if to_else:
+            self._add_else_action(act)
+        else:
+            self._add_action(act)
+
+    def _pick_scene_for(self, row: ActionRow) -> None:
+        """行内点场景名：重开同一个选择窗，选完就地换（id / 名字 / 家庭一起换）。"""
+        scene = ScenePicker.pick(self._scenes, self._p, self)
+        if scene is not None:
+            row.set_scene(str(scene.get("scene_id") or ""),
+                          str(scene.get("name") or ""),
+                          self._draft.home or self._home)
 
     def _sync_action_empty(self) -> None:
         box = getattr(self, "action_empty", None)
@@ -2074,7 +2328,8 @@ class AutomationDialog(QDialog):
                         self._remove_else_action, self._move_else_action,
                         on_pick_device=self._pick_device_for,
                         devices=self._devices,
-                        parent=self.else_box)
+                        parent=self.else_box,
+                        on_pick_scene=self._pick_scene_for)
         self.else_layout.addWidget(row)
         self._else_rows.append(row)
         self._renumber_else()

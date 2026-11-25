@@ -12,6 +12,7 @@
     conditions[] = {type, op, arg}        空数组 = 无条件
     actions[]    = {type:"device_action", did, device, action, args{入参名: 值}}
                  | {type:"delay", ms[, unit:"s"]}
+                 | {type:"scene", scene_id, scene, home}   ← 2026-11-25 加
     else_actions[] = 同 actions[]，**只在条件不成立时执行**；空数组不写键
 
 **设备动作**（2026-11-14 重构）：一条动作 = 一台设备 + 一个功能 + 该功能的参数。
@@ -19,6 +20,12 @@
 ``execute-text-directive`` / ``emit-virtual-event``），``args`` 按**入参名**存
 （``text-content`` / ``silent-execution`` / ``virtual-param``）。白名单与每项的
 参数元数据在 ``action_catalog``。
+
+**快捷场景动作**（2026-11-25 用户要求）：动作列表里可以再加一类「执行快捷场景」。
+它没有设备、没有 action 名，执行走 ``Client.run_scene(scene_id, home)``。
+``scene`` / ``home`` 都是快照：``scene`` 只给日志和界面回显（场景改名后仍按 id 执行），
+``home`` 固定"选它时所在的那个家"——场景 id 只在家庭内唯一，规则换家庭后不能按新家庭
+瞎猜。校验只管"选没选"（纯函数），场景被删由执行层报「场景已不存在」。
 
 **绝不存 siid/aiid**：同一份能力在型号之间方法号完全不同（``wake-up`` 在 lx06 是
 aiid 3、在 oh2p 是 1），固件升级也可能变；存名字、执行时按名字查坐标才是稳的
@@ -160,7 +167,9 @@ OPS: dict[str, str] = {
 #: 那把尺子（两种规格存的是同一个 ``ms``），所以这里不该出现 ``delay_s``。
 #: ``device_action`` 的"功能"不在这里列举——那是 ``action_catalog.FEATURES``
 #: 的白名单，加一个功能不该改这个常量。
-ACTION_TYPES = ("device_action", "delay")
+#: ``scene`` 是 2026-11-25 加的：执行米家「快捷场景」，它不是设备动作（没有 did、
+#: 没有 action），执行走 ``Client.run_scene``，所以单列一种类型。
+ACTION_TYPES = ("device_action", "scene", "delay")
 
 
 def _text(value: Any, limit: int = MAX_NAME_LEN) -> str:
@@ -284,11 +293,14 @@ class Condition:
 
 @dataclass(slots=True)
 class Action:
-    """一个动作：**对某台设备做一件事**，或者等一会。
+    """一个动作：**对某台设备做一件事**、**执行一个快捷场景**，或者等一会。
 
     * ``device_action`` —— ``did``（设备 id）+ ``device``（显示名快照，只给日志和
       界面回显；设备改名 / 移除后执行仍按 ``did`` 走）+ ``action``（spec 里的 action
       名）+ ``args``（入参名 → 值）。
+    * ``scene`` —— ``scene_id`` + ``scene``（名字快照）+ ``home``（家庭 id）。
+      场景是**云端对象**，没有设备、也没有 action 名，执行走 ``Client.run_scene``。
+      存 ``home`` 是因为场景 id 只在家庭内唯一，规则又换了家庭时得按当时那个家执行。
     * ``delay`` —— ``ms``。
 
     **不存 siid/aiid**（见模块 docstring）：执行时按 ``action`` 名字现查。
@@ -308,6 +320,10 @@ class Action:
     args: dict[str, Any] = field(default_factory=dict)
     ms: int = 0
     unit: str = "ms"
+    scene_id: str = ""
+    scene: str = ""
+    #: 场景动作归属的家庭 id。空串 = 老数据 / 手工写的文件，执行时回落到当前家庭。
+    home: str = ""
 
     @property
     def feature(self) -> action_catalog.Feature | None:
@@ -320,6 +336,13 @@ class Action:
             # 毫秒是默认刻度，不写这个键
             if self.unit == "s":
                 out["unit"] = "s"
+            return out
+        if self.type == "scene":
+            out = {"type": "scene", "scene_id": self.scene_id}
+            if self.scene:
+                out["scene"] = self.scene
+            if self.home:
+                out["home"] = self.home
             return out
         out = {
             "type": "device_action",
@@ -340,6 +363,17 @@ class Action:
         if kind == "delay":
             unit = "s" if _text(raw.get("unit"), 4) == "s" else "ms"
             return cls(kind, ms=_integer(raw.get("ms"), 0, 0, MAX_DELAY_MS), unit=unit)
+        if kind == "scene":
+            scene_id = _text(raw.get("scene_id"), 64)
+            if not scene_id:
+                # 没有场景 id 的场景动作什么也执行不了：留不住，别在界面上摆一个空行
+                return None
+            return cls(
+                type=kind,
+                scene_id=scene_id,
+                scene=_text(raw.get("scene"), 120),
+                home=_text(raw.get("home"), 64),
+            )
         if kind != "device_action":
             # 旧形状（virtual_event / speaker）与未知类型：这一条动作留不住。
             # 规则本身还在，用户重选一次即可——见模块 docstring「只认当前结构」。
@@ -490,6 +524,13 @@ def _action_errors(actions: list[Action], label: str) -> list[str]:
                 errors.append(f"{label} {i} 的延迟要在 0–{MAX_DELAY_MS} 毫秒"
                               f"（{MAX_DELAY_MS // 1000} 秒）之间")
             continue
+        if act.type == "scene":
+            # 场景动作只有"选了哪个场景"一件事可查。**不查场景还在不在**：那要读
+            # store 的缓存，而校验是纯函数；场景被删 / 换了家庭由执行层报错
+            # （日志里写"场景已不存在"），与设备动作同一口径。
+            if not act.scene_id.strip():
+                errors.append(f"{label} {i} 没选快捷场景")
+            continue
         if not act.did.strip():
             errors.append(f"{label} {i} 没选设备")
             continue
@@ -584,12 +625,14 @@ def validate_rule(rule: Rule) -> list[str]:
         errors.append("没有状态条件时「否则执行动作」永远不会触发："
                       "要么给它加一条条件，要么清空这一段")
     errors.extend(_action_errors(rule.else_actions, "否则动作"))
-    # 「至少有一条真会干事的动作」——延迟不算，它只是等。以前这条只认虚拟事件，
-    # 加了音箱指令之后一条「按键 → 让音箱说句话」的规则完全成立，所以按"是不是设备
-    # 动作"判，而不是按具体功能判。
-    if not any(a.type == "device_action" and a.did.strip() and a.action
-               for a in rule.actions):
-        errors.append("动作里至少要有一条设备动作（延迟只是等待，不算）")
+    # 「至少有一条真会干事的动作」——延迟不算，它只是等。设备动作与快捷场景都算：
+    # 一条「按键 → 执行回家场景」的规则完全成立，场景只是"由云端替我们动多台设备"。
+    if not any(
+        (a.type == "device_action" and a.did.strip() and a.action)
+        or (a.type == "scene" and a.scene_id.strip())
+        for a in rule.actions
+    ):
+        errors.append("动作里至少要有一条设备动作或快捷场景（延迟只是等待，不算）")
     if not (0 <= rule.cooldown_ms <= MAX_COOLDOWN_MS):
         errors.append("冷静期超出范围")
     return errors

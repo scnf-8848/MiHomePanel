@@ -241,6 +241,40 @@ class AutomationService(QObject):
         want = self.current_home if home is None else home
         return action_catalog.collect(getattr(self.store, "devices", {}).values(), want)
 
+    def scene_options(self, home: str | None = None) -> list[dict[str, Any]]:
+        """某个家庭里的快捷场景（给「＋ 选择快捷场景」用）。默认 = 当前家庭。
+
+        **连隐藏的场景一起返回**：隐藏只是首页那排胶囊不画它（2026-11-24 定的口径），
+        场景本身还在。动作指向一个"首页看不见"的场景完全合法——用户可能正是为了
+        不让它占首页才藏起来，却仍要能被热键唤起。隐藏 / 停用由界面标注，这里不筛。
+
+        ``store`` 没有这个方法 / 场景还没加载时返回空表：编辑窗不能因为取不到场景
+        就打不开（离线验证的假 store 也没有）。
+        """
+        want = self.current_home if home is None else home
+        getter = getattr(self.store, "scenes_for", None)
+        if not callable(getter):
+            return []
+        try:
+            scenes = list(getter(want, include_hidden=True))
+        except Exception:  # noqa: BLE001
+            return []
+        out: list[dict[str, Any]] = []
+        prefs = getattr(self.store, "prefs", None)
+        is_hidden = getattr(prefs, "is_scene_hidden", None)
+        for scene in scenes:
+            sid = str(scene.get("scene_id") or "").strip()
+            name = str(scene.get("name") or "").strip()
+            if not sid or not name:
+                continue
+            out.append({
+                "scene_id": sid,
+                "name": name,
+                "enabled": bool(scene.get("enable", True)),
+                "hidden": bool(is_hidden(sid)) if callable(is_hidden) else False,
+            })
+        return out
+
     def status_for(self, keys: str) -> str:
         return self.registry.status(keys)
 
@@ -445,13 +479,62 @@ class AutomationService(QObject):
         return None
 
     def _run(self, act: Action, done: Callable[[str], None]) -> None:
-        """执行一条设备动作：找设备 → 按名字查坐标 → 按入参名拼 ``in`` → 交给收发器。
+        """执行一条动作：设备动作走 ``_run_device``，快捷场景走 ``_run_scene``。
 
         ``done`` 只收一句中文原因，**空串 = 成功**。但注意引擎已经不用它推进队列了
         （见 ``engine._step``）：这里发出去就返回，回执之后 ``done`` 才会被调一次
         （失败时）。
+        """
+        if act.type == "scene":
+            self._run_scene(act, done)
+            return
+        self._run_device(act, done)
 
-        判据仍然全在这里做，而且都在**发送之前**：找不到设备 / 没这个功能 / 离线 /
+    def _run_scene(self, act: Action, done: Callable[[str], None]) -> None:
+        """执行一个快捷场景。
+
+        **不在发送前核对"场景还在不在"**：那要读 store 的场景缓存，而场景可能刚被
+        别的端改过。云端那边场景 id 不存在时会回失败，按同一套 ``done`` 报出去，
+        日志里写明原因——与设备动作"设备移除后才报错"同一口径。
+
+        ``act.home`` 记的是"当初选这个场景时所在的家"。场景 id 只在家庭内唯一，
+        规则换过家庭后不能拿新家庭去猜；老数据没有这个字段才回落到当前家庭。
+        """
+        sid = str(act.scene_id or "").strip()
+        if not sid:
+            done("没有选快捷场景")
+            return
+        if self.worker is None:
+            done("没有配置执行通道（serial 模式需要显式传 worker）")
+            return
+        home = str(act.home or "") or self.current_home
+
+        def finished(result: Any, error: BaseException | None) -> None:
+            if error is not None:
+                done(f"后台任务失败：{error}")
+                return
+            if result is False:
+                # ``Client.run_scene`` 失败固定返回 False，原因在 ``last_error``
+                detail = getattr(self.client, "last_error", "") or ""
+                done(detail or "云端没有执行这个场景")
+                return
+            # 场景改到哪几台说不准：让界面那串全量读跑起来，卡片才跟着变
+            confirm = getattr(self.store, "schedule_confirm", None)
+            if callable(confirm):
+                confirm()
+            done("")
+
+        self.worker.submit(
+            lambda: self.client.run_scene(sid, home),
+            callback=finished,
+            priority=PRIORITY_CONTROL,
+            label="场景",
+        )
+
+    def _run_device(self, act: Action, done: Callable[[str], None]) -> None:
+        """执行一条设备动作：找设备 → 按名字查坐标 → 按入参名拼 ``in`` → 交给收发器。
+
+        判据全在这里做，而且都在**发送之前**：找不到设备 / 没这个功能 / 离线 /
         参数不合法，这些 ``done(reason)`` 是同步调的——引擎据此知道"这一步一个字都
         没发出去"，日志文案也据此区分"没发出去"和"回执报错"。
         """

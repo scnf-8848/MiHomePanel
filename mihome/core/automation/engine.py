@@ -3,11 +3,11 @@
 
 **不 import Qt、不 import ctypes、不碰网络。** 两个出口由外部注入：
 
-* ``run(action, done)`` —— 执行一条**设备动作**（对某台设备做一件事）。**提交即返回**，
+* ``run(action, done)`` —— 执行一条**动作**（设备动作 / 快捷场景）。**提交即返回**，
   队列不等回执（理由见 ``_step``）；``done(error)`` 只在**失败**时调一次——发送前被
   判据挡下是同步调，回执报错是稍后调。**解析设备、查 action 坐标、清洗参数、
-  拼入参全在调用方**（``core/automation/action_catalog.py`` + ``AutomationService._run``），
-  引擎不认设备、不认型号、也不认功能名。
+  拼入参、找场景归属全在调用方**（``core/automation/action_catalog.py`` +
+  ``AutomationService._run``），引擎不认设备、不认型号、也不认功能名。
 * ``call_later(ms, fn)`` —— 延迟动作；生产里必须接到**成员 QTimer**，不能在 UI 线程
   ``time.sleep()``。默认实现是同步立即执行，仅供离线验证兜底。
 
@@ -288,6 +288,28 @@ class AutomationEngine:
                           else f"延迟 {act.ms} ms", run=run)
             self.call_later(act.ms, lambda: self._step(rule, actions, index + 1,
                                                       branch=branch, run=run))
+            return
+        if act.type == "scene":
+            # 快捷场景：云端替我们动多台设备。和延迟一样"提交即下一步"——场景是
+            # 异步执行的，等它跑完再走下一步没有意义（米家自己的自动化也不等）。
+            label = act.scene or act.scene_id
+            sent = False
+
+            def scene_done(error: str) -> None:
+                if self._closed or not error:
+                    return
+                where = "回执报错" if sent else "没发出去"
+                self._add_log(rule, FAILED,
+                              f"快捷场景「{label}」未执行：{error}（{where}）", run=run)
+
+            try:
+                self.run(act, scene_done)
+                sent = True
+            except Exception as exc:  # noqa: BLE001  通道抛异常也只记日志，不拦后续
+                scene_done(f"{exc}")
+            if sent:
+                self._add_log(rule, SENT, f"执行快捷场景 → 「{label}」", run=run)
+            self._step(rule, actions, index + 1, branch=branch, run=run)
             return
         feat = act.feature
         if act.type != "device_action" or feat is None:

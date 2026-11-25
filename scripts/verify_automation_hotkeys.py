@@ -559,6 +559,9 @@ class SerialClient:
         self.code = code
         self.boom = boom
         self.calls: list[tuple] = []
+        #: ``run_scene`` 的返回：False = 云端拒绝（原因进 ``last_error``）
+        self.scene_ok = True
+        self.scene_calls: list[tuple] = []
         self.last_error = ""
 
     def raw(self):
@@ -570,6 +573,14 @@ class SerialClient:
             self.last_error = f"动作异常: {self.boom}"
             return -1
         return self.code
+
+    def run_scene(self, scene_id, home_id):  # noqa: N802
+        """真 ``Client.run_scene``：成功 True、失败 False（**不是**错误码）。"""
+        self.scene_calls.append((scene_id, home_id))
+        if self.boom is not None:
+            self.last_error = f"场景异常: {self.boom}"
+            return False
+        return self.scene_ok
 
 
 serial_client = SerialClient()
@@ -653,6 +664,46 @@ worker.jobs[-1]["cb"](-704220025, None)
 check("云端的负数码仍走 explain，不抢 last_error",
       done and "-704220025" in done[0] and "上次残留" not in done[0], str(done))
 
+# 快捷场景（2026-11-25）：同一条串行队列，但调的是 ``Client.run_scene``。
+# 它不是设备动作（没有 did / aiid），判据也不能照抄 run_action 那套——后者失败返回 -1，
+# 前者失败返回 False，写成 ``code < 0`` 会把 False 当成功放过去。
+print("\n--- 快捷场景：进 worker、调 run_scene、成功后全量回读 ---", flush=True)
+done.clear()
+worker.jobs.clear()
+confirmed.clear()
+serial.client = SerialClient()
+serial._run(Action("scene", scene_id="s9", scene="示例-回家", home="1001"), done.append)
+check("场景也丢进共享 worker（一条）", len(worker.jobs) == 1, str(len(worker.jobs)))
+check("场景任务标签是「场景」", worker.jobs[-1]["label"] == "场景",
+      worker.jobs[-1]["label"])
+check("场景用 CONTROL 优先级", worker.jobs[-1]["priority"] == PRIORITY_CONTROL,
+      str(worker.jobs[-1]["priority"]))
+check("提交完不等结果", done == [], str(done))
+ret = worker.jobs[-1]["fn"]()
+check("调的是 run_scene，家庭用动作里存的那个",
+      serial.client.scene_calls == [("s9", "1001")], str(serial.client.scene_calls))
+check("返回值是 True/False，不是错误码", ret is True, repr(ret))
+worker.jobs[-1]["cb"](ret, None)
+check("场景成功后安排全量回读（改了哪几台说不准）", confirmed == [1], str(confirmed))
+check("场景成功 done 是空串", done == [""], str(done))
+
+done.clear()
+worker.jobs.clear()
+rejecting = SerialClient()
+rejecting.scene_ok = False
+rejecting.last_error = "场景已不存在"
+serial.client = rejecting
+serial._run(Action("scene", scene_id="s9"), done.append)
+worker.jobs[-1]["cb"](False, None)
+check("run_scene 返回 False 当失败（别当成功放过去）",
+      done and "场景已不存在" in done[0], str(done))
+
+done.clear()
+worker.jobs.clear()
+serial._run(Action("scene"), done.append)
+check("没选场景时同步报错、一条都不入队",
+      done == ["没有选快捷场景"] and not worker.jobs, f"{done} / {len(worker.jobs)}")
+
 done.clear()
 worker.jobs.clear()
 serial.client = SerialClient()
@@ -660,6 +711,10 @@ serial.worker = None
 serial._run(act, done.append)
 check("没注入 worker 时明确报，不静默", done and "没有配置执行通道" in done[0], str(done))
 check("没 worker 就不入队", not worker.jobs)
+done.clear()
+serial._run(Action("scene", scene_id="s9"), done.append)
+check("场景同样要 worker（不静默跳过）",
+      done and "没有配置执行通道" in done[0], str(done))
 serial.close()
 
 print("\n--- 日志落盘：服务重启后还能翻回上次那一串 ---", flush=True)

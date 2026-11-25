@@ -95,6 +95,15 @@ def sample_devices() -> list[AC.ActionDevice]:
     ]
 
 
+def sample_scenes() -> list[dict]:
+    """三条快捷场景：普通 / 已隐藏 / 已停用（三种标注都要能看到）。"""
+    return [
+        {"scene_id": "s1", "name": "示例-回家", "enabled": True, "hidden": False},
+        {"scene_id": "s2", "name": "示例-睡觉", "enabled": True, "hidden": True},
+        {"scene_id": "s3", "name": "示例-离家", "enabled": False, "hidden": False},
+    ]
+
+
 class FakeService(QObject):
     log_added = Signal(object)
     log_cleared = Signal()
@@ -113,6 +122,8 @@ class FakeService(QObject):
         self.current_home = home
         # 当前家庭里能执行动作的设备（选择窗的候选）。专门用例里换成空列表
         self.devices = sample_devices()
+        #: 当前家庭的快捷场景（「＋ 选择快捷场景」的候选），含隐藏 / 停用
+        self.scenes = sample_scenes()
         # 注册状态：默认"已注册"，专门用例里改成"未注册"检查颜色
         self.registered = True
         # 编辑页打开期间被临时退掉热键的规则 id（真服务上的 ``_editing``）
@@ -156,6 +167,9 @@ class FakeService(QObject):
 
     def action_devices(self, home: str | None = None) -> list[AC.ActionDevice]:
         return list(self.devices)
+
+    def scene_options(self, home: str | None = None) -> list[dict]:
+        return list(self.scenes)
 
     def sync(self) -> None:
         self.syncs += 1
@@ -1169,18 +1183,23 @@ check("新建规则默认没有动作行（点了按钮才加）", len(dlg._acti
 check("③ 空态提示指向那两枚按钮",
       not dlg.action_empty.isHidden() and dlg.action_empty.text() == A.ACTION_HINT_EMPTY,
       dlg.action_empty.text())
-check("③ 两枚入口：＋ 选择设备 / ＋ 延迟",
+check("③ 三枚入口：选择设备 / 选择快捷场景 / 延迟",
       dlg.add_action_btn.text() == "＋ 选择设备"
+      and dlg.add_scene_btn.text() == "＋ 选择快捷场景"
       and dlg.add_delay_btn.text() == "＋ 延迟",
-      f"{dlg.add_action_btn.text()} / {dlg.add_delay_btn.text()}")
-check("④ 两枚入口文案与 ③ 一致（共用同一款 ActionRow）",
+      f"{dlg.add_action_btn.text()} / {dlg.add_scene_btn.text()} / {dlg.add_delay_btn.text()}")
+check("④ 三枚入口文案与 ③ 一致（共用同一款 ActionRow）",
       dlg.add_else_btn.text() == "＋ 选择设备"
+      and dlg.add_else_scene_btn.text() == "＋ 选择快捷场景"
       and dlg.add_else_delay_btn.text() == "＋ 延迟",
-      f"{dlg.add_else_btn.text()} / {dlg.add_else_delay_btn.text()}")
-check("两枚按钮的 tooltip 说清各自加什么",
+      f"{dlg.add_else_btn.text()} / {dlg.add_else_scene_btn.text()} / "
+      f"{dlg.add_else_delay_btn.text()}")
+check("三枚按钮的 tooltip 说清各自加什么",
       "中枢网关" in dlg.add_action_btn.toolTip()
+      and "快捷场景" in dlg.add_scene_btn.toolTip()
       and "等一段" in dlg.add_delay_btn.toolTip(),
-      f"{dlg.add_action_btn.toolTip()} / {dlg.add_delay_btn.toolTip()}")
+      f"{dlg.add_action_btn.toolTip()} / {dlg.add_scene_btn.toolTip()} / "
+      f"{dlg.add_delay_btn.toolTip()}")
 check("默认没有条件", len(dlg._cond_rows) == 0 and not dlg.cond_empty_box.isHidden())
 check("0 条条件时空态块的按钮上方分隔线让位（不叠线）",
       dlg.cond_btns_divider.isHidden())
@@ -1674,6 +1693,90 @@ check("没有设备时列表收起、给空态文案",
       and empty_picker.empty.text() == "当前家庭没有可执行动作的设备。",
       empty_picker.empty.text())
 empty_picker.close()
+
+print("\n--- 编辑窗：快捷场景动作（11-25 新入口） ---", flush=True)
+dlg2 = A.AutomationDialog(service2, theme.LIGHT)
+check("编辑窗拿到了当前家庭的场景清单", len(dlg2._scenes) == 3, str(len(dlg2._scenes)))
+_orig_scene_pick = A.ScenePicker.pick
+try:
+    A.ScenePicker.pick = staticmethod(lambda *a, **k: sample_scenes()[0])
+    dlg2._pick_scene_and_add()
+    check("选中场景后直接加出一行", len(dlg2._action_rows) == 1)
+    srow = dlg2._action_rows[0]
+    check("场景行：左边是场景名", srow.device_btn.text() == "示例-回家",
+          srow.device_btn.text())
+    check("场景行：右边是固定说明（不是可改的功能下拉）",
+          not srow.scene_kind.isHidden() and srow.kind.isHidden(),
+          f"{srow.scene_kind.isHidden()} / {srow.kind.isHidden()}")
+    check("场景行没有输入框与单位下拉",
+          srow.value_edit.isHidden() and srow.unit.isHidden() and srow.silent.isHidden())
+    acted = srow.value()
+    check("读回是 scene 动作（不是伪装成设备动作）",
+          (acted.type, acted.scene_id, acted.scene, acted.home)
+          == ("scene", "s1", "示例-回家", "1001"), str(acted))
+    check("场景动作不带 did / action / args",
+          (acted.did, acted.action, acted.args) == ("", "", {}), str(acted))
+    A.ScenePicker.pick = staticmethod(lambda *a, **k: None)
+    dlg2._pick_scene_and_add()
+    check("取消选择就什么都不加", len(dlg2._action_rows) == 1)
+
+    A.ScenePicker.pick = staticmethod(lambda *a, **k: sample_scenes()[1])
+    dlg2._pick_scene_for(srow)
+    check("行内点场景名可以重选（名字 / id / 家庭一起换）",
+          (srow.device_btn.text(), srow.value().scene_id) == ("示例-睡觉", "s2"),
+          f"{srow.device_btn.text()} / {srow.value().scene_id}")
+
+    dlg2._add_condition(Condition("idle_minutes", "ge", "10"))
+    A.ScenePicker.pick = staticmethod(lambda *a, **k: sample_scenes()[2])
+    dlg2._pick_scene_and_add(to_else=True)
+    check("④ 加进否则队列而不是 ③",
+          len(dlg2._else_rows) == 1 and len(dlg2._action_rows) == 1)
+    check("④ 的场景行也读回 scene",
+          dlg2._else_rows[0].value().scene_id == "s3", str(dlg2._else_rows[0].value()))
+finally:
+    A.ScenePicker.pick = _orig_scene_pick
+
+# 空场景行：刚加出来不亮红，点保存才说缺什么（与其他行同一套做法）
+blank = A.ActionRow(Action("scene"), theme.LIGHT, lambda: None,
+                    lambda w: None, lambda w, d: None)
+check("空场景行默认不亮红字", blank.hint.isHidden())
+blank.reveal_missing()
+check("点保存才说「要先选快捷场景」",
+      blank.hint.text() == "要先选快捷场景", blank.hint.text())
+check("空场景行出错时焦点给场景按钮", blank.focus_widget() is blank.device_btn)
+blank.deleteLater()
+
+# 场景选择窗本体
+scene_picker = A.ScenePicker(sample_scenes(), theme.LIGHT)
+check("每个场景一行", scene_picker.list.count() == 3)
+check("普通场景没有后缀", scene_picker.list.item(0).text() == "示例-回家",
+      scene_picker.list.item(0).text())
+check("隐藏的场景标出来（但仍可选）",
+      scene_picker.list.item(1).text() == "示例-睡觉　　已隐藏"
+      and bool(scene_picker.list.item(1).flags() & Qt.ItemIsSelectable),
+      scene_picker.list.item(1).text())
+check("停用的场景标出来（也仍可选，执行时才报）",
+      scene_picker.list.item(2).text() == "示例-离家　　已停用"
+      and bool(scene_picker.list.item(2).flags() & Qt.ItemIsSelectable),
+      scene_picker.list.item(2).text())
+scene_picker.search.setText("睡觉")
+check("按名字搜得到", not scene_picker.list.item(1).isHidden()
+      and scene_picker.list.item(0).isHidden())
+scene_picker.search.setText("不存在")
+check("搜不到时给空态文案", not scene_picker.empty.isHidden()
+      and scene_picker.empty.text() == "没有匹配的场景。", scene_picker.empty.text())
+scene_picker.search.clear()
+scene_picker._on_item(scene_picker.list.item(1))
+check("点一下即选中", scene_picker.chosen() is not None
+      and scene_picker.chosen()["scene_id"] == "s2", str(scene_picker.chosen()))
+scene_picker.close()
+empty_scene_picker = A.ScenePicker([], theme.LIGHT)
+check("没有场景时列表收起、给空态文案",
+      empty_scene_picker.list.isHidden() and not empty_scene_picker.empty.isHidden()
+      and empty_scene_picker.empty.text() == "当前家庭还没有快捷场景。",
+      empty_scene_picker.empty.text())
+empty_scene_picker.close()
+dlg2.close()
 
 print("\n--- 编辑窗：校验 / 保存即关闭 ---", flush=True)
 dlg.name_edit.setText("测试播报")

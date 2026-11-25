@@ -321,8 +321,8 @@ check("延迟越界提示写明两个刻度",
 # 一条动作 = **设备 + 功能 + 该功能的参数**（11-14 重构）。**绝不存 siid/aiid**：
 # 同一能力跨型号方法号完全不同（wake-up 在 lx06 是 aiid 3、在 oh2p 是 1），
 # 执行时按 action 名字现查（core/miot_action.py）。
-check("动作类型只有两档（device_action / delay）",
-      ACTION_TYPES == ("device_action", "delay"), str(ACTION_TYPES))
+check("动作类型三档（device_action / scene / delay）",
+      ACTION_TYPES == ("device_action", "scene", "delay"), str(ACTION_TYPES))
 evt_dict = evt("事件A").to_dict()
 check("设备动作落盘 = did/device/action/args",
       evt_dict == {"type": "device_action", "did": "hub1", "device": "客厅中枢",
@@ -346,6 +346,34 @@ check("旧 virtual_event 动作读不回来",
 check("旧 speaker 动作读不回来",
       Action.from_dict({"type": "speaker", "did": "d", "text": "x"}) is None)
 check("认不出的类型也读不回来", Action.from_dict({"type": "play-music"}) is None)
+
+# 快捷场景动作（2026-11-25 用户要求）：**不是设备动作**——没有 did、没有 action 名，
+# 执行走 `Client.run_scene`。存家庭 id 是因为场景 id 只在家庭内唯一。
+scene_act = Action("scene", scene_id="s1", scene="示例-回家", home="h1")
+check("场景动作落盘 = scene_id/scene/home",
+      scene_act.to_dict() == {"type": "scene", "scene_id": "s1",
+                              "scene": "示例-回家", "home": "h1"},
+      str(scene_act.to_dict()))
+check("场景名是空的就不写那个键（保持文件干净）",
+      "scene" not in Action("scene", scene_id="s1").to_dict(),
+      str(Action("scene", scene_id="s1").to_dict()))
+scene_back = Action.from_dict(scene_act.to_dict())
+check("场景动作能原样读回",
+      (scene_back.type, scene_back.scene_id, scene_back.scene, scene_back.home)
+      == ("scene", "s1", "示例-回家", "h1"),
+      str(scene_back))
+check("没有 scene_id 的场景动作读不回来（什么也执行不了）",
+      Action.from_dict({"type": "scene", "scene": "示例-回家"}) is None)
+check("克隆规则不丢场景动作（编辑页开一次保存一次不会蒸发）",
+      [a.to_dict() for a in base_rule(actions=[scene_act]).clone().actions]
+      == [scene_act.to_dict()])
+check("只有一条场景动作就能过校验",
+      validate_rule(base_rule(actions=[scene_act])) == [],
+      str(validate_rule(base_rule(actions=[scene_act]))))
+check("场景没选被抓", any("没选快捷场景" in e for e in validate_rule(base_rule(
+    actions=[Action("scene")]))))
+check("场景动作 + 延迟也合法",
+      validate_rule(base_rule(actions=[scene_act, Action("delay", ms=1000)])) == [])
 check("没选设备被抓", any("没选设备" in e for e in validate_rule(base_rule(actions=[
     Action("device_action", did="", action="wake-up")]))))
 check("功能未知被抓", any("功能未知" in e for e in validate_rule(base_rule(actions=[
@@ -360,9 +388,9 @@ check("事件名不走音箱的字符白名单（下划线括号能存）",
       str(validate_rule(base_rule(actions=[evt("my_event(1)")]))))
 check("只有一条设备动作也能过校验（按键 → 让音箱说句话是完整规则）",
       validate_rule(base_rule(actions=[speak("我回来了")])) == [])
-check("只有延迟仍然过不了（得有一条真会干事的）",
-      any("至少要有一条设备动作" in e for e in validate_rule(base_rule(actions=[
-          Action("delay", ms=1000)]))),
+check("只有延迟仍然过不了（得有一条真会干事的：设备动作或场景）",
+      any("至少要有一条设备动作或快捷场景" in e
+          for e in validate_rule(base_rule(actions=[Action("delay", ms=1000)]))),
       str(validate_rule(base_rule(actions=[Action("delay", ms=1000)]))))
 check("发虚拟事件 + 延迟照旧合法",
       validate_rule(base_rule(actions=[evt("A"), Action("delay", ms=1000)])) == [])
@@ -769,6 +797,45 @@ engine_e.trigger("Ctrl+Alt+F7")
 check("空类型动作也当未知处理",
       any(x.outcome == FAILED and "未知动作「-」" in x.detail for x in engine_e.log),
       str([x.detail for x in engine_e.log]))
+
+# 快捷场景（2026-11-25）：引擎不认场景，只把它交给 run；日志写场景名，失败不停队列
+section("执行快捷场景：交给通道、日志有名字、失败不停队列")
+
+
+class SceneRunner:
+    """记录每条动作的类型；``fail=True`` 时同步报错（模拟"没发出去"）。"""
+
+    def __init__(self, fail: bool = False) -> None:
+        self.types: list[str] = []
+        self.fail = fail
+
+    def __call__(self, act: Action, done) -> None:
+        self.types.append(act.type)
+        done("云端没有执行这个场景" if self.fail else "")
+
+
+sr = SceneRunner()
+eng_s, _, _, _ = make_engine(base_rule(actions=[scene_act, evt("后续")]), runner=sr)
+eng_s.trigger("Ctrl+Alt+F7")
+check("场景动作原样交给执行通道（不是设备动作）",
+      sr.types == ["scene", "device_action"], str(sr.types))
+check("日志写「执行快捷场景 → 场景名」",
+      any(x.outcome == SENT and "执行快捷场景" in x.detail and "示例-回家" in x.detail
+          for x in eng_s.log), str([x.detail for x in eng_s.log]))
+check("场景动作不写参数摘要（它没有入参）",
+      not any("（）" in x.detail for x in eng_s.log))
+
+sr_fail = SceneRunner(fail=True)
+eng_sf, _, _, _ = make_engine(base_rule(actions=[scene_act, evt("后续")]),
+                              runner=sr_fail)
+eng_sf.trigger("Ctrl+Alt+F7")
+check("场景失败写 FAILED 并说明原因",
+      any(x.outcome == FAILED and "快捷场景" in x.detail
+          and "云端没有执行这个场景" in x.detail for x in eng_sf.log),
+      str([x.detail for x in eng_sf.log]))
+check("场景失败不拦后续动作（后续照样提交）",
+      sr_fail.types == ["scene", "device_action"], str(sr_fail.types))
+check("场景失败也走完了整串", any(x.outcome == DONE for x in eng_sf.log))
 
 # 日志
 engine7, _, _, _ = make_engine(base_rule())
