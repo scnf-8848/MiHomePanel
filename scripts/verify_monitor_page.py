@@ -134,8 +134,10 @@ def main() -> int:
                    str([line.count(0) for line in cover]))
     check("1+5 的主窗是左上 2×2（参考项目的画法）",
           LAYOUT_SPECS["1+5"].cells[0], (0, 0, 2, 2))
-    check("1+2 的主窗宽是小窗的 2 倍（靠 col_stretch，跨列改不了列宽）",
-          LAYOUT_SPECS["1+2"].col_stretch, (2, 1))
+    check("1+2 的主窗在上行、跨两列（2026-11-25 从「左一大」改成「上大下二」）",
+          LAYOUT_SPECS["1+2"].cells[0], (0, 0, 1, 2))
+    check("1+2 上行高是小行的 2 倍（row_stretch=(2, 1)）",
+          LAYOUT_SPECS["1+2"].row_stretch, (2, 1))
 
     print("\n2) 落盘：布局与格子")
     check("偏好版本升到 20", PREFS_VERSION, 20)
@@ -219,21 +221,34 @@ def main() -> int:
            page._cells[1].x() > main.x(),
            page._cells[4].y() > main.y()),
           (True, True, True))
-    # 一大两小：主窗占左列两行、宽度是小窗的 2 倍（col_stretch=(2, 1)）
+    # 一大两小：主窗在上行跨两列、高是小窗的 2 倍（row_stretch=(2, 1)，2026-11-25 改）
     page.cb_layout.setCurrentIndex(page.cb_layout.findData("1+2"))
     app.processEvents()
     page.resize(920, 560)
     app.processEvents()
     page._grid.activate()
     main, small = page._cells[0], page._cells[1]
-    check("一大两小：主窗宽约为小窗的 2 倍",
-          abs(main.width() / max(1, small.width()) - 2) <= 0.15, True)
-    check("一大两小：主窗占左列两行（高也是小窗的 2 倍）",
+    check("一大两小：主窗宽 = 整块画面区（跨两列）", main.width(), page._grid_host.width())
+    check("一大两小：主窗高约为小窗的 2 倍",
           abs(main.height() / max(1, small.height()) - 2) <= 0.15, True)
-    check("一大两小：两个小窗等高、上下叠在右侧",
-          (abs(page._cells[1].height() - page._cells[2].height()) <= 2,
-           page._cells[2].y() > page._cells[1].y(),
-           page._cells[1].x() > main.x()), (True, True, True))
+    check("一大两小：两个小窗等宽、左右并排在下行",
+          (abs(page._cells[1].width() - page._cells[2].width()) <= 2,
+           page._cells[2].x() > page._cells[1].x(),
+           page._cells[1].y() > main.y()), (True, True, True))
+    # 改排布的理由就是"有效画面面积"：16:9 画面在格子里的填充率，三格应当一致
+    # （2:1 行高的意义就在这——主窗和小窗留一样的黑边）。旧的左一大方案里三个
+    # 格子都是 0.87 的竖条，填充率只有 51%。
+    def fill(cell) -> float:
+        w, h = cell.width(), cell.height()
+        if w <= 0 or h <= 0:
+            return 0.0
+        ar = 16 / 9
+        return (h * ar / w) if w / h >= ar else (w / (h * ar))
+
+    fills = [fill(c) for c in page._cells]
+    check("一大两小：三格的 16:9 填充率一致（留边比例相同）",
+          max(fills) - min(fills) < 0.02, True)
+    check("…而且都明显高于旧方案的 51%", min(fills) > 0.75, True)
     page.cb_layout.setCurrentIndex(page.cb_layout.findData("1x1"))
     app.processEvents()
     page.cb_layout.setCurrentIndex(page.cb_layout.findData("2x2"))
