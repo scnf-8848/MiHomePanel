@@ -2381,7 +2381,10 @@ class AutomationDialog(QDialog):
         if btn is None:  # 兜住 _clear_rows 早于 _build_editor 的调用顺序
             return
         has_cond = bool(self._cond_rows)
-        for button in (btn, getattr(self, "add_else_delay_btn", None)):
+        # 按属性名枚举而不是写死按钮元组：④ 再加入口时只改这一行，
+        # 免得像 11-25 那样漏掉新按钮（「＋ 选择快捷场景」当初就没被灰掉）。
+        for name in ("add_else_btn", "add_else_scene_btn", "add_else_delay_btn"):
+            button = getattr(self, name, None)
             if button is None:
                 continue
             button.setEnabled(has_cond)

@@ -2622,16 +2622,26 @@ edlg = A.AutomationDialog(esvc, theme.LIGHT)
 edlg.resize(860, 900)
 edlg.show()
 app.processEvents()
-check("② 没条件时 ④ 的两枚按钮都是灰的",
-      not edlg.add_else_btn.isEnabled() and not edlg.add_else_delay_btn.isEnabled())
+check("② 没条件时 ④ 的三枚按钮都是灰的（设备 / 场景 / 延迟）",
+      not edlg.add_else_btn.isEnabled()
+      and not edlg.add_else_scene_btn.isEnabled()
+      and not edlg.add_else_delay_btn.isEnabled(),
+      f"{edlg.add_else_btn.isEnabled()} / "
+      f"{edlg.add_else_scene_btn.isEnabled()} / "
+      f"{edlg.add_else_delay_btn.isEnabled()}")
 check("灰着时 tooltip 说明原因",
       "永远不会触发" in edlg.add_else_btn.toolTip(), edlg.add_else_btn.toolTip())
+check("场景按钮灰着时同样解释原因",
+      "永远不会触发" in edlg.add_else_scene_btn.toolTip(),
+      edlg.add_else_scene_btn.toolTip())
 check("④ 空态先说「先加条件」", "先加一条状态条件" in edlg.else_hint.text(),
       edlg.else_hint.text())
 
 edlg._add_condition(Condition(type="idle_minutes", op="ge", arg="10"))
-check("加一条条件后两枚按钮都恢复可用",
-      edlg.add_else_btn.isEnabled() and edlg.add_else_delay_btn.isEnabled())
+check("加一条条件后三枚按钮都恢复可用",
+      edlg.add_else_btn.isEnabled()
+      and edlg.add_else_scene_btn.isEnabled()
+      and edlg.add_else_delay_btn.isEnabled())
 check("空态改成「可以留空」", "可以留空" in edlg.else_hint.text(),
       edlg.else_hint.text())
 
@@ -2694,8 +2704,9 @@ check("④ 上移不影响 ③ 的顺序",
 # 删光 ② 的条件：④ 的动作**留着**，但按钮变灰、保存被拦
 edlg2._remove_condition(edlg2._cond_rows[0])
 check("删光条件后 ④ 的动作不清空", len(edlg2._else_rows) == 2)
-check("删光条件后 ④ 的两枚按钮变灰",
+check("删光条件后 ④ 的三枚按钮变灰",
       not edlg2.add_else_btn.isEnabled()
+      and not edlg2.add_else_scene_btn.isEnabled()
       and not edlg2.add_else_delay_btn.isEnabled())
 check("删光条件后不能保存", edlg2._save(quiet=True) is False)
 check("错误条说清两条出路",
