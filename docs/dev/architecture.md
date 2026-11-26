@@ -494,7 +494,7 @@ scripts/
   verify_card_layout.py 设备卡片排版几何断言：标题让位 / 电源位置 / 内容带起点 / 多键按键边界
   verify_locale.py   请求 locale 必须是合法串（zh_CN），否则设备名回退英文
   verify_power_glyph.py 卡片电源符号 ⏻ 的像素级验证（缺口宽度、圆环比例）
-  verify_scenes.py   场景隐藏 + 圆角右键菜单 + 场景条单独刷新 / 拉失败兜底 / 空表防抖（48 项）
+  verify_scenes.py   场景隐藏 + 圆角右键菜单 + 场景条单独刷新（含胶囊 isVisible）/ 拉失败兜底 / 空表防抖（52 项）
   verify_scene_shortcut.py 场景桌面快捷方式：文件名清洗 / 参数拼装（源码与打包）/ `.lnk` 真往返 / 重名同场景覆盖而异场景另起 / 待执行队列（升序、超龄丢弃、坏文件丢弃、上限 5、`.tmp` 不取）/ 命令行合法性 / 真广播交接（子进程占令牌收消息）/ 结果四档反馈 / 接线（62 项）
   verify_theme.py    视觉 token：圆角 / 字号 / 强调色 / 开关尺寸 / 状态胶囊
   verify_tooltip.py  自绘悬停提示：节奏、控件间互不影响、圆角浮层

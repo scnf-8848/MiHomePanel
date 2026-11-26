@@ -146,6 +146,13 @@ class SceneBar(QWidget):
             pill.setParent(self)
             pill.clicked.connect(self.scene_run)
             pill.menu_requested.connect(self.scene_menu)
+            # **必须显式 show()**：父控件已经可见时新建的子控件默认是隐藏的
+            # （`isHidden()` 为真，父的 setVisible 不会再把它带出来）。
+            # 首次建墙时条还没显示，子控件跟着父一起出现，所以那里看不出问题；
+            # 而 `refresh_scenes()` 是在条可见时换胶囊的——漏了这句就只有标题和
+            # 占位高度、一个按钮都不画（2026-11-27 用户实测：App 里增删场景后
+            # 刷新即如此，切一次家庭整墙重建就正常）。
+            pill.show()
             self._pills.append(pill)
         if scenes and not self._pills:
             # 拿到了数据却一条都没画出来，界面只是"空着"，没有任何痕迹——

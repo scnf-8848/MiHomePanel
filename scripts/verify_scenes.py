@@ -108,6 +108,18 @@ def checks_refresh(app: QApplication) -> None:
     check("改名跟上了", "回家（改）" in names, str(names))
     check("新增跟上了", names == ["回家（改）", "离家", "关灯", "看电影"], str(names))
 
+    # 2026-11-27 的真事故：条已经可见时新建的胶囊**默认是隐藏的**（Qt 规定
+    # setParent() 之后必须 show()），于是只有标题和占位高度、一个按钮都不画；
+    # 首次建墙看不出来——那时条还没显示，子控件跟着父一起出现。切一次家庭
+    # 会整墙重建，所以"切家庭再切回来就好了"。
+    pills = wall.scene_bar._pills  # noqa: SLF001
+    check("刷新后每个胶囊都真的在显示（父已可见时新建子控件不会自动 show）",
+          bool(pills) and all(p.isVisible() and not p.isHidden() for p in pills),
+          str([(p.name, p.isVisible(), p.isHidden()) for p in pills]))
+    check("刷新后胶囊有正常尺寸（不是 0×0）",
+          all(p.height() > 0 and p.width() >= 100 for p in pills),
+          str([(p.width(), p.height()) for p in pills]))
+
     # 停用的场景不进条：手机里停用等于"不显示"，与 build() 的口径一致
     fresh[1] = dict(fresh[1], enable=False)
     wall.refresh_scenes(fresh)
@@ -128,6 +140,8 @@ def checks_refresh(app: QApplication) -> None:
     check("恢复后条重新可见", wall.scene_bar.isVisible())
     check("还是同一个条", wall.scene_bar is same_bar)
     check("胶囊回来了", len(wall.scene_bar._pills) == 1)  # noqa: SLF001
+    check("恢复后胶囊也真的在显示",
+          all(p.isVisible() and not p.isHidden() for p in wall.scene_bar._pills))  # noqa: SLF001
     wall.close()
 
     # 原本一个场景都没有的墙（条根本没建）：新场景到了要插在第 0 位
@@ -148,6 +162,9 @@ def checks_refresh(app: QApplication) -> None:
     check("补建时插在布局第 0 位（场景条在墙顶部）",
           wall2.scene_bar is not None and wall2._col.indexOf(wall2.scene_bar) == 0)  # noqa: SLF001
     check("补建的条是可见的", wall2.scene_bar is not None and wall2.scene_bar.isVisible())
+    check("补建时胶囊也是显示的",
+          wall2.scene_bar is not None
+          and all(p.isVisible() for p in wall2.scene_bar._pills))  # noqa: SLF001
     wall2.close()
 
 
