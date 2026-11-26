@@ -457,6 +457,7 @@ class WallView(QScrollArea):
     scene_run = Signal(str)
     hide_requested = Signal(str, bool)  # did, 是否隐藏
     scene_hide_requested = Signal(str, bool)  # scene_id, 是否隐藏
+    scene_shortcut_requested = Signal(str)  # scene_id：在桌面建一个执行它的快捷方式
     card_value_committed = Signal(str, int, int, object)  # did, siid, piid, value
     card_style_requested = Signal(str, str)  # did, 样式 id（宽度由样式自带）
     capability_refresh_requested = Signal(str)  # did：清能力缓存并立刻重查
@@ -725,14 +726,23 @@ class WallView(QScrollArea):
                 self.card_style_requested.emit(did, str(data[1]))
 
     def _on_scene_menu(self, scene_id: str, pos: QPoint) -> None:
+        """场景胶囊右键：执行 / 建桌面快捷方式 / 隐藏。
+
+        「创建桌面快捷方式」是**幂等**的：同一个场景再点一次就是覆盖，不做
+        "删除"入口——快捷方式是桌面上的一个普通文件，用户自己删最快；
+        程序也不记"哪个场景建过"，那份账一旦用户改名/挪走就必然对不上。
+        """
         hidden = self._store.prefs.is_scene_hidden(scene_id)
         menu = Menu(self, self._p)
         act_run = menu.addAction("执行场景")
+        act_shortcut = menu.addAction("创建桌面快捷方式")
         menu.addSeparator()
         act_hide = menu.addAction("恢复显示" if hidden else "隐藏场景")
         chosen = menu.exec(pos)
         if chosen is act_run:
             self.scene_run.emit(scene_id)
+        elif chosen is act_shortcut:
+            self.scene_shortcut_requested.emit(scene_id)
         elif chosen is act_hide:
             self.scene_hide_requested.emit(scene_id, not hidden)
 

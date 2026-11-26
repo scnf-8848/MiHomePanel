@@ -11,8 +11,8 @@ from pathlib import Path
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import QApplication
 
-from .core import applog, autostart
-from .core.single_instance import SingleInstance, focus_window
+from .core import applog, autostart, scene_shortcut
+from .core.single_instance import SingleInstance
 from .ui import app_icon, fonts, theme
 from .ui.main_window import MainWindow
 
@@ -545,6 +545,12 @@ def main() -> int:
         ns = parser.parse_args(args)
         return probe_camera(rounds=ns.rounds, lane=ns.lane, timeout=ns.timeout)
 
+    # 桌面快捷方式（``--scene <sid> --home <hid>``）。参数在 GUI 起来之前就解析：
+    # 不合法时直接退出，不去建窗口——用户点的是"执行一个场景"，不是"打开程序"。
+    scene_request = scene_shortcut.parse_request(args)
+    if scene_shortcut.requested(args) and scene_request is None:
+        return 2
+
     # Windows 系统通知（后台提醒 / 收进托盘那条气泡）头部的图标取自 AUMID 的
     # IconUri，不是托盘图标——不显式注册的话 Windows 会按 exe 路径生成一个
     # "第一次弹通知时的图标快照"，换图标后一直显示旧的。必须在建窗口、挂托盘
@@ -577,6 +583,14 @@ def main() -> int:
     # 放在 MainWindow 之前——先抢令牌再建窗口，否则两个进程会各刷一轮设备列表。
     guard = SingleInstance()
     if not guard.acquire():
+        if scene_request is not None:
+            # 先落文件再广播：主实例收到广播会立刻去读，反了这个条目就赶不上这一轮。
+            # 第二个进程**不发任何网络请求**（auth.json 非原子写 + passToken 轮换，
+            # 两个进程同时刷新会把用户踢下线），执行永远由主实例做。
+            scene_shortcut.queue(*scene_request)
+            guard.notify_existing()
+            applog.log("shortcut", "已把场景请求交给正在运行的实例，本进程退出")
+            return 0
         guard.notify_existing()
         _report_instance_blocked()
         return 0
@@ -590,14 +604,14 @@ def main() -> int:
     _report_startup(window)
     _warn_if_readonly(window)
 
-    def bring_forward() -> None:
-        try:
-            focus_window(window)
-        except RuntimeError:  # 窗口已经销毁（正在退出）
-            pass
-
-    guard.activated.connect(bring_forward)
-    present_window(window, autostart_requested())
+    # 广播没有载荷，所以"这次是又点了程序图标，还是点了某个场景的快捷方式"
+    # 由窗口自己去 pending 目录里看，这里不判断。
+    guard.activated.connect(window.on_activation_broadcast)
+    if scene_request is not None:
+        # 没在跑 → 显式启动（窗口照常出现，用户看得见发生了什么）→ 加载完执行。
+        # 走和"已在跑"同一条消费路径，不另开一套"启动参数"分支。
+        scene_shortcut.queue(*scene_request)
+    present_window(window, autostart_requested() and scene_request is None)
     window.start()
     # 3 秒后再记一份"跑起来之后"的现场：托盘到底挂上没有、挂件在不在屏幕上。
     # 这一段必须延后——`install()` 的重试链最长要 12 秒，启动瞬间的结论会误导。

@@ -40,8 +40,7 @@ from PySide6.QtWidgets import (
 )
 
 from .. import __version__
-from ..core import climate as climate_mod
-from ..core import speaker
+from ..core import applog, climate as climate_mod, scene_shortcut, speaker
 from ..core.alerts import ERROR, TOAST_COOLDOWN, Alert, AlertPolicy
 from ..core.api import Client, explain
 from ..core.automation import FAILED
@@ -50,8 +49,9 @@ from ..core.icons import IconCache
 from ..core.jobs import SerialWorker
 from ..core.poll_demand import PollDemandBoard
 from ..core.prefs import Prefs
+from ..core.single_instance import focus_window
 from ..core.store import Store
-from . import chrome, theme, tooltip
+from . import app_icon, chrome, theme, tooltip
 from .alert_bar import ALERT_MARGIN_TOP, ALERT_MARGIN_X, AlertBar
 from .automation_list import AutomationPage
 from .chrome import DimOverlay, TitleBar, WindowFrame, exec_with_dim_click
@@ -97,6 +97,10 @@ TOPOLOGY_MS = 5 * 60 * 1000  # 设备列表低频刷新：新增设备不用手�
 #: 设备清单是唯一能拿到上下线的接口，按家庭逐个请求，比一轮属性读贵得多。
 #: 这里沿用现有的降频档（与托盘同一个 15 秒），掉线 / 回线最多晚 15 秒可见。
 ONLINE_MS = POLL_HIDDEN_MS
+#: 桌面快捷方式一次点击会连发 3 次全局广播（防"对面还没装消息过滤器"时丢失），
+#: 主实例每次都会去 pending 目录看一眼：第一眼取到条目并执行，后两眼是空的。
+#: 这个宽限期把这些空眼归到同一次点击，**不要**顺手把窗口抢到前台。
+SCENE_DRAIN_GRACE = 3.0
 
 
 def _refresh_path(c: QPointF, half: float) -> QPainterPath:
@@ -365,6 +369,11 @@ class MainWindow(QMainWindow):
         self._auto_fail_at: dict[str, float] = {}
         self.automation.log_added.connect(self._on_automation_log)
 
+        # 桌面快捷方式：上次消费待执行条目的时刻（把一次点击的 3 次广播归成一批），
+        # 以及"启动补捞做过没有"（广播在启动窗口期会丢，加载完要补一次）。
+        self._last_scene_drain = 0.0
+        self._scene_boot_drained = False
+
         # 右侧：顶部指令条 + 卡片墙。指令条占的正是警告条浮层那条横带
         # （同一个 ALERT_MARGIN_X / ALERT_MARGIN_TOP + AlertBar.H），所以警告条
         # 一出现就正好压住它——这是定下的预期，不改浮层层级。
@@ -453,6 +462,7 @@ class MainWindow(QMainWindow):
         self.wall.device_reset_requested.connect(self._on_device_reset)
         self.wall.scene_hide_requested.connect(self.store.set_scene_hidden)
         self.wall.scene_run.connect(self._on_scene)
+        self.wall.scene_shortcut_requested.connect(self._on_scene_shortcut)
         self.wall.card_clicked.connect(self._on_card_clicked)
         # 耗材页算出两档提醒的条数，由这里转给侧栏圆点：页面不认识 SideNav，
         # 也不需要知道圆点画在哪
@@ -1365,6 +1375,12 @@ class MainWindow(QMainWindow):
         fire_start = getattr(self.automation, "fire_start_rules", None)
         if callable(fire_start):
             fire_start()
+        # 桌面快捷方式在"程序正在启动"的窗口期发来的广播会丢（原生消息过滤器还没
+        # 装好），所以加载完成后补捞一次；此后的点击都走广播那条路。
+        # 延到下一拍：先让界面画完，再发请求。
+        if not self._scene_boot_drained:
+            self._scene_boot_drained = True
+            QTimer.singleShot(0, lambda: self._drain_scene_requests())
 
     # -- 顶栏音箱指令条 --------------------------------------------------
     def _refresh_speakers(self) -> None:
@@ -1498,6 +1514,118 @@ class MainWindow(QMainWindow):
 
     def _on_scene(self, scene_id: str) -> None:
         self.store.run_scene(scene_id, self.store.active_home)
+
+    # -- 桌面快捷方式 ------------------------------------------------------
+    def on_activation_broadcast(self) -> None:
+        """收到"又有人启动了这个程序"的全局广播。
+
+        两种来源：用户又点了一次程序图标（→ 把窗口叫到前台），或者点了一个场景的
+        桌面快捷方式（→ 只执行场景，**不动窗口**）。广播本身没有载荷
+        （``PostMessageW(HWND_BROADCAST, msg, 0, 0)``），所以判据是 pending 目录里
+        有没有刚放进来的条目。
+
+        ``notify_existing`` 一次发三条，后两条会看到目录已空；用
+        ``SCENE_DRAIN_GRACE`` 把这簇广播当成同一次点击，不去抢焦点。
+        """
+        if self._drain_scene_requests():
+            return
+        if time.monotonic() - self._last_scene_drain < SCENE_DRAIN_GRACE:
+            return
+        try:
+            focus_window(self)
+        except RuntimeError:  # 窗口正在销毁（退出途中）
+            pass
+
+    def _drain_scene_requests(self) -> bool:
+        """把待执行条目取走并执行，返回这一轮有没有东西。
+
+        执行不排队、不合并：用户连点五次就是五次。但一轮最多取
+        ``scene_shortcut.PENDING_LIMIT`` 条，剩下的下一轮拿走。
+        """
+        items = scene_shortcut.drain()
+        if not items:
+            return False
+        self._last_scene_drain = time.monotonic()
+        for item in items:
+            self._execute_scene_request(
+                str(item.get("scene_id") or ""), str(item.get("home_id") or "")
+            )
+        return True
+
+    def _execute_scene_request(self, scene_id: str, home_id: str) -> None:
+        """执行一个由桌面快捷方式发起的场景。
+
+        ``home_id`` 来自快捷方式，**不改当前页面 / 当前家庭**——用户可能正在看
+        另一个家庭的那面墙。场景名查不到（刚在手机里删掉）就用中性说法，
+        不拿 id 当名字。
+        """
+        scene = next(
+            (
+                s
+                for s in (self.store.scenes_by_home.get(home_id) or [])
+                if str(s.get("scene_id") or "") == scene_id
+            ),
+            None,
+        )
+        name = str((scene or {}).get("name") or "快捷场景")
+        applog.log("shortcut", f"执行快捷方式：{name}（scene={scene_id} home={home_id}）")
+        self.store.run_scene(
+            scene_id,
+            home_id,
+            on_done=lambda ok, why: self._scene_request_done(name, ok, why),
+        )
+
+    def _scene_request_done(self, name: str, ok: bool, reason: str) -> None:
+        """快捷方式触发的执行结果。
+
+        这条路必须用系统通知：用户点完桌面图标就去看别的东西了，顶栏那行状态
+        文字他根本看不到。托盘不可用时顶部轻提示兜底（窗口不在就什么都没了，
+        但那已经是"系统不支持通知"，不是这里能解决的）。
+        """
+        if ok:
+            text = f"已执行「{name}」"
+        else:
+            text = f"场景执行失败「{name}」" + (f" · {reason}" if reason else "")
+        tray = getattr(self, "tray", None)
+        if tray is not None:
+            tray.show_message("米家控制台", text, 6000, warning=not ok)
+        if self.isVisible():
+            tooltip.toast_top(
+                self, text, self.palette_ref,
+                kind=tooltip.TOAST_OK if ok else tooltip.TOAST_FAIL, ms=6000,
+            )
+
+    def _on_scene_shortcut(self, scene_id: str) -> None:
+        """右键场景 → 创建桌面快捷方式。
+
+        **不记"哪个场景建过"**：快捷方式自己带着 ``scene_id``，再点一次就是覆盖；
+        用户改名 / 挪走 / 删掉都在程序视野之外，记一份账必然对不上，还得自愈。
+        """
+        home = self.store.active_home
+        scene = next(
+            (
+                s
+                for s in self.store.scenes_for(home, include_hidden=True)
+                if str(s.get("scene_id") or "") == scene_id
+            ),
+            None,
+        )
+        name = str((scene or {}).get("name") or "")
+        try:
+            path = scene_shortcut.create(
+                scene_id, home, name, icon=str(app_icon.path() or "")
+            )
+        except OSError as exc:
+            applog.log("shortcut", f"创建桌面快捷方式失败：{exc}")
+            tooltip.toast_top(
+                self, f"创建快捷方式失败 · {exc}", self.palette_ref,
+                kind=tooltip.TOAST_FAIL, ms=6000,
+            )
+            return
+        applog.log("shortcut", f"已创建桌面快捷方式：{path}")
+        tooltip.toast_top(
+            self, f"已在桌面创建「{path.stem}」", self.palette_ref, ms=5000
+        )
 
     def _on_escape(self) -> None:
         """``Esc``：先收消息浮层，再照顾正在输入的那一格。

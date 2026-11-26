@@ -495,6 +495,7 @@ scripts/
   verify_locale.py   请求 locale 必须是合法串（zh_CN），否则设备名回退英文
   verify_power_glyph.py 卡片电源符号 ⏻ 的像素级验证（缺口宽度、圆环比例）
   verify_scenes.py   场景隐藏 + 圆角右键菜单（偏好往返、过滤、四角透明）
+  verify_scene_shortcut.py 场景桌面快捷方式：文件名清洗 / 参数拼装（源码与打包）/ `.lnk` 真往返 / 重名同场景覆盖而异场景另起 / 待执行队列（升序、超龄丢弃、坏文件丢弃、上限 5、`.tmp` 不取）/ 命令行合法性 / 真广播交接（子进程占令牌收消息）/ 接线（52 项）
   verify_theme.py    视觉 token：圆角 / 字号 / 强调色 / 开关尺寸 / 状态胶囊
   verify_tooltip.py  自绘悬停提示：节奏、控件间互不影响、圆角浮层
   verify_tree.py     设置页排序（家庭 / 房间 / 场景，设备层已移除）与隐藏页（设备 / 场景两个 tab）四棵树：结构、展开状态、同层拖动落盘、跨层拖动被拒、恢复默认、聚合开关
@@ -671,6 +672,109 @@ Windows 上即 `C:\Users\<用户名>\.config\mijia-api\auth.json`。这是 mijia
 依次验：空着能拿、第二个拿不到、广播真能到子进程窗口并 emit、子进程一死令牌立刻
 能再拿、换数据目录互不影响。子进程不显示窗口，只 `WA_NativeWindow` + `createWinId()`
 造一个真句柄——离屏平台没有 HWND，测不出广播。
+
+## 桌面快捷方式：点一下 = 执行一个场景（2026-11-26 落地）
+
+右键首页的场景胶囊 → 「创建桌面快捷方式」，桌面上出现 `<场景名>.lnk`，双击就算
+执行一次。**这个功能真正的难点不是 `.lnk`，是"点下去之后谁去发那个请求"**：
+本程序是单实例 + 单份 `auth.json`，第二个进程自己发请求有机会把用户踢下线。
+
+### `.lnk` 怎么建：ctypes 直连 COM，不引依赖
+
+`core/scene_shortcut.py` 用 `CoCreateInstance(CLSID_ShellLink)` 拿 `IShellLinkW`，
+`SetPath / SetArguments / SetWorkingDirectory / SetDescription / SetIconLocation`
+之后 `QueryInterface(IPersistFile)` → `Save`。本机没有 pywin32 / comtypes，也不该为
+这一件事引入（绿色版、无安装器）。**vtable 序号写死**，注释里标了每个号是什么：
+`IShellLinkW` 的 `SetPath` 是 20、`SetArguments` 11、`SetWorkingDirectory` 9、
+`SetDescription` 7、`SetIconLocation` 17；`IPersistFile` 的 `Load` 5、`Save` 6。
+
+几个坑：
+
+- `SetPath` 传的是**路径本身，不要自己加引号**（加了就存成一个带引号的非法路径）。
+  只有参数串需要引号，而我们只有 id，用不上。
+- 桌面路径必须走 `QStandardPaths.DesktopLocation`。拼 `%USERPROFILE%\Desktop` 在
+  OneDrive 接管桌面之后指向用户看不见的空目录，建出来等于没建。
+- 写完之后要 `SHChangeNotify(SHCNE_ASSOCCHANGED, ...)`，否则资源管理器要等下一次
+  自己刷新才显示新图标，用户以为没建成。
+- 源码模式目标用 `pythonw.exe` 不用 `python.exe`，否则每点一次闪一个黑框；工作目录
+  设仓库根，参数是 `-m mihome --scene … --home …`。打包模式目标是 exe 自己、参数不带 `-m`。
+
+### 谁发请求：网络调用只由 GUI 进程做
+
+三条代码事实决定了这件事（`core/api.py` 用上游 `mijiaAPI`）：
+
+1. `_save_auth_data()` 是 `open(..., "w")` **先截断再写**，不是原子写；
+2. `_refresh_token()` 成功后**轮换 `passToken`**；
+3. `_request()` 每次都先刷 token。
+
+两个进程同时过期、同时刷新 → 一方把另一方的登录态覆盖掉，极端情况要重新扫码。
+**一条桌面捷径把用户踢下线是不可接受的**，所以第二个进程只做两件事：落一个
+"待执行"文件、广播，然后退出。`run_scene` 内部还要 `_get_home_owner(home_id)`，
+而 `scene_id` 只在家庭内唯一，所以 **`home_id` 必须存进快捷方式**，不能运行时猜。
+
+### 交接通道：pending 文件 + 那条没有载荷的广播
+
+单实例的广播是 `PostMessageW(HWND_BROADCAST, msg, 0, 0)`——两个参数都是 0，
+传不了 `scene_id`。又不能用 `QLocalServer`（`dist` 里没有 `Qt6Network.dll`，见上一节），
+所以载荷走文件：
+
+- `<data>/pending/scene-<毫秒>-<pid>-<随机>.json`，内容 `{scene_id, home_id, at}`；
+- **先写 `.tmp` 再 `os.replace`**：读到半个文件就执行是最糟的结果；
+- **先落文件、再广播**（`app.py` 里第二实例那三行，顺序反了主实例会读空）。
+
+主实例侧（`MainWindow.on_activation_broadcast`）**不能无条件把窗口叫到前台**：
+广播没有载荷，分不清"用户又点了程序图标"和"点了场景快捷方式"。判据是 pending
+目录里有没有刚放进来的东西：
+
+```
+收到广播 → drain 到条目 → 执行场景，不动窗口
+        → 没条目，但 3 秒内刚 drain 过 → 什么都不做（同一次点击的第 2、3 条广播）
+        → 没条目且不在宽限期内 → focus_window（原来的"再点一次图标"语义）
+```
+
+`notify_existing()` 一次发 3 条（防对面过滤器还没装好），所以那 3 秒的宽限期
+（`SCENE_DRAIN_GRACE`）是必需的，不然每次点快捷方式都会把窗口抢到前台。
+
+**启动补捞**：`acquire()` 到装过滤器之间有个窗口期，广播可能丢。所以主窗口第一次
+`_on_loaded` 之后补 drain 一次。没补捞的话，程序正在启动的那几秒里点快捷方式就白点了。
+
+### 三种状态（用户 2026-11-26 拍板）
+
+| 点击时 | 行为 | 延迟 |
+| --- | --- | --- |
+| 程序已在跑 | pending + 广播 → 主实例执行 | ~0.2 s |
+| 没在跑 | **显式启动**（窗口照常出现）→ 加载完执行 | 几秒 |
+| 正在启动中 | 广播可能丢 → 启动补捞兜住 | 同上 |
+
+**"没在跑"不静默进托盘**（评估文档原方案），用户要的是"点了就看见发生了什么"：
+藏到托盘里执行，用户既不知道程序起来了、也不知道场景跑没跑。窗口出现 + 托盘气泡
+「已执行「回家」」，比"等 8 秒然后什么都没发生"好。
+
+失败必须看得见：气泡写「场景执行失败「回家」· <原因>」，原因取 `Client.last_error`
+或抛上来的异常（`Store.run_scene(..., on_done=)` 就是给这条通道加的，普通点击不传）。
+
+### 不记簿记、不做删除入口
+
+评估时曾计划在 `prefs` 里存 `scene_shortcuts`（`scene_id` → `.lnk` 路径），用户
+2026-11-26 否掉了：快捷方式自己带着 `scene_id`，再点一次「创建」就是覆盖；桌面文件
+归用户管，改名 / 挪走 / 删掉都在程序视野之外，记一份账必然对不上，还得写自愈。
+同理不做「删除桌面快捷方式」——用户自己在桌面删最快。
+
+代价只有一个：**同名不同场景**要另起 `(2)`（`unique_path()` 读回旧 `.lnk` 的
+`--scene` 判断），否则两个家庭各有一个「回家」时会静默互相覆盖。
+
+### 边界
+
+- 场景在手机里删了 / 停用了 → 云端拒绝，气泡照原样报原因，**不静默**。
+- 快捷方式按 `home_id` 执行，**不改**当前页面 / 当前家庭（用户可能正在看另一面墙）。
+- 场景改名后快捷方式名不跟着变（v1）；点击仍正常，走的是 id。
+- 源码模式挪仓库 / 重建 venv 后快捷方式失效（找不到 `pythonw.exe`），和 `autostart`
+  同一类问题，重建成一次即可。
+- **不要勾"以管理员身份运行"**：UAC 弹窗 + 不同完整性级别抢同一个 `Local\` 互斥量
+  → 被当成第二实例挡掉，点了白点。
+
+验证：`scripts/verify_scene_shortcut.py`（52 项，临时目录，不碰真实桌面）。真机上
+"点一下看气泡"只能人工验，见 `docs/reference/scene-shortcut.md` 第 8 节。
 
 ## 开机启动：一条 HKCU 启动项，加上一个自愈
 

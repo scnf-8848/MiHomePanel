@@ -1511,21 +1511,41 @@ class Store:
             callback=done,
         )
 
-    def run_scene(self, scene_id: str, home_id: str = "") -> None:
+    def run_scene(self, scene_id: str, home_id: str = "", on_done=None) -> None:
+        """执行一个快捷场景。
+
+        ``on_done(ok, reason)`` 给"用户看不见界面"的调用方（桌面快捷方式）：顶栏
+        状态文字那条通道对他们是无效的，得由调用方换成系统气泡。普通点击不传。
+        """
+
+        def done(result: Any, error: BaseException | None) -> None:
+            ok, reason = self._on_scene_done(result, error)
+            if on_done is not None:
+                on_done(ok, reason)
+
         self.worker.submit(
             self.client.run_scene,
             (scene_id, home_id or self.home_id),
             priority=PRIORITY_CONTROL,
             label="scene",
-            callback=self._on_scene_done,
+            callback=done,
         )
 
-    def _on_scene_done(self, result: Any, error: BaseException | None) -> None:
+    def _on_scene_done(self, result: Any, error: BaseException | None) -> tuple[bool, str]:
+        """返回 ``(成功?, 失败原因)``。
+
+        原因只从两个地方取：抛上来的异常，或者 ``Client`` 记的 ``last_error``
+        （云端返回非 0 / 网络错误都在那里）。
+        """
         ok = error is None and result is not False
         self._status("场景执行失败" if not ok else "场景已执行")
         if ok:
             # 场景改到哪几台说不准：不按设备确认，交给界面的固定时点全量读序列
             self._notify_command_done()
+            return True, ""
+        if error is not None:
+            return False, f"{type(error).__name__}: {error}"
+        return False, (getattr(self.client, "last_error", "") or "云端拒绝了这次请求")
 
     # -- 杂务 ------------------------------------------------------------
     @property
