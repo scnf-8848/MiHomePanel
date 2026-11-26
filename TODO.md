@@ -129,6 +129,16 @@
 
 ## 最近完成（2026-11-15 ~ 11-26）
 
+- **快捷场景"凭空消失"（2026-11-26 晚，用户实测报的）**：App 里新建一个场景 → 程序里
+  刷新 → 首页那排胶囊全没了。真机探测证明云端接口正常（14 条、字段齐全），本地用真
+  prefs 也复现不出 —— 是**那一轮拿到了合法空表**，界面当真清空。根子在
+  `mijiaAPI._get_scenes_list`：`if ret and "manual_scene_info_list" in ret` 不满足就
+  `return []`，**"结构不符"与"真删光了"在调用方看来一模一样**，日志里一条错都没有。
+  三处修：① `Client.scenes()` 自己发 `GetSimpleSceneList`，缺键 / 失败 → `None`（沿用
+  旧表）；② `Store._merge_scenes()` 空表防抖——第一轮空沿用旧表，连续两轮空才真清空
+  （5 分钟一轮最坏晚 5 分钟，F5 两次立即生效）；③ `SceneBar.set_scenes` 全跳过时记日志。
+  新增 `logs/scene.log` 诊断（home 尾号 / 条数 / 键名，不记场景名）。验证
+  `verify_scenes.py` 38 → 48 项（`Client.scenes` 五分支 + 防抖六分支）。
 - **新场景不用重启才出现（2026-11-26，用户问「是不是只在启动那下更新场景」挖出来的）**：
   数据其实每 5 分钟重拉一次（`_load_job` 里每家庭一次 `get_scenes_list`，另有启动 /
   登录 / F5），但 `_on_loaded` 只在**设备集变了**时整墙重建，没变只 `update_cards`

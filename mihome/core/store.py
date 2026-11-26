@@ -28,6 +28,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
+from . import applog
 from .api import (
     Client,
     HomeNode,
@@ -209,6 +210,10 @@ class Store:
         self.devices: dict[str, DeviceState] = {}
         self.scenes: list[dict[str, Any]] = []
         self.scenes_by_home: dict[str, list[dict[str, Any]]] = {}
+        #: 每个家庭"连续拉到空表"的轮数。空表**先沿用一轮旧表**再真清空——
+        #: 2026-11-26 的真实事故：刚在 App 里建完场景，那一轮云端回了空表，
+        #: 首页一排场景当场全消失，用户以为被删了。见 ``_merge_scenes``。
+        self._scenes_empty: dict[str, int] = {}
         self.home_id = ""
         self.active_home = ""  # 当前正在看的家庭 id（首页只有这一个家庭）
         self.loading = False
@@ -269,6 +274,7 @@ class Store:
         self.topology = Topology()
         self.scenes = []
         self.scenes_by_home = {}
+        self._scenes_empty.clear()
         self.active_home = ""
         self.home_id = ""
         self.loading = False
@@ -307,6 +313,36 @@ class Store:
             scenes[home.id] = got
         return topo, specs, scenes
 
+    def _merge_scenes(
+        self, incoming: dict[str, list[dict[str, Any]]]
+    ) -> dict[str, list[dict[str, Any]]]:
+        """把这一轮的场景表并进内存表，**空表先沿用一轮旧表**。
+
+        ``Client.scenes()`` 只在请求失败 / 结构不符时给 ``None``；但云端偶发地
+        回一个**合法空表**（2026-11-26：刚在 App 里建完场景，那一轮就是空表），
+        调用方看来和"真删光了"一模一样，首页一排胶囊当场全消失。
+
+        所以空表多等一轮：第一次空 + 旧表有数据 → 沿用旧表并记一笔；连续两轮
+        空才当真清空。5 分钟一轮，最坏晚 5 分钟；手动刷新两次立即生效。
+        ``None`` 那条路在 ``_load_job`` 里已经兜成旧表，走到这里的都是"成功"。
+        """
+        merged: dict[str, list[dict[str, Any]]] = {}
+        for hid, got in incoming.items():
+            old = self.scenes_by_home.get(hid) or []
+            if got or not old:
+                merged[hid] = got
+                self._scenes_empty.pop(hid, None)
+                continue
+            streak = self._scenes_empty.get(hid, 0) + 1
+            self._scenes_empty[hid] = streak
+            if streak <= 1:
+                applog.log("scene", f"home ...{hid[-4:]} 空表但旧表 {len(old)} 条，先沿用一轮")
+                merged[hid] = old
+            else:
+                applog.log("scene", f"home ...{hid[-4:]} 连续 {streak} 轮空表，当真清空")
+                merged[hid] = []
+        return merged
+
     def _on_loaded(self, result: Any, error: BaseException | None) -> None:
         self.loading = False
         if error is not None or result is None:
@@ -314,7 +350,7 @@ class Store:
             self._status(self.last_error)
             return
         topo, specs, scenes = result
-        self.scenes_by_home = scenes
+        self.scenes_by_home = self._merge_scenes(scenes)
         self.home_id = topo.homes[0].id if topo.homes else ""
         self.apply_topology(topo, specs)
         ids = [h.id for h in self.homes()]

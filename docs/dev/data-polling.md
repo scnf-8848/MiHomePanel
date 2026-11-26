@@ -59,7 +59,26 @@ _poll()（3s / 托盘 15s 的 tick）
 真的没场景"在界面上长得一样，`_on_loaded` 会整体替换 `scenes_by_home`，于是首页那排
 场景整排消失，而且一挂就是到下次成功刷新（5 分钟后）。`_load_job` 拿 `load()` 时拍的
 `prev_scenes` 快照兜底（快照跟着任务进工作线程，主线程那份 `scenes_by_home` 不跨线程读）。
-云端真回 `[]`（用户把场景删光了）照原样换成空表，不兜底。
+
+**空表也要防抖**（2026-11-26 晚，用户实测报上来的）。`mijiaAPI._get_scenes_list` 的判据是
+`if ret and "manual_scene_info_list" in ret`，不满足就 `return []`——云端换键 / 返回别的
+结构时，调用方拿到的是**合法空表**，跟"真删光了"分不开。所以 `Client.scenes()` 不再走库
+那个方法，自己发 `GetSimpleSceneList` 并三分：
+
+| 云端返回 | `Client.scenes` | 界面 |
+| --- | --- | --- |
+| `manual_scene_info_list` 有数据 | 列表 | 正常画 |
+| `manual_scene_info_list` 是 `[]` | `[]` | **先沿用一轮旧表**，连续两轮空才清 |
+| 没有这个键 / 请求失败 | `None` | 沿用旧表（`_load_job` 兜底） |
+
+空表防抖在 `Store._merge_scenes()`（主线程，`_on_loaded` 里调）：每个家庭记
+`_scenes_empty[home]`，第一轮空 + 旧表有数据 → 沿用并记一笔，第二轮还空 → 当真清空。
+5 分钟一轮，最坏晚 5 分钟；手动 F5 两次立即生效。理由是"删精光"几乎总是用户在 App 里
+主动做的、可以等，而"凭空消失"会让人以为数据丢了。
+
+诊断一律落 `<data>/logs/scene.log`（只记 home 尾号 / 条数 / 键名，不记场景名）：
+`home ...5562 拉到 14 条（enable 为真 12）`、`空表但旧表 N 条，先沿用一轮`、
+`条更新：N 条进、M 个胶囊出，可见=… 高=…`。2026-11-26 查这个 bug 时最缺的就是这几行。
 
 ## 写入确认：mute 到期后单台读 5 次
 

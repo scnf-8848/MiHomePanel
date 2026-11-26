@@ -15,6 +15,7 @@ from PySide6.QtCore import QPoint, QRect, QRectF, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QFontMetrics, QPainter
 from PySide6.QtWidgets import QSizePolicy, QWidget
 
+from ..core import applog
 from . import theme
 from .widgets import draw_text
 
@@ -130,20 +131,37 @@ class SceneBar(QWidget):
             pill.setParent(None)
             pill.deleteLater()
         self._pills = []
+        disabled = 0
+        nameless = 0
         for s in scenes:
             if not s.get("enable", True):
+                disabled += 1
                 continue
             sid = str(s.get("scene_id") or "")
             name = str(s.get("name") or "")
             if not sid or not name:
+                nameless += 1
                 continue
             pill = ScenePill(sid, name, self._p)
             pill.setParent(self)
             pill.clicked.connect(self.scene_run)
             pill.menu_requested.connect(self.scene_menu)
             self._pills.append(pill)
+        if scenes and not self._pills:
+            # 拿到了数据却一条都没画出来，界面只是"空着"，没有任何痕迹——
+            # 2026-11-26 场景整排消失时，就是卡在这里分不清是没数据还是字段变了。
+            applog.log(
+                "scene",
+                f"{len(scenes)} 条全部跳过：enable 为假 {disabled} 条、"
+                f"缺 scene_id/name {nameless} 条",
+            )
         self._relayout()
         self.setVisible(bool(self._pills))
+        applog.log(
+            "scene",
+            f"条更新：{len(scenes)} 条进、{len(self._pills)} 个胶囊出，"
+            f"可见={self.isVisible()} 高={self.height()}",
+        )
 
     def _relayout(self) -> None:
         x = 0

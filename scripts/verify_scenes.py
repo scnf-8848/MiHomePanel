@@ -151,6 +151,56 @@ def checks_refresh(app: QApplication) -> None:
     wall2.close()
 
 
+def checks_client_scenes() -> None:
+    """``Client.scenes`` 必须把"结构不符"和"真没有场景"分开。
+
+    2026-11-26 的真事故：库内 ``_get_scenes_list`` 的判据是
+    ``if ret and "manual_scene_info_list" in ret``，不满足就 ``return []``，
+    于是云端换键 / 返回别的结构时调用方拿到的是**合法空表**——界面照实清空，
+    首页整排场景消失，而日志里一条错误都没有。
+    """
+    from mijiaAPI.errors import APIError
+
+    from mihome.core.api import Client
+
+    class _Raw:
+        locale = "zh_CN"
+        service_login_url = ""
+        auth_data: dict = {}
+
+        def __init__(self, ret=None, exc=None) -> None:
+            self.ret = ret
+            self.exc = exc
+
+        def _request(self, uri, data):  # noqa: ANN001, ANN202
+            if self.exc is not None:
+                raise self.exc
+            return self.ret
+
+        def _get_home_owner(self, hid):  # noqa: ANN001, ANN202
+            return 1
+
+        def get_homes_list(self):  # noqa: ANN202
+            return [{"id": "111", "uid": 1}]
+
+    def call(**kw):  # noqa: ANN003, ANN202
+        return Client(api=_Raw(**kw)).scenes("111")
+
+    check("真空表照实返回（云端真删光了）",
+          call(ret={"manual_scene_info_list": []}) == [])
+    check("result 里没有 manual_scene_info_list → None",
+          call(ret={}) is None)
+    check("键名换了（scene_list）→ None，不能当空表",
+          call(ret={"scene_list": [{"scene_id": "1", "name": "x"}]}) is None)
+    check("请求抛异常 → None", call(exc=APIError(-1, "boom")) is None)
+    got = call(ret={"manual_scene_info_list": [
+        {"scene_id": "1", "name": "a"}, {"scene_id": "2", "name": "b"}]})
+    check("正常两条，且每条都补了 home_id",
+          isinstance(got, list) and len(got) == 2
+          and all(s.get("home_id") == "111" for s in got),
+          f"{got}")
+
+
 def checks_load_fallback() -> None:
     """``Store._load_job``：某家场景拉失败时沿用上一轮的表。
 
@@ -200,7 +250,26 @@ def checks_load_fallback() -> None:
 
     _Client.answer = []
     _, _, scenes = st._load_job(prev)
-    check("云端真空（[]）是真空，不沿用", scenes["h1"] == [], str(scenes))
+    check("空表原样返回给上层（防抖在 _merge_scenes 做）", scenes["h1"] == [], str(scenes))
+
+    # 空表防抖：2026-11-26 真事故——刚在 App 里建完场景，那一轮云端回空表，
+    # 首页整排胶囊当场消失。空表先沿用一轮，连续两轮空才当真。
+    st.scenes_by_home = {"h1": [{"scene_id": "old", "name": "旧场景"}]}
+    st._scenes_empty.clear()
+    merged = st._merge_scenes({"h1": []})
+    check("第一轮空表 → 沿用旧表", [s["scene_id"] for s in merged["h1"]] == ["old"],
+          str(merged))
+    merged = st._merge_scenes({"h1": []})
+    check("连续第二轮空表 → 真清空", merged["h1"] == [], str(merged))
+    merged = st._merge_scenes({"h1": [{"scene_id": "new", "name": "新"}]})
+    check("来数据后计数清零", not st._scenes_empty and len(merged["h1"]) == 1, str(merged))
+    merged = st._merge_scenes({"h1": []})
+    check("计数清零后再遇空表，又是'先沿用'", len(merged["h1"]) == 1, str(merged))
+
+    st.scenes_by_home = {}
+    st._scenes_empty.clear()
+    merged = st._merge_scenes({"h1": []})
+    check("旧表本来就空 → 空表照收，不报错", merged["h1"] == [], str(merged))
 
     _Client.answer = None
     st.scenes_by_home = {}
@@ -269,6 +338,9 @@ def main() -> int:
 
     print("\n5) 场景拉失败不清空旧表")
     checks_load_fallback()
+
+    print("\n6) 场景表：结构不符与真删光必须分开")
+    checks_client_scenes()
 
     print()
     if FAILS:

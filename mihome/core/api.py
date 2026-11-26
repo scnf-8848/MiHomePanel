@@ -38,7 +38,7 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 from mijiaAPI import mijiaAPI
 from mijiaAPI.errors import APIError, ERROR_CODE
 
-from . import device_catalog, dev_fault, paths
+from . import applog, device_catalog, dev_fault, paths
 from .health import (
     NETWORK,
     PROTOCOL,
@@ -950,15 +950,76 @@ class Client:
     def scenes(self, home_id: str | None = None) -> list[dict[str, Any]] | None:
         """拉一个家庭的快捷场景。
 
-        **失败返回 ``None``，不是空表**：空表与"这家真没场景"在界面上长得一模一样，
-        调用方会把首页那排场景整排清掉（用户以为被删了），一挂就是到下次刷新。
-        见 ``Store._load_job`` 的兜底。
+        **不走 ``mijiaAPI.get_scenes_list()``**（2026-11-26 改）。库内
+        ``_get_scenes_list`` 的判据是 ``if ret and "manual_scene_info_list" in ret``，
+        不满足就 ``return []``——于是"接口结构不符（云端改了字段 / 返回了别的键）"
+        和"这家真没场景"**在调用方看来一模一样**，首页那排胶囊会被整排清掉，
+        用户以为场景被删了。这里自己发请求，把两种情况分开：
+
+        * 结构不符 / 请求失败 → 抛 → 返回 ``None`` → 调用方沿用上次的表；
+        * 返回空表 → 真切空。
+
+        **失败返回 ``None``，不是空表**：见 ``Store._load_job`` 的兜底。
+        诊断落 ``<data>/logs/scene.log``（只记键名与条数，不记场景名）。
         """
+        uri = "/appgateway/miot/appsceneservice/AppSceneService/GetSimpleSceneList"
         with self._lock:
             try:
-                return list(self._api.get_scenes_list(home_id))
+                if home_id:
+                    homes = [str(home_id)]
+                else:
+                    homes = [str(h["id"]) for h in self._api.get_homes_list()]
+                out: list[dict[str, Any]] = []
+                for hid in homes:
+                    data = {
+                        "app_version": 12,
+                        "get_type": 2,
+                        "home_id": hid,
+                        "owner_uid": self._api._get_home_owner(hid),
+                    }
+                    ret = self._api._request(uri, data)
+                    if not isinstance(ret, dict):
+                        raise APIError(
+                            -1, f"场景列表返回的不是对象：{type(ret).__name__}"
+                        )
+                    items = ret.get("manual_scene_info_list")
+                    if items is None:
+                        # 关键分支：结构不符**不能**当成"没有场景"
+                        applog.log(
+                            "scene",
+                            f"结构不符：home ...{hid[-4:]} result 键={sorted(ret)}",
+                        )
+                        raise APIError(
+                            -1,
+                            "场景列表结构不符（result 里没有 manual_scene_info_list，"
+                            f"实际有 {sorted(ret)}）",
+                        )
+                    if items:
+                        # 字段名变了会让界面静默跳过每一条（缺 scene_id / name），
+                        # 那种"接口有数据但一个都不画"最难查，先把键名记下来。
+                        miss = [
+                            k for k in ("scene_id", "name")
+                            if k not in items[0]
+                        ]
+                        if miss:
+                            applog.log(
+                                "scene",
+                                f"字段缺失 {miss}：home ...{hid[-4:]} "
+                                f"首条键={sorted(items[0])}",
+                            )
+                    for s in items:
+                        if isinstance(s, dict):
+                            s["home_id"] = hid
+                            out.append(s)
+                    applog.log(
+                        "scene",
+                        f"home ...{hid[-4:]} 拉到 {len(items)} 条"
+                        f"（enable 为真 {sum(1 for s in items if s.get('enable', True)) if items else 0}）",
+                    )
+                return out
             except Exception as exc:  # noqa: BLE001
                 self.last_error = f"场景列表失败: {exc}"
+                applog.log("scene", f"失败：{type(exc).__name__}: {exc}")
                 return None
 
     def messages(self, limit: int = 30) -> dict[str, Any]:
