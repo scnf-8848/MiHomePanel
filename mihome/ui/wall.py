@@ -20,6 +20,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from PySide6.QtCore import QEvent, QPoint, QPointF, QRect, QRectF, Qt, QUrl, Signal
 from PySide6.QtGui import (
     QColor,
@@ -522,6 +524,30 @@ class WallView(QScrollArea):
         self._sections.clear()
         self._cards.clear()
         self.scene_bar = None
+
+    def refresh_scenes(self, scenes: list[dict[str, Any]]) -> None:
+        """场景数据重拉后只换这一条，不重建整面墙。
+
+        低频刷新（5 分钟一轮 + F5）会顺带把场景拉回来，但那轮设备集通常没变，
+        ``MainWindow._on_loaded`` 走的是 ``update_cards``（只刷卡片）——场景条不会
+        重画，结果手机里新建 / 改名 / 删掉的场景得重启程序才看得到。这里补上，
+        顺带保住滚动位置、卡片状态和正在播的画面（整墙重建会把这些全丢）。
+
+        全部场景被删或停用时条自己 ``setVisible(False)`` 并把高度设成 0，控件留着
+        复用——下次又有场景时不必重新插布局。
+        """
+        if self.scene_bar is None:
+            if not any(s.get("enable", True) for s in scenes):
+                return
+            bar = SceneBar(self._p)
+            bar.scene_run.connect(self.scene_run)
+            bar.scene_menu.connect(self._on_scene_menu)
+            # 先入布局再加内容，理由同 build()：否则会先当顶层窗口闪一下
+            self._col.insertWidget(0, bar)
+            self.scene_bar = bar
+            bar.set_scenes(scenes)
+            return
+        self.scene_bar.set_scenes(scenes)
 
     def build(self) -> None:
         """拓扑 / 家庭 / 排序变化后重建整个墙。"""

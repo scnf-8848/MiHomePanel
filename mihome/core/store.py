@@ -283,10 +283,15 @@ class Store:
             return
         self.loading = True
         self._status("正在连接米家…")
-        self.worker.submit(self._load_job, priority=PRIORITY_CONTROL, label="load",
-                           callback=self._on_loaded)
+        # 旧场景表跟着任务带进工作线程：拉失败时要拿它兜底，而 ``scenes_by_home``
+        # 归主线程写（每次 load 都会整体替换），直接读会踩到半写状态。
+        prev_scenes = {k: list(v) for k, v in self.scenes_by_home.items()}
+        self.worker.submit(self._load_job, (prev_scenes,), priority=PRIORITY_CONTROL,
+                           label="load", callback=self._on_loaded)
 
-    def _load_job(self) -> tuple[Topology, dict[str, DeviceSpec], dict[str, list[dict[str, Any]]]]:
+    def _load_job(
+        self, prev_scenes: dict[str, list[dict[str, Any]]]
+    ) -> tuple[Topology, dict[str, DeviceSpec], dict[str, list[dict[str, Any]]]]:
         topo = self.client.load_topology()
         urns = [d.spec_type for d in topo.real_devices()]
         specs = self.repo.get_many(urns, workers=4)
@@ -294,7 +299,12 @@ class Store:
         # 切家庭时就不用再等一次网络。
         scenes: dict[str, list[dict[str, Any]]] = {}
         for home in topo.homes:
-            scenes[home.id] = self.client.scenes(home.id)
+            got = self.client.scenes(home.id)
+            if got is None:
+                # 拉失败**沿用上次的表**：换成空表会让首页那排场景凭空消失，
+                # 用户以为场景被删了，而且一挂就是 5 分钟（下次成功刷新才回来）。
+                got = prev_scenes.get(home.id, [])
+            scenes[home.id] = got
         return topo, specs, scenes
 
     def _on_loaded(self, result: Any, error: BaseException | None) -> None:

@@ -1361,6 +1361,9 @@ class MainWindow(QMainWindow):
         else:
             # 设备集合没变：只刷新卡片，保住滚动位置和鼠标悬停
             self.wall.update_cards(set(self.store.devices))
+            # 场景另算：这一轮可能刚拉到新建 / 改名 / 删掉的场景，而设备集没变时
+            # 上面那条路不会重画场景条（5 分钟一轮，不补就永远是一屏旧场景）
+            self.wall.refresh_scenes(self.store.scenes)
         if self._start_placement_pending and active:
             self._start_placement_pending = False
             self._apply_start_room(active)

@@ -33,6 +33,34 @@ _poll()（3s / 托盘 15s 的 tick）
   36 台、判不出 12 台、**没有一台反证为离线**。
 - 刷新失败只打日志、保留旧状态，15 秒后自然重试；它不进属性轮询的健康账本。
 
+## 拓扑与快捷场景：每 5 分钟一次，但界面要单独跟（2026-11-26）
+
+`MainWindow._topo_timer` 每 `TOPOLOGY_MS = 5 分钟` 调一次 `Store.load()`，一次
+`_load_job` 里拉三样：拓扑（`load_topology`）、规格（`get_many`）、**每个家庭一次
+`get_scenes_list`**（`Client.scenes`）。四个入口：
+
+| 时机 | 谁触发 |
+| --- | --- |
+| 启动 / 登录成功 | `MainWindow.start()`、登录对话框的 `succeeded` |
+| 每 5 分钟 | `_topo_timer` → `_refresh_topology()`（`not loading and store.devices` 时才跑） |
+| 手动 | `F5` / `Ctrl+R` → `_reload()` → `Store.rebuild()` |
+
+**切家庭不拉网络**：`scenes_by_home` 是启动那次一起拿完的，`_on_home_selected` 只从
+缓存里取，切来切去不额外发请求。
+
+**数据刷了不等于界面刷了**——这是 2026-11-26 修的一个真 bug。`_on_loaded()` 的判据是
+"设备集合变没变"：变了才 `wall.set_home()` 整墙重建；没变只走 `update_cards()`（逐张
+`card.refresh`）。场景条不在这两条路上，于是**手机里新建的场景只有重启才出现**：5 分钟
+那轮数据拉到了、界面没理它。补法是 `WallView.refresh_scenes()`：只 `set_scenes()` 换
+胶囊，不碰卡片、不动滚动位置、不断正在播的画面。设备集**变了**时仍走整墙重建，那条路
+本来就会重画场景条。
+
+**拉失败要沿用旧表**。`Client.scenes()` 失败返回 `None`，不再返回 `[]`——空表和"这家
+真的没场景"在界面上长得一样，`_on_loaded` 会整体替换 `scenes_by_home`，于是首页那排
+场景整排消失，而且一挂就是到下次成功刷新（5 分钟后）。`_load_job` 拿 `load()` 时拍的
+`prev_scenes` 快照兜底（快照跟着任务进工作线程，主线程那份 `scenes_by_home` 不跨线程读）。
+云端真回 `[]`（用户把场景删光了）照原样换成空表，不兜底。
+
 ## 写入确认：mute 到期后单台读 5 次
 
 写入是**乐观**的：按下开关的瞬间屏幕上就是新值，可那是我们自己写的，不是设备回读的。

@@ -947,13 +947,19 @@ class Client:
                 self.last_error = f"场景执行失败: {exc}"
                 return False
 
-    def scenes(self, home_id: str | None = None) -> list[dict[str, Any]]:
+    def scenes(self, home_id: str | None = None) -> list[dict[str, Any]] | None:
+        """拉一个家庭的快捷场景。
+
+        **失败返回 ``None``，不是空表**：空表与"这家真没场景"在界面上长得一模一样，
+        调用方会把首页那排场景整排清掉（用户以为被删了），一挂就是到下次刷新。
+        见 ``Store._load_job`` 的兜底。
+        """
         with self._lock:
             try:
                 return list(self._api.get_scenes_list(home_id))
             except Exception as exc:  # noqa: BLE001
                 self.last_error = f"场景列表失败: {exc}"
-                return []
+                return None
 
     def messages(self, limit: int = 30) -> dict[str, Any]:
         """读一次消息中心（``POST /v2/message/v2/typelist``），返回云端原始 payload。
