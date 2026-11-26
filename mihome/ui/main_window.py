@@ -1578,22 +1578,39 @@ class MainWindow(QMainWindow):
     def _scene_request_done(self, name: str, ok: bool, reason: str) -> None:
         """快捷方式触发的执行结果。
 
-        这条路必须用系统通知：用户点完桌面图标就去看别的东西了，顶栏那行状态
-        文字他根本看不到。托盘不可用时顶部轻提示兜底（窗口不在就什么都没了，
-        但那已经是"系统不支持通知"，不是这里能解决的）。
+        成功**只弹窗口内轻提示，不发系统通知**（用户 2026-11-26 定）：成功没有需要
+        用户处理的信息，一次点击换一条通知进了通知中心还得自己清，是纯噪音。
+        窗口恰好不可见时退回托盘 tooltip——hover 能看到，也不打扰。
+
+        失败才发系统通知：用户可能已经离开窗口，而失败是要他动手的（重登 / 场景
+        被删 / 设备离线），漏掉的代价比多一条通知大。
         """
         if ok:
             text = f"已执行「{name}」"
         else:
             text = f"场景执行失败「{name}」" + (f" · {reason}" if reason else "")
+        visible = self.isVisible()
         tray = getattr(self, "tray", None)
-        if tray is not None:
-            tray.show_message("米家控制台", text, 6000, warning=not ok)
-        if self.isVisible():
+        if not ok and tray is not None:
+            tray.show_message("米家控制台", text, 6000, warning=True)
+        if visible:
             tooltip.toast_top(
                 self, text, self.palette_ref,
                 kind=tooltip.TOAST_OK if ok else tooltip.TOAST_FAIL, ms=6000,
             )
+        elif ok and tray is not None:
+            # 窗口不在（最小化 / 收进托盘）时成功不提示太像"点了没反应"，也不该升级成
+            # 系统通知：托盘 tooltip 是零打扰的一档，鼠标扫一眼就有。8 秒后换回当前
+            # 状态，免得一条"已执行"长期挂在那儿让人以为是刚发生的。
+            tray.set_status(text)
+
+            def _restore_tip() -> None:
+                try:
+                    tray.set_status(self.status.text())
+                except RuntimeError:  # 窗口已销毁（正在退出）
+                    pass
+
+            QTimer.singleShot(8000, _restore_tip)
 
     def _on_scene_shortcut(self, scene_id: str) -> None:
         """右键场景 → 创建桌面快捷方式。

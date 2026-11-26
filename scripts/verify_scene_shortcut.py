@@ -247,10 +247,85 @@ def main() -> int:
         except subprocess.TimeoutExpired:
             child.kill()
 
-    # -- 7) 接线 ----------------------------------------------------------
+    # -- 7) 结果反馈：成功只轻提示，失败才系统通知 ------------------------
+    # 用户 2026-11-26 定：成功没有需要处理的信息，弹系统通知是纯噪音（进了通知中心
+    # 还得自己清）；失败是要他动手的（重登 / 场景被删 / 设备离线），必须够显眼。
+    print("\n7) 结果反馈：成功不打扰、失败必提醒", flush=True)
+    from PySide6.QtWidgets import QApplication
+
+    _app = QApplication.instance() or QApplication([])
+    from mihome.ui import tooltip as _tt
+    from mihome.ui.main_window import MainWindow as _MW
+
+    toasts: list[tuple[str, int]] = []
+    notices: list[tuple[str, bool]] = []
+    tips: list[str] = []
+
+    class _Tray:
+        def show_message(self, title: str, body: str, msecs: int = 4000, *,
+                         warning: bool = False) -> bool:
+            notices.append((body, warning))
+            return True
+
+        def set_status(self, text: str) -> None:
+            tips.append(text)
+
+    class _Status:
+        @staticmethod
+        def text() -> str:
+            return "在线"
+
+    class _Win:
+        palette_ref = None
+        tray = _Tray()
+        status = _Status()
+
+        def __init__(self, visible: bool) -> None:
+            self.visible = visible
+
+        def isVisible(self) -> bool:  # noqa: N802 - Qt 命名
+            return self.visible
+
+    def reset() -> None:
+        toasts.clear()
+        notices.clear()
+        tips.clear()
+
+    orig_toast = _tt.toast_top
+    _tt.toast_top = lambda *a, **k: toasts.append((a[1], k.get("kind")))  # type: ignore[assignment]
+    try:
+        reset()
+        _MW._scene_request_done(_Win(True), "回家", True, "")
+        check("成功 + 窗口可见：弹轻提示", len(toasts) == 1 and toasts[0][0] == "已执行「回家」",
+              str(toasts))
+        check("成功 + 窗口可见：**不发**系统通知", notices == [], str(notices))
+        check("成功 + 窗口可见：轻提示是 OK 档", bool(toasts) and toasts[0][1] == _tt.TOAST_OK)
+
+        reset()
+        _MW._scene_request_done(_Win(False), "回家", True, "")
+        check("成功 + 窗口不可见：仍不发系统通知", notices == [], str(notices))
+        check("成功 + 窗口不可见：退回托盘 tooltip", tips == ["已执行「回家」"], str(tips))
+
+        reset()
+        _MW._scene_request_done(_Win(True), "回家", False, "场景不存在")
+        check("失败 + 窗口可见：发系统通知",
+              [n for n in notices if n[1]] == [("场景执行失败「回家」 · 场景不存在", True)],
+              str(notices))
+        check("失败 + 窗口可见：带原因", notices and "场景不存在" in notices[0][0])
+        check("失败 + 窗口可见：轻提示是 FAIL 档",
+              bool(toasts) and toasts[0][1] == _tt.TOAST_FAIL)
+
+        reset()
+        _MW._scene_request_done(_Win(False), "回家", False, "未登录")
+        check("失败 + 窗口不可见：系统通知是唯一通道", len(notices) == 1, str(notices))
+        check("失败 + 窗口不可见：不弹看不见的轻提示", toasts == [], str(toasts))
+    finally:
+        _tt.toast_top = orig_toast  # type: ignore[assignment]
+
+    # -- 8) 接线 ----------------------------------------------------------
     # 不建窗口（那要联网刷拓扑），只确认信号 / 入口 / 启动分支真的连上了：
     # 这类"拼错一个名字就整条路不通"的地方，比逻辑更容易坏。
-    print("\n7) 接线", flush=True)
+    print("\n8) 接线", flush=True)
     from mihome.ui.main_window import MainWindow
     from mihome.ui.wall import WallView
 
