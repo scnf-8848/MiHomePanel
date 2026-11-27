@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import inspect
 import os
 import sys
 import tempfile
@@ -26,6 +27,7 @@ from mihome.core.prefs import (  # noqa: E402
     Prefs,
 )
 from mihome.ui.detail import DetailDialog  # noqa: E402
+from mihome.ui.main_window import MainWindow  # noqa: E402
 from mihome.ui.settings import SettingsDialog  # noqa: E402
 
 OK = 0
@@ -106,6 +108,18 @@ def main() -> None:
     # 详情页已无旧预热方法（防止有人把进程级预热又加回来）
     check("无旧 _prefetch_camera", hasattr(DetailDialog, "_prefetch_camera"), False)
     check("有 _auto_start_camera", callable(getattr(DetailDialog, "_auto_start_camera", None)), True)
+
+    # 进程级预热：启动时把 go2rtc 拉起来（只登记源，不取流）。2026-11-28 加，
+    # 配合自建 go2rtc 的换票缓存补丁，把"进程启动 + 云端换票"挪出点击后的关键路径。
+    warm = getattr(MainWindow, "_warm_camera_service", None)
+    check("主窗口有进程级预热", callable(warm), True)
+    src = inspect.getsource(MainWindow)
+    check("加载完就预热", "_warm_camera_service()" in src, True)
+    if callable(warm):
+        body = inspect.getsource(warm)
+        check("只跑一次（先查标志）", body.index("_camera_warmed:") < body.index("Thread("), True)
+        check("设备表空时不置位", body.index("if not nodes:") < body.index("_camera_warmed = True"), True)
+        check("用 prepare()，不取流", "prepare(" in body and ".open(" not in body, True)
 
     print(f"\n通过 {OK} 项，失败 {FAIL} 项")
     raise SystemExit(1 if FAIL else 0)

@@ -73,7 +73,7 @@ RTSP，加载态只写一句「加载中…」加一条流动的细条——**�
 | 阶段 | 官方构建 | 开播补丁版 | 能不能省 |
 |---|---|---|---|
 | go2rtc 子进程启动到 `/api` 就绪 | 0.85 s | 0.85 s | 打开详情页就在后台起，点播放时不用等 |
-| 云端 `miss_get_vendor` 换票 | 0.65 s | 0.65 s | **go2rtc 每开一路都要调一次**，可以自己预取后并行 |
+| 云端 `miss_get_vendor` 换票 | 0.65 s | 0.65 s | **已省（2026-11-28）**：`go2rtc-vendor-cache.patch` 缓存 10 分钟 + 落盘 + 启动后后台预热 |
 | MISS 握手 + `probe` 到首个 RTP 包 | 0.55 s | 0.75 s | 补丁多一次 video start，多 0.2 s |
 | **等下一个 IDR** | **2.5–3.0 s** | **0** | 补丁把它消掉了，见下 |
 | 177–251 KB 的 IDR 传完 + 解码出帧 | ~1.0 s | ~0.7 s | 换子码流能小一截，但画质就没了 |
@@ -102,11 +102,12 @@ RTSP，加载态只写一句「加载中…」加一条流动的细条——**�
 .venv\Scripts\python.exe scripts\build_go2rtc.py
 ```
 
-这一版同时带**云台接口**（见下一节「云台」）。两个补丁是独立的：官方构建两个都没有，
-只打第一个就只有首帧优化。
+这一版同时带**云台接口**（见下一节「云台」）和**换票缓存**（见下下节）。三个补丁互相
+独立：官方构建三个都没有，只打第一个就只有"不等 GOP"这一项。
 
-- 取上游快照 `990f4de`（验证过的那个）→ `git apply` 两个补丁
-  （`go2rtc-keyframe.patch` 开播、`go2rtc-ptz.patch` 云台）
+- 取上游快照 `990f4de`（验证过的那个）→ `git apply` 三个补丁
+  （`go2rtc-keyframe.patch` 开播、`go2rtc-ptz.patch` 云台、
+  `go2rtc-vendor-cache.patch` 换票缓存）
   → 用 Go 1.27.3 编译（本机没有 Go 会自动下便携版到 `<data>/go/`，76 MB，只下一次）
   → 装到 `<data>/go2rtc/go2rtc.exe`
 - `git` 先找 PATH；找不到再自动用 GitHub Desktop 自带的
@@ -125,9 +126,35 @@ RTSP，加载态只写一句「加载中…」加一条流动的细条——**�
   想跟进新版本得重跑一遍（补丁与 `producer.go` 的 `Dial()` 一一对应，改动面很小）。
   上游哪天自己修了「probe 吃掉开播 IDR」，删掉补丁和这个脚本即可
 - 试过但**不行**的方案记在这里免得重走：把 probe 读到的包缓存起来在 `Start()` 里补发
-  （`Producer.cache`）。裸流里首包确实变成 IDR，但 Qt 端到端只到 4.7 秒且时灵时不灵——
-  补发是在 RTSP 还没 PLAY 完时写的，和建流竞争；而且老包的时间戳/POC 落后于追上来的活流，
-  ffmpeg 会直接跳过它继续等下一个 IDR
+  （`Producer.cache`，2026-11-13 试过一次，2026-11-28 深夜带调试输出又试了一次，
+  两轮结论一致）。**为什么不行**（第二次有实据）：热态下 `StartMedia` 之后先到的是上一轮
+  会话残留的包——probe 读到的"首个视频包"时间戳比同时刻音频包早 0.6–0.8 s，紧跟的是
+  `nal=1`（非关键帧）；补发出去 ffmpeg 报 `Error constructing the frame RPS` /
+  `Skipping invalid undecodable NALU`，只能等下一个 IDR。实测冷启 3.4–5.7 s、
+  热态 4.6–5.8 s（现有"停 150 ms 再起"是 3.0–3.6 / 2.4–2.6 s）。
+  也就是说 **stop→start 那 150 ms 是在强制摄像头从 IDR 重开一路，不是浪费**。
+
+### 换票缓存：把 0.7–1.0 s 的云端请求挪出关键路径
+
+`miss_get_vendor` 只是换一张几十秒内有效的票，但冷启一次要 **0.7–1.0 s**（TLS + token
+登录占大头）。`go2rtc-vendor-cache.patch` 做了三件事：
+
+1. 换票结果按 `did|host` 缓存 **10 分钟**（键里带 host：远程中继与局域网直连是两张不同
+   的票，混用拨不通）；
+2. **落盘**到 go2rtc 工作目录 `vendor-cache.json`（0600，与 `go2rtc.yaml` 同级）。
+   本程序会因"换取流源"重启 go2rtc，纯内存缓存在重启后清零，而恰恰是重启后那次开播
+   最需要它；
+3. 进程启动 0.5 s 后**后台把配置里每条 `xiaomi://` 源先换一遍**（只发 HTTPS，不拨号，
+   不占观看位）。拨号失败且用的是缓存票时丢掉该条，让重连走一次真实换票。
+
+配套的程序侧改动：`MainWindow._warm_camera_service()` 在设备表首次加载完就后台跑一次
+`camera_service().prepare()`（监控页用的同一个入口，只登记源），把 go2rtc 子进程的
+0.85 s 启动也从点击后的关键路径上挪走。
+
+实测（同一台 069a01、局域网、`measure_camera_coldstart.py` 口径）：程序启动 3 s 后再开
+同一台摄像头，首帧 **3.45 s → 2.61 s**；同一台设备再开一次 2.2–2.4 s。
+**剩下的 0.6–1.0 s 在 Qt 的 FFmpeg 播放器里**（首帧进 receiver 比上屏早这么多），
+要再压只能换播放栈，见 `docs/reference/camera-first-frame.md` §5。
 
 #### 补丁版 Release 与 `install_go2rtc.py --patched`
 

@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import threading
 import time
 from typing import Any
 
@@ -42,6 +43,7 @@ from PySide6.QtWidgets import (
 from .. import __version__
 from ..core import applog, climate as climate_mod, scene_shortcut, speaker
 from ..core.alerts import ERROR, TOAST_COOLDOWN, Alert, AlertPolicy
+from ..core.camera import shared as camera_service
 from ..core.api import Client, explain
 from ..core.automation import FAILED
 from ..core.automation.service import AutomationService
@@ -373,6 +375,9 @@ class MainWindow(QMainWindow):
         # 以及"启动补捞做过没有"（广播在启动窗口期会丢，加载完要补一次）。
         self._last_scene_drain = 0.0
         self._scene_boot_drained = False
+
+        # 摄像头：进程级预热做过没有（只做一次，见 ``_warm_camera_service``）
+        self._camera_warmed = False
 
         # 右侧：顶部指令条 + 卡片墙。指令条占的正是警告条浮层那条横带
         # （同一个 ALERT_MARGIN_X / ALERT_MARGIN_TOP + AlertBar.H），所以警告条
@@ -1374,6 +1379,11 @@ class MainWindow(QMainWindow):
         self._refresh_speakers()
         self.widget_panel.rebuild()
         self.store.poll()
+        # 设备表刚齐：把摄像头取流服务提前拉起来（**只登记源，不取流、不占观看位**）。
+        # 它省的是"第一次点开摄像头"那一段：go2rtc 子进程启动（约 0.85 s）不再算在
+        # 用户等待里，而它一起来就在后台把云端换票做好（自带补丁 go2rtc-vendor-cache，
+        # 票落盘，进程重启后照样命中），开播时只剩拨号 + 等一个 IDR。
+        self._warm_camera_service()
         # 设备表齐了，"本程序启动时"的规则才真的发得出设备动作（服务内部幂等，
         # 重登 / 重新加载不会再触发一次）。未登录时走不到这里，规则等下次启动。
         fire_start = getattr(self.automation, "fire_start_rules", None)
@@ -1385,6 +1395,34 @@ class MainWindow(QMainWindow):
         if not self._scene_boot_drained:
             self._scene_boot_drained = True
             QTimer.singleShot(0, lambda: self._drain_scene_requests())
+
+    def _warm_camera_service(self) -> None:
+        """把 go2rtc 子进程提前拉起来（只登记源，不取流、不占观看位）。
+
+        ``camera_service().prepare()`` 是监控页进页面时用的同一个入口：配置里挂上
+        ``xiaomi://`` 源，但 go2rtc 的 producer 是惰性的——没有消费者连 RTSP 就不
+        拨号、不建会话、不占观看位（2026-11-19 实测，``/api/streams`` 里 consumers
+        为 null、日志零 dial 行）。
+
+        为什么值得在启动时做：2026-11-28 掐表，程序启动 3 s 后再开同一台摄像头，
+        首帧 3.45 s；把 go2rtc 提前起来（并让它后台把云端换票做好）后 2.61 s。
+        真正省的是"进程启动 0.85 s + 换票 0.7 s"这两段，都从用户点击后的关键路径
+        上挪走了。只做一次，失败不影响任何功能（下次点开摄像头照旧现起）。
+        """
+        if self._camera_warmed:
+            return
+        nodes = [st.node for st in self.store.devices.values()]
+        if not nodes:
+            return  # 这一轮设备表还是空的（未登录 / 首次加载没回来），下次再试
+        self._camera_warmed = True
+
+        def job() -> None:
+            try:
+                camera_service().prepare(self.store.client, nodes)
+            except Exception as exc:  # noqa: BLE001 - 预热失败只影响首帧快慢
+                applog.log("camera", f"进程级预热失败：{exc}")
+
+        threading.Thread(target=job, name="camera-warm", daemon=True).start()
 
     # -- 顶栏音箱指令条 --------------------------------------------------
     def _refresh_speakers(self) -> None:

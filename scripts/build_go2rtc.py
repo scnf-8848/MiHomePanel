@@ -12,7 +12,13 @@
    （摄像头每次 video start 都从 IDR 开头），首帧降到 1.85–3.15 秒
    （均值 2.18），抖动也几乎没了。
 
-2. **云台接口（``/api/xiaomi/ptz``）**：``chuangmi.camera.069a01`` 这类机型的
+2. **换票缓存 + 启动预热（``go2rtc-vendor-cache.patch``）**：``miss_get_vendor``
+   一次 0.7–1.0 s（冷启含 TLS + token 登录），而它只是换一张几十秒内有效的票。
+   补丁把它按 ``did|host`` 缓存 10 分钟、落盘到工作目录（进程因"换取流源"重启后
+   仍然命中），并在启动 0.5 s 后后台把配置里每条 ``xiaomi://`` 源先换一遍。
+   实测：程序启动 3 s 后再开同一台摄像头，首帧 3.45 s → 2.61 s。
+
+3. **云台接口（``/api/xiaomi/ptz``）**：``chuangmi.camera.069a01`` 这类机型的
    MIoT 规格里**没有 ptz 服务**，云台只能走和取流同一条 MISS 连接的 ``0x112``
    指令。上游 ``pkg/xiaomi/miss/client.go`` 只定义了常量（``cmdMotorReq``），
    没实现、也没有 API 入口。``go2rtc-ptz.patch`` 补上 ``Client.Motor()``、
@@ -62,11 +68,13 @@ REF = "990f4de"
 PATCHES = (
     ROOT / "scripts" / "patches" / "go2rtc-keyframe.patch",
     ROOT / "scripts" / "patches" / "go2rtc-ptz.patch",
+    ROOT / "scripts" / "patches" / "go2rtc-vendor-cache.patch",
 )
 #: 每个补丁打完后必须能在源码里看到的关键点（防止"补丁说成功、其实没生效"）
 PATCH_MARKS = {
     "go2rtc-keyframe.patch": ("pkg/xiaomi/miss/producer.go", "StopMedia()"),
     "go2rtc-ptz.patch": ("pkg/xiaomi/miss/client.go", "func (c *Client) Motor("),
+    "go2rtc-vendor-cache.patch": ("internal/xiaomi/xiaomi.go", "warmAllTickets"),
 }
 GO_VERSION = "1.27.3"
 UA = "MiHomePanel-builder"

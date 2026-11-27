@@ -1,0 +1,184 @@
+diff --git a/internal/xiaomi/xiaomi.go b/internal/xiaomi/xiaomi.go
+index 1e57842..4449a0d 100644
+--- a/internal/xiaomi/xiaomi.go
++++ b/internal/xiaomi/xiaomi.go
+@@ -7,8 +7,10 @@ import (
+ 	"fmt"
+ 	"net/http"
+ 	"net/url"
++	"os"
+ 	"strings"
+ 	"sync"
++	"time"
+ 
+ 	"github.com/AlexxIT/go2rtc/internal/api"
+ 	"github.com/AlexxIT/go2rtc/internal/app"
+@@ -28,6 +30,7 @@ func Init() {
+ 	tokens = v.Cfg
+ 
+ 	log = app.GetLogger("xiaomi")
++	loadVendorCache()
+ 
+ 	streams.HandleFunc("xiaomi", func(rawURL string) (core.Producer, error) {
+ 		u, err := url.Parse(rawURL)
+@@ -35,18 +38,33 @@ func Init() {
+ 			return nil, err
+ 		}
+ 
++		cached := false
+ 		if u.User != nil {
+-			rawURL, err = getCameraURL(u)
+-			if err != nil {
++			if raw, ok := cachedCameraURL(u); ok {
++				rawURL, cached = raw, true
++			} else if rawURL, err = getCameraURL(u); err != nil {
+ 				return nil, err
++			} else {
++				storeCameraURL(u, rawURL)
+ 			}
+ 		}
+ 
+ 		log.Debug().Msgf("xiaomi: dial %s", rawURL)
+ 
+-		return xiaomi.Dial(rawURL)
++		prod, err := xiaomi.Dial(rawURL)
++		if err != nil && cached {
++			// 缓存里的票据被拒（过期 / 已用过）：丢掉它，让 go2rtc 的重连
++			// 走一次真实的换票，而不是拿着同一张坏票反复失败。
++			dropCameraURL(u)
++		}
++		return prod, err
+ 	})
+ 
++	// 进程一起来就在后台把这批摄像头的票换好（不拨号、不占观看位）。
++	// 换票一次 0.7–1.0 s，大头是 TLS + token 登录；等用户点开摄像头时再换，
++	// 这段时间就白等了。这里只发一个 HTTPS 请求，设备侧零感知。
++	time.AfterFunc(500*time.Millisecond, warmAllTickets)
++
+ 	api.HandleFunc("api/xiaomi", apiXiaomi)
+ }
+ 
+@@ -90,6 +108,123 @@ func cloudUserRequest(user *url.Userinfo, apiURL, params string) ([]byte, error)
+ 	return cloudRequest(userID, region, apiURL, params)
+ }
+ 
++// 换票缓存：miss_get_vendor 一次 0.7–1.0 s（冷启时含 TLS + token 登录），
++// 同一张票几十秒内完全够用。键里带 host——远程中继和局域网直连是两条不同的
++// 换票结果，混用会拨不通。
++//
++// 落盘（工作目录下 vendor-cache.json，0600）而不是只放内存，是因为本程序的
++// go2rtc 会因"换取流源"重启：内存缓存在重启后清零，而恰恰是重启后那次开播
++// 最需要这张票。文件里含 sign / 临时密钥，属凭据，权限与 go2rtc.yaml 同级。
++type vendorTicket struct {
++	URL string `json:"url"`
++	Exp int64  `json:"exp"` // Unix 秒
++}
++
++const (
++	vendorTTL  = 10 * time.Minute
++	vendorFile = "vendor-cache.json"
++)
++
++var (
++	vendorMu    sync.Mutex
++	vendorCache = map[string]vendorTicket{}
++)
++
++func vendorKey(u *url.URL) string {
++	return u.Query().Get("did") + "|" + u.Host
++}
++
++func loadVendorCache() {
++	data, err := os.ReadFile(vendorFile)
++	if err != nil {
++		return
++	}
++	var saved map[string]vendorTicket
++	if err = json.Unmarshal(data, &saved); err != nil {
++		return
++	}
++	now := time.Now().Unix()
++	vendorMu.Lock()
++	for key, ticket := range saved {
++		if ticket.Exp > now {
++			vendorCache[key] = ticket
++		}
++	}
++	vendorMu.Unlock()
++}
++
++// saveVendorCache 由调用方持锁调用
++func saveVendorCache() {
++	data, err := json.Marshal(vendorCache)
++	if err != nil {
++		return
++	}
++	if err = os.WriteFile(vendorFile, data, 0o600); err != nil {
++		log.Debug().Err(err).Msg("xiaomi: save vendor cache")
++	}
++}
++
++func cachedCameraURL(u *url.URL) (string, bool) {
++	vendorMu.Lock()
++	defer vendorMu.Unlock()
++	key := vendorKey(u)
++	ticket, ok := vendorCache[key]
++	if !ok {
++		return "", false
++	}
++	if time.Now().Unix() > ticket.Exp {
++		delete(vendorCache, key)
++		saveVendorCache()
++		return "", false
++	}
++	return ticket.URL, true
++}
++
++func storeCameraURL(u *url.URL, raw string) {
++	vendorMu.Lock()
++	vendorCache[vendorKey(u)] = vendorTicket{
++		URL: raw,
++		Exp: time.Now().Add(vendorTTL).Unix(),
++	}
++	saveVendorCache()
++	vendorMu.Unlock()
++}
++
++func dropCameraURL(u *url.URL) {
++	vendorMu.Lock()
++	delete(vendorCache, vendorKey(u))
++	saveVendorCache()
++	vendorMu.Unlock()
++}
++
++// warmAllTickets 把配置里每条 xiaomi 源都换一次票（串行即可：一台 0.7 s，
++// 三台约 2 s，都在后台）。失败不重试——真正拨号时还会再换一次。
++func warmAllTickets() {
++	for _, sources := range streams.GetAllSources() {
++		for _, raw := range sources {
++			if !strings.HasPrefix(raw, "xiaomi://") {
++				continue
++			}
++			u, err := url.Parse(raw)
++			if err != nil || u.User == nil {
++				continue
++			}
++			if _, ok := cachedCameraURL(u); ok {
++				continue
++			}
++			t0 := time.Now()
++			rawURL, err := getCameraURL(u)
++			if err != nil {
++				log.Warn().Err(err).Str("url", raw).Msg("xiaomi: warm ticket")
++				continue
++			}
++			storeCameraURL(u, rawURL)
++			log.Debug().Msgf("xiaomi: warm ticket %s %d ms",
++				vendorKey(u), time.Since(t0).Milliseconds())
++		}
++	}
++}
++
+ func getCameraURL(url *url.URL) (string, error) {
+ 	model := url.Query().Get("model")
+ 
