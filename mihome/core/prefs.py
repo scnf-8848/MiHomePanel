@@ -173,6 +173,33 @@ def widget_layout_size(layout: str) -> tuple[int, int]:
     return int(rows), int(cols)
 
 
+#: 槽位里"快捷场景"的前缀。设备槽位直接存 did（米家 did 是纯数字串），场景槽位
+#: 存 ``scene:<home_id>:<scene_id>``——``scene_id`` 只在家庭内唯一，所以 ``home_id``
+#: 必须随行。用前缀而不是另开一张表，是因为槽位表就是"哪一格放什么"的唯一出处，
+#: 拆成两张表迟早对不上（删场景 / 换布局 / 截断三处都要同步维护）。
+WIDGET_SCENE_PREFIX = "scene:"
+
+
+def widget_slot_is_scene(slot: str) -> bool:
+    return str(slot).startswith(WIDGET_SCENE_PREFIX)
+
+
+def widget_scene_slot(home_id: str, scene_id: str) -> str:
+    """场景槽位的规范写法。"""
+    return f"{WIDGET_SCENE_PREFIX}{home_id}:{scene_id}"
+
+
+def parse_widget_scene_slot(slot: str) -> tuple[str, str] | None:
+    """``scene:<home>:<scene_id>`` → ``(home, scene_id)``；不是场景槽位给 ``None``。"""
+    raw = str(slot)
+    if not raw.startswith(WIDGET_SCENE_PREFIX):
+        return None
+    home, sep, scene_id = raw[len(WIDGET_SCENE_PREFIX):].partition(":")
+    if not sep or not home or not scene_id:
+        return None
+    return home, scene_id
+
+
 def _clean_slots(slots: Iterable[Any], cells: int) -> list[str]:
     """规范化槽位表：只留字符串、同一台设备只留第一次出现、按格数补齐 / 截断。"""
     out: list[str] = [""] * cells
@@ -1005,8 +1032,15 @@ class Prefs:
         return widget_layout_size(self.widget_layout)[1]
 
     def widget_dids(self) -> list[str]:
-        """槽位表里真正放了设备的 did（按行优先顺序，跳过空格）。"""
-        return [d for d in self.widget_slots if d]
+        """槽位表里真正放了**设备**的 did（按行优先顺序，跳过空格与场景槽位）。"""
+        return [
+            d for d in self.widget_slots
+            if d and not widget_slot_is_scene(d)
+        ]
+
+    def widget_scene_slots(self) -> list[str]:
+        """槽位表里的场景槽位（原样返回，解析用 ``parse_widget_scene_slot``）。"""
+        return [s for s in self.widget_slots if widget_slot_is_scene(s)]
 
     def set_widget_layout(self, layout: str) -> bool:
         """换宫格布局。按行优先保留现有设备：新格数少了就截掉尾部，多了补空槽。"""
@@ -1051,7 +1085,11 @@ class Prefs:
         return self.set_widget_slot(index, "")
 
     def remove_widget(self, did: str) -> bool:
-        """按 did 清槽（卡片右键「从挂件移除」/ 设备被删时用）。"""
+        """按槽位值清格（卡片右键「从挂件移除」/ 设备或场景被删时用）。
+
+        参数可以是设备 did，也可以是 ``scene:<home>:<scene_id>``——这里只做
+        字符串相等比较，不关心它是哪种卡。
+        """
         if did not in self.widget_slots:
             return False
         return self.set_widget_slots(["" if s == did else s for s in self.widget_slots])

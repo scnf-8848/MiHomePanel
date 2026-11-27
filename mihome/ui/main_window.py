@@ -1837,9 +1837,13 @@ class MainWindow(QMainWindow):
         if after != before:
             self.widget_panel.rebuild()
 
-    def _on_widget_remove(self, did: str) -> None:
-        """卡片右键的「从挂件移除」：清掉占着这台设备的槽位，显隐不变。"""
-        if self.prefs.remove_widget(did):
+    def _on_widget_remove(self, slot: str) -> None:
+        """卡片右键的「从挂件移除」：清掉这一格，显隐不变。
+
+        ``slot`` 可能是设备 did，也可能是 ``scene:<home>:<scene_id>``——
+        ``prefs.remove_widget`` 按值比槽位，两种都清得掉，不要在这里解析。
+        """
+        if self.prefs.remove_widget(slot):
             self.widget_panel.rebuild()
 
     def _on_widget_open_consumables(self) -> None:

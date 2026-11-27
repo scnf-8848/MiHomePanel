@@ -44,7 +44,13 @@ from .chrome import (
 from .combo import Combo
 from .tree import ReorderTree
 from .widgets import draw_text
-from ..core.prefs import WIDGET_COLS_MAX, WIDGET_ROWS_MAX, widget_layout_size
+from ..core.prefs import (
+    WIDGET_COLS_MAX,
+    WIDGET_ROWS_MAX,
+    parse_widget_scene_slot,
+    widget_layout_size,
+    widget_scene_slot,
+)
 
 #: 按钮外框高度，和确认框 / 设置页对齐（见 ``confirm.BTN_H`` 的说明：别用 padding 算）
 BTN_H = 32
@@ -157,23 +163,51 @@ class SlotGrid(QWidget):
         p.setRenderHint(QPainter.Antialiasing, True)
         pal = self._p
         for index in range(self.rows * self.cols):
-            rect = self.cell_rect(index)
-            did = self.slots[index] if index < len(self.slots) else ""
-            st = self.store.devices.get(did) if did else None
-            if st is None:
-                self._paint_empty_cell(p, rect, index, pal)
-            else:
-                self._paint_device_cell(p, rect, index, st, pal)
+            slot = self.slots[index] if index < len(self.slots) else ""
+            self._paint_slot(p, self.cell_rect(index), index, slot, pal)
         if self._dragging and 0 <= self._press_index < len(self.slots):
-            did = self.slots[self._press_index]
-            st = self.store.devices.get(did) if did else None
-            if st is not None:
+            slot = self.slots[self._press_index]
+            if slot:
                 ghost = self.cell_rect(self._press_index)
-                ghost.moveTo(self._drag_pos + QPoint(CELL_W // 2, CELL_H // 2) * 0)
+                ghost.moveTo(self._drag_pos)
                 p.setOpacity(0.85)
-                self._paint_device_cell(p, ghost, -1, st, pal, ghost_mode=True)
+                self._paint_slot(p, ghost, -1, slot, pal, ghost_mode=True)
                 p.setOpacity(1.0)
         p.end()
+
+    def _paint_slot(self, p: QPainter, rect: QRect, index: int, slot: str,
+                    pal: theme.Palette, *, ghost_mode: bool = False) -> None:
+        """按槽位内容选画法：空槽 / 设备卡 / 场景卡。
+
+        槽位里可能是 ``scene:<home>:<scene_id>``——宫格和挂件用的是同一张槽位表，
+        所以这里也必须认得它，否则管理窗会把摆好的场景显示成空格。
+        """
+        parsed = parse_widget_scene_slot(slot) if slot else None
+        if parsed is not None:
+            self._paint_scene_cell(p, rect, index, parsed, pal, ghost_mode=ghost_mode)
+            return
+        st = self.store.devices.get(slot) if slot else None
+        if st is None:
+            if not ghost_mode:
+                self._paint_empty_cell(p, rect, index, pal)
+            return
+        self._paint_device_cell(p, rect, index, st, pal, ghost_mode=ghost_mode)
+
+    def _scene_of(self, home_id: str, scene_id: str) -> dict | None:
+        table = getattr(self.store, "scenes_by_home", None) or {}
+        for scene in table.get(home_id) or []:
+            if str(scene.get("scene_id") or "") == scene_id:
+                return scene
+        return None
+
+    def _home_label(self, home_id: str) -> str:
+        getter = getattr(self.store, "home_label", None)
+        if getter is None:
+            return ""
+        try:
+            return str(getter(home_id) or "")
+        except Exception:  # noqa: BLE001
+            return ""
 
     def _paint_empty_cell(self, p: QPainter, rect: QRect, index: int,
                           pal: theme.Palette) -> None:
@@ -183,7 +217,7 @@ class SlotGrid(QWidget):
         p.setBrush(QColor(theme.blend(pal.bg, pal.text, 0.02)))
         p.drawRoundedRect(QRectF(rect).adjusted(0.5, 0.5, -0.5, -0.5), CELL_RADIUS, CELL_RADIUS)
         draw_text(
-            p, rect, "＋ 添加设备", size=12,
+            p, rect, "＋ 添加设备或场景", size=12,
             color=pal.accent if hot else pal.text_mute,
             align=Qt.AlignCenter,
         )
@@ -211,6 +245,34 @@ class SlotGrid(QWidget):
             cx, cy = rect.right() - 16, rect.y() + 16
             p.drawLine(cx - 4, cy - 4, cx + 4, cy + 4)
             p.drawLine(cx - 4, cy + 4, cx + 4, cy - 4)
+
+    def _paint_scene_cell(self, p: QPainter, rect: QRect, index, parsed,
+                          pal: theme.Palette, *, ghost_mode: bool = False) -> None:
+        """场景格：标题是场景名，副标题「家庭 · 快捷场景」。
+
+        场景在 App 里被删掉时槽位还在——这里照实写「场景已删除」，别画成空槽：
+        空槽意味着"这一格没放东西"，用户会以为是被程序偷偷清掉了。
+        """
+        home_id, scene_id = parsed
+        scene = self._scene_of(home_id, scene_id)
+        name = str((scene or {}).get("name") or "")
+        home_label = self._home_label(home_id)
+        hot = index == self._hover and not ghost_mode
+        p.setPen(QPen(QColor(pal.border), 1))
+        p.setBrush(QColor(theme.blend(pal.card, pal.text, 0.05)))
+        p.drawRoundedRect(QRectF(rect).adjusted(0.5, 0.5, -0.5, -0.5), CELL_RADIUS, CELL_RADIUS)
+        title = QRect(rect.x() + 12, rect.y() + 10, rect.width() - 40, 18)
+        draw_text(p, title, name or "场景已删除", size=13,
+                  color=pal.text if name else pal.text_mute, weight=QFont.DemiBold)
+        sub = f"{home_label} · 快捷场景" if name else f"{home_label} · 快捷场景已删除"
+        draw_text(p, QRect(rect.x() + 12, rect.y() + 32, rect.width() - 24, 16),
+                  sub, size=11, color=pal.text_mute)
+        if ghost_mode or not hot:
+            return
+        p.setPen(QPen(QColor(pal.text_mute), 1.3))
+        cx, cy = rect.right() - 16, rect.y() + 16
+        p.drawLine(cx - 4, cy - 4, cx + 4, cy + 4)
+        p.drawLine(cx - 4, cy + 4, cx + 4, cy - 4)
 
     # -- 交互 ------------------------------------------------------------
     def mousePressEvent(self, event) -> None:  # noqa: N802
@@ -277,7 +339,12 @@ class SlotGrid(QWidget):
 
 
 class _DevicePicker(QDialog):
-    """选一台设备：家庭 → 房间 → 设备。挂件跨家庭，所以从家庭层开始。"""
+    """选一张卡放哪格：家庭 → （快捷场景 / 房间 → 设备）。
+
+    挂件跨家庭，所以从家庭层开始。场景不属于任何房间，挂在家庭下面单独一个
+    「快捷场景」分组；只列 ``enable`` 为真的——停用的场景点下去必然失败，
+    摆到挂件上只会变成一颗按了没反应的按钮。
+    """
 
     def __init__(self, store, used: set[str], palette: theme.Palette,
                  parent: QWidget | None = None) -> None:
@@ -285,7 +352,7 @@ class _DevicePicker(QDialog):
         self.store = store
         self._p = palette
         self._chosen = ""
-        self.setWindowTitle("添加设备")
+        self.setWindowTitle("添加设备或场景")
         self.setWindowFlags(Qt.Dialog | Qt.FramelessWindowHint)
         self._frame = WindowFrame(
             self,
@@ -302,7 +369,7 @@ class _DevicePicker(QDialog):
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
         outer.addWidget(
-            TitleBar("添加设备", palette, buttons=("close",), variant="dialog",
+            TitleBar("添加设备或场景", palette, buttons=("close",), variant="dialog",
                      frame=self._frame)
         )
         body = QWidget()
@@ -340,6 +407,23 @@ class _DevicePicker(QDialog):
         self._activate_size()
         tab_focus_only(self)
 
+    def _scenes(self, home_id: str) -> list[dict]:
+        """这个家庭可执行的场景（含被隐藏的，滤掉停用的）。
+
+        走 ``Store.scenes_for`` 而不是直接读 ``scenes_by_home``：前者已经按用户
+        排序过，管理窗里的顺序和首页胶囊一致。
+        """
+        getter = getattr(self.store, "scenes_for", None)
+        if getter is not None:
+            try:
+                items = list(getter(home_id, include_hidden=True))
+            except Exception:  # noqa: BLE001 —— 家庭表还没加载完
+                items = []
+        else:
+            table = getattr(self.store, "scenes_by_home", None) or {}
+            items = list(table.get(home_id) or [])
+        return [s for s in items if s.get("enable", True)]
+
     def _fill(self, used: set[str]) -> None:
         for home in self.store.homes():
             home_item = self.tree.add_row(
@@ -347,6 +431,24 @@ class _DevicePicker(QDialog):
                 {"kind": "home", "home": home.id, "room": "", "id": home.id},
             )
             home_item.setExpanded(True)
+            scenes = [s for s in self._scenes(home.id) if str(s.get("scene_id") or "")]
+            if scenes:
+                scene_group = self.tree.add_row(
+                    home_item, "快捷场景",
+                    {"kind": "scene_group", "home": home.id, "room": "", "id": ""},
+                    suffix=f"{len(scenes)} 个",
+                )
+                scene_group.setExpanded(True)
+                for scene in scenes:
+                    self.tree.add_row(
+                        scene_group, str(scene.get("name") or "未命名场景"),
+                        {
+                            "kind": "scene",
+                            "home": home.id,
+                            "room": "",
+                            "id": str(scene.get("scene_id") or ""),
+                        },
+                    )
             for room_id, room_name in self.store.room_entries(home.id):
                 states = [st for st in self.store.device_states(home.id, room_id)
                           if st.did not in used]
@@ -367,9 +469,17 @@ class _DevicePicker(QDialog):
 
     def _on_click(self, item: QTreeWidgetItem, _col: int) -> None:
         data = item.data(0, Qt.UserRole) or {}
-        if data.get("kind") == "device":
+        kind = data.get("kind")
+        if kind == "device":
             self._chosen = str(data.get("id") or "")
-            self.btn_ok.setEnabled(bool(self._chosen))
+        elif kind == "scene":
+            self._chosen = widget_scene_slot(
+                str(data.get("home") or ""), str(data.get("id") or "")
+            )
+        else:
+            # 家庭 / 分组 / 房间行不改变已选项：点开分组不该把选中的设备清掉
+            return
+        self.btn_ok.setEnabled(bool(self._chosen))
 
     def _on_double(self, item: QTreeWidgetItem, _col: int) -> None:
         self._on_click(item, 0)
@@ -458,7 +568,7 @@ class WidgetManagerDialog(QDialog):
         self.grid.changed.connect(self._activate_size)
         col.addWidget(self.grid)
 
-        hint = QLabel("点空格添加设备；两格之间拖动可以交换位置。空着的格子会原样留在挂件上。")
+        hint = QLabel("点空格添加设备或场景；两格之间拖动可以交换位置。空着的格子会原样留在挂件上。")
         hint.setObjectName("Hint")
         hint.setWordWrap(True)
         col.addWidget(hint)
@@ -493,13 +603,13 @@ class WidgetManagerDialog(QDialog):
         dlg = _DevicePicker(self.store, used, self._p, self)
         if exec_with_dim_click(dlg) != QDialog.Accepted:
             return
-        did = dlg.chosen()
-        if not did:
+        slot = dlg.chosen()
+        if not slot:
             return
         cells = self.grid.cells()
-        if did in cells:
-            cells[cells.index(did)] = ""
-        cells[index] = did
+        if slot in cells:
+            cells[cells.index(slot)] = ""
+        cells[index] = slot
         self.grid.set_grid(self.grid.rows, self.grid.cols, cells)
         self._activate_size()
 

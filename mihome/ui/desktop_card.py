@@ -9,7 +9,7 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import QPoint, QPointF, QRect, QRectF, Qt, Signal
+from PySide6.QtCore import QPoint, QPointF, QRect, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import QBrush, QColor, QFont, QPainter, QPen
 from PySide6.QtWidgets import QWidget
 
@@ -26,6 +26,8 @@ PAD = 10
 #: 电源键直径（比主界面的 32 小一号，否则 56 高塞不下两行字）
 POWER_D = 26
 RADIUS = 10
+#: 场景卡执行结果在副标题上停留多久（之后换回家庭名）
+FLASH_MS = 2600
 
 
 def card_subtitle(st: DeviceState) -> str:
@@ -212,4 +214,163 @@ class WidgetCard(QWidget):
 
     def contextMenuEvent(self, event) -> None:  # noqa: N802
         self.menu_requested.emit(self.state.did, event.globalPos())
+        event.accept()
+
+
+class SceneCard(QWidget):
+    """挂件上的快捷场景卡：158×56，标题是场景名，右侧圆里画一个右箭头。
+
+    和设备卡的差别只在两处：场景没有在线 / 开关这些状态（它是一次性动作），
+    右边那颗圆里的字形从电源换成右箭头（用户 2026-11-27 定）。点击**整张卡**
+    就执行——场景卡摆上挂件就是为了点，再要求"必须点中箭头"只会让人点空。
+
+    执行结果就地显示在副标题上（``flash()``，2.6 s 后换回家庭名）：用户在看着
+    挂件，不需要再弹一条系统通知，也不必把主窗口拉出来。
+    """
+
+    run_requested = Signal()
+    menu_requested = Signal(QPoint)  # 全局坐标
+
+    def __init__(self, name: str, home_label: str, palette: theme.Palette,
+                 parent=None) -> None:
+        super().__init__(parent)
+        self.name = name
+        self.home_label = home_label
+        self._pal = palette
+        self._hover = False
+        self._pressed = False
+        self._press_pos: QPoint | None = None
+        self._flash = ""
+        self._flash_ok: bool | None = True
+        self._flash_timer = QTimer(self)
+        self._flash_timer.setSingleShot(True)
+        self._flash_timer.timeout.connect(self._end_flash)
+        self.setFixedSize(CARD_W, CARD_H)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setAttribute(Qt.WA_Hover, True)
+
+    # -- 外部接口 --------------------------------------------------------
+    def set_palette(self, palette: theme.Palette) -> None:
+        self._pal = palette
+        self.update()
+
+    def set_text(self, name: str, home_label: str) -> None:
+        self.name = name
+        self.home_label = home_label
+        self.update()
+
+    def flash(self, text: str, ok: bool | None = True) -> None:
+        """把结果临时顶到副标题上；下一次执行会重新计时。
+
+        ``ok=None`` 表示"进行中"——用中性色，不要一上来就染成成功色。
+        """
+        self._flash = text
+        self._flash_ok = ok
+        self._flash_timer.start(FLASH_MS)
+        self.update()
+
+    def _end_flash(self) -> None:
+        self._flash = ""
+        self.update()
+
+    # -- 绘制 ------------------------------------------------------------
+    def _arrow_rect(self) -> QRect:
+        return QRect(CARD_W - PAD - POWER_D, (CARD_H - POWER_D) // 2, POWER_D, POWER_D)
+
+    def paintEvent(self, _event) -> None:  # noqa: N802
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        pal = self._pal
+        base = pal.card
+        if self._hover or self._pressed:
+            base = theme.card_hover_color(base, pal)
+        p.setPen(Qt.NoPen)
+        p.setBrush(theme.card_fill(base, pal))
+        p.drawRoundedRect(QRectF(0, 0, CARD_W, CARD_H), RADIUS, RADIUS)
+
+        title_w = CARD_W - PAD * 2 - (POWER_D + 8)
+        draw_text(
+            p,
+            QRect(PAD, PAD, title_w, 20),
+            self.name,
+            size=13,
+            color=pal.text,
+            weight=QFont.DemiBold,
+        )
+        if self._flash:
+            sub = self._flash
+            sub_color = (
+                pal.text_soft if self._flash_ok is None
+                else pal.accent if self._flash_ok else theme.DANGER
+            )
+        else:
+            sub, sub_color = self.home_label or "快捷场景", pal.text_soft
+        draw_text(
+            p,
+            QRect(PAD, PAD + 22, CARD_W - PAD * 2, 16),
+            sub,
+            size=11,
+            color=sub_color,
+        )
+        self._paint_arrow(p)
+        p.end()
+
+    def _paint_arrow(self, p: QPainter) -> None:
+        """右箭头（›）：一个中性圆 + 一笔折线，圆心与设备卡的电源键完全对齐。
+
+        圆底只在悬停 / 按下时上主题色——常驻主色会让整排卡片都在喊"点我"，
+        和设备卡的关态保持同一档安静。
+        """
+        pal = self._pal
+        hot = self._hover or self._pressed
+        rect = QRectF(self._arrow_rect())
+        p.setPen(Qt.NoPen)
+        p.setBrush(
+            QBrush(QColor(pal.accent)) if hot
+            else QBrush(QColor(theme.blend(pal.card, pal.text, 0.08)))
+        )
+        p.drawEllipse(rect)
+        c = rect.center()
+        ink = QColor("#FFFFFF" if hot else pal.text_soft)
+        p.setPen(QPen(ink, 1.7, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+        p.setBrush(Qt.NoBrush)
+        dx, dy = rect.width() * 0.16, rect.width() * 0.21
+        p.drawLine(QPointF(c.x() - dx, c.y() - dy), QPointF(c.x() + dx * 0.7, c.y()))
+        p.drawLine(QPointF(c.x() + dx * 0.7, c.y()), QPointF(c.x() - dx, c.y() + dy))
+
+    # -- 交互 ------------------------------------------------------------
+    def enterEvent(self, event) -> None:  # noqa: N802
+        self._hover = True
+        self.update()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:  # noqa: N802
+        self._hover = False
+        self.update()
+        super().leaveEvent(event)
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802
+        if event.button() != Qt.LeftButton:
+            super().mousePressEvent(event)
+            return
+        self._press_pos = event.position().toPoint()
+        self._pressed = True
+        self.update()
+        event.accept()
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802
+        if event.button() != Qt.LeftButton or self._press_pos is None:
+            super().mouseReleaseEvent(event)
+            return
+        pos = event.position().toPoint()
+        press = self._press_pos
+        self._press_pos = None
+        self._pressed = False
+        self.update()
+        if (pos - press).manhattanLength() <= 4 and self.rect().contains(pos):
+            self.run_requested.emit()
+        event.accept()
+
+    def contextMenuEvent(self, event) -> None:  # noqa: N802
+        self.menu_requested.emit(event.globalPos())
         event.accept()

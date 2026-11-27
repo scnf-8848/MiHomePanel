@@ -28,16 +28,20 @@ from mihome.core.prefs import (  # noqa: E402
     WIDGET_CELLS_MAX,
     WIDGET_LAYOUT_DEFAULT,
     Prefs,
+    parse_widget_scene_slot,
     widget_layout_size,
+    widget_scene_slot,
 )
 from mihome.ui import theme  # noqa: E402
 from mihome.ui.desktop_card import (  # noqa: E402
     CARD_W,
+    SceneCard,
     WidgetCard,
     card_subtitle,
     power_available,
 )
 from mihome.ui.desktop_widget import (  # noqa: E402
+    BTN_LOCK,
     BTN_OPEN,
     GAP,
     HEADER_H,
@@ -108,16 +112,33 @@ def make_state(
 
 
 class FakeStore:
-    def __init__(self, states: dict[str, object] | None = None) -> None:
+    def __init__(self, states: dict[str, object] | None = None,
+                 scenes: dict[str, list[dict]] | None = None,
+                 home_labels: dict[str, str] | None = None) -> None:
         self.devices = dict(states or {})
+        self.scenes_by_home = dict(scenes or {})
+        self.home_labels = dict(home_labels or {})
         self.polls = 0
         self.toggles: list[tuple[str, int, int]] = []
+        self.ran: list[tuple[str, str]] = []
+        self.run_ok = True
 
     def poll(self) -> None:
         self.polls += 1
 
     def toggle(self, did: str, siid: int, piid: int) -> None:
         self.toggles.append((did, siid, piid))
+
+    def home_label(self, home_id: str) -> str:
+        return self.home_labels.get(home_id, home_id)
+
+    def scenes_for(self, home_id: str, *, include_hidden: bool = False) -> list[dict]:
+        return list(self.scenes_by_home.get(home_id) or [])
+
+    def run_scene(self, scene_id: str, home_id: str = "", on_done=None) -> None:
+        self.ran.append((scene_id, home_id))
+        if on_done is not None:
+            on_done(self.run_ok, "" if self.run_ok else "云端拒绝了这次请求")
 
 
 class FakeZorder:
@@ -177,9 +198,11 @@ class FakeZorder:
         return True
 
 
-def make_widget(tmp: Path, states: dict[str, object] | None = None):
+def make_widget(tmp: Path, states: dict[str, object] | None = None,
+                scenes: dict[str, list[dict]] | None = None,
+                home_labels: dict[str, str] | None = None):
     prefs = Prefs(tmp / "prefs.json")
-    store = FakeStore(states)
+    store = FakeStore(states, scenes, home_labels)
     poll = PollDemandBoard("属性轮询", idle_ms=None)
     widget = DesktopWidget(store, prefs, theme.palette_for("porcelain", "light"), poll)
     return widget, store, prefs, poll
@@ -270,17 +293,53 @@ def test_prefs(tmp: Path) -> None:
         WIDGET_LAYOUT_DEFAULT))
     check("格子上限", WIDGET_CELLS_MAX, 36)
 
+    # 场景槽位：scene:<home>:<scene_id>。设备槽位仍是裸 did，两种可以混在一张表里
+    check("场景槽位写法", widget_scene_slot("h1", "s9"), "scene:h1:s9")
+    check("解析场景槽位", parse_widget_scene_slot("scene:h1:s9"), ("h1", "s9"))
+    check("设备槽位不解析成场景", parse_widget_scene_slot("1234567"), None)
+    check("缺 home 的槽位不认", parse_widget_scene_slot("scene::s9"), None)
+    check("缺 scene_id 的槽位不认", parse_widget_scene_slot("scene:h1:"), None)
+    prefs.set_widget_layout("1x3")
+    prefs.set_widget_slots(["d1", widget_scene_slot("h1", "s1"), ""])
+    check("混排后只数设备", prefs.widget_dids(), ["d1"])
+    check("场景槽位单列", prefs.widget_scene_slots(), ["scene:h1:s1"])
+    check("槽位原样保住场景", prefs.widget_slots[1], "scene:h1:s1")
+
+
+def _items_of_kind(tree, kind: str) -> list:
+    """按 ``data(0, UserRole)["kind"]`` 收集树里的节点（含各层子节点）。"""
+    from PySide6.QtCore import Qt as _Qt
+    from PySide6.QtWidgets import QTreeWidgetItem as _Item
+
+    out: list = []
+
+    def walk(item: _Item) -> None:
+        if (item.data(0, _Qt.UserRole) or {}).get("kind") == kind:
+            out.append(item)
+        for i in range(item.childCount()):
+            walk(item.child(i))
+
+    for i in range(tree.topLevelItemCount()):
+        walk(tree.topLevelItem(i))
+    return out
+
 
 def test_manager(tmp: Path) -> None:
     """管理窗：布局 + 槽位落盘，换布局按行优先保留。"""
     print("挂件管理窗")
     from types import SimpleNamespace
 
-    from mihome.ui.widget_manager import WidgetManagerDialog
+    from mihome.ui.widget_manager import WidgetManagerDialog, _DevicePicker
 
     prefs = Prefs(tmp / "mgr.json")
     prefs.set_widget_layout("1x2")
     prefs.set_widget_slots(["d1", "d2"])
+    scenes = {
+        "h1": [
+            {"scene_id": "s1", "name": "示例-回家", "enable": True},
+            {"scene_id": "s2", "name": "示例-已停用", "enable": False},
+        ]
+    }
     store = SimpleNamespace(
         devices={
             "d1": make_state("d1", name="示例-灯"),
@@ -288,10 +347,14 @@ def test_manager(tmp: Path) -> None:
             "d3": make_state("d3", name="示例-插座"),
         },
         prefs=prefs,
-        homes=lambda: [],
-        home_label=lambda home_id: home_id,
-        room_entries=lambda home_id: [],
-        device_states=lambda home_id, room_id: [],
+        homes=lambda: [SimpleNamespace(id="h1", name="家")],
+        home_label=lambda home_id: "示例-家",
+        room_entries=lambda home_id: [("r1", "示例-客厅")],
+        device_states=lambda home_id, room_id: [
+            make_state("d1", name="示例-灯"), make_state("d3", name="示例-插座"),
+        ],
+        scenes_for=lambda home_id, include_hidden=False: list(scenes.get(home_id, [])),
+        scenes_by_home=scenes,
     )
     dlg = WidgetManagerDialog(store, theme.palette_for("porcelain", "light"))
     check("按偏好铺宫格", (dlg.grid.rows, dlg.grid.cols), (1, 2))
@@ -305,10 +368,24 @@ def test_manager(tmp: Path) -> None:
     check("换布局行列", (dlg.grid.rows, dlg.grid.cols), (2, 2))
     check("换布局保留现有设备", dlg.grid.cells(), ["", "d2", "", ""])
 
-    dlg.grid.set_grid(2, 2, ["d2", "", "d3", ""])
+    # 场景格：宫格要认得 scene: 前缀，画得出来、落盘不失真
+    dlg.grid.set_grid(2, 2, [widget_scene_slot("h1", "s1"), "d2", "", ""])
+    check_true("宫格能画场景格", not dlg.grid.grab().isNull())
+
+    # 选卡弹窗：家庭下多一个「快捷场景」分组，只列 enable 为真的
+    picker = _DevicePicker(store, set(), theme.palette_for("porcelain", "light"))
+    check("树里有快捷场景分组", len(_items_of_kind(picker.tree, "scene_group")), 1)
+    scene_items = _items_of_kind(picker.tree, "scene")
+    check("只列启用中的场景", [i.text(0) for i in scene_items], ["示例-回家"])
+    picker._on_click(scene_items[0], 0)
+    check("选场景得到槽位值", picker.chosen(), "scene:h1:s1")
+    check("选中后「添加」可用", picker.btn_ok.isEnabled(), True)
+    picker.deleteLater()
+
     dlg.accept()
     check("关窗后布局落盘", prefs.widget_layout, "2x2")
-    check("关窗后槽位落盘", prefs.widget_slots, ["d2", "", "d3", ""])
+    check("场景槽位一起落盘", prefs.widget_slots[0], "scene:h1:s1")
+    check("关窗后槽位落盘", prefs.widget_slots, ["scene:h1:s1", "d2", "", ""])
     dlg.deleteLater()
 
 
@@ -568,8 +645,8 @@ def test_header_buttons(tmp: Path) -> None:
     prefs.set_widget_slots(["d0"])
     widget.rebuild()
     rects = {name: widget._button_rect(name) for name in _BUTTON_ORDER}
-    check("头部四个按钮", len(rects), 4)
-    check("位置互不重叠", len({(r.x(), r.y()) for r in rects.values()}), 4)
+    check("头部五个按钮", len(rects), 5)
+    check("位置互不重叠", len({(r.x(), r.y()) for r in rects.values()}), 5)
     check_true(
         "都落在头部横带里",
         all(r.top() >= 0 and r.bottom() <= HEADER_H for r in rects.values()),
@@ -580,6 +657,95 @@ def test_header_buttons(tmp: Path) -> None:
     widget.open_main_requested.connect(lambda: emitted.append(True))
     widget._activate_button(BTN_OPEN)
     check("打开主窗口要发信号", len(emitted), 1)
+
+
+def test_lock(tmp: Path) -> None:
+    """顶栏锁定按钮：锁上只挡拖动，解锁后恢复；状态进 prefs。"""
+    print("锁定位置")
+    widget, _store, prefs, _poll = make_widget(tmp, {"d0": make_state("d0")})
+    prefs.set_widget_slots(["d0"])
+    widget.rebuild()
+    check("默认不锁", widget.locked, False)
+    check("未锁时的提示", widget._button_tip(BTN_LOCK), _BUTTON_TIPS[BTN_LOCK])
+
+    widget.show()
+    widget.move(100, 100)
+    widget._activate_button(BTN_LOCK)
+    check("点按钮锁上", prefs.widget_locked, True)
+    check("锁定落盘", Prefs(tmp / "prefs.json").widget_locked, True)
+    check("锁定时提示改成解锁", widget._button_tip(BTN_LOCK), "解锁位置")
+
+    start = QPoint(30, 10)
+    widget.mousePressEvent(_mouse(widget, QEvent.MouseButtonPress, start))
+    widget.mouseMoveEvent(
+        _mouse(widget, QEvent.MouseMove, start + QPoint(24, 18), button=Qt.NoButton)
+    )
+    check("锁住后拖不动", widget.pos(), QPoint(100, 100))
+    widget.mouseReleaseEvent(
+        _mouse(widget, QEvent.MouseButtonRelease, start + QPoint(24, 18))
+    )
+
+    widget._activate_button(BTN_LOCK)
+    check("再点解锁", prefs.widget_locked, False)
+    widget.mousePressEvent(_mouse(widget, QEvent.MouseButtonPress, start))
+    widget.mouseMoveEvent(
+        _mouse(widget, QEvent.MouseMove, start + QPoint(24, 18), button=Qt.NoButton)
+    )
+    check("解锁后能拖", widget.pos(), QPoint(124, 118))
+    widget.mouseReleaseEvent(
+        _mouse(widget, QEvent.MouseButtonRelease, start + QPoint(24, 18))
+    )
+    widget.hide()
+
+
+def test_scene_card(tmp: Path) -> None:
+    """快捷场景卡：槽位识别、点击执行、结果就地显示、场景被删不建卡。"""
+    print("快捷场景卡")
+    scenes = {
+        "h1": [
+            {"scene_id": "s1", "name": "示例-回家", "enable": True},
+            {"scene_id": "s2", "name": "示例-离家", "enable": True},
+        ]
+    }
+    widget, store, prefs, _poll = make_widget(
+        tmp, {"d0": make_state("d0")}, scenes, {"h1": "示例-家"}
+    )
+    prefs.set_widget_layout("1x2")
+    prefs.set_widget_slots([widget_scene_slot("h1", "s1"), "d0"])
+    widget.rebuild()
+    check("场景槽位建场景卡", isinstance(widget._cards.get(0), SceneCard), True)
+    check("设备槽位还是设备卡", isinstance(widget._cards.get(1), WidgetCard), True)
+    check("场景槽位不混进设备表", prefs.widget_dids(), ["d0"])
+
+    card = widget._cards[0]
+    check("副标题用家庭名", card.home_label, "示例-家")
+    check_true("场景卡画得出来", not card.grab().isNull())
+    widget.update_states({"d0"})
+    check_true("增量刷新跳过场景卡不炸", True)
+
+    blank = QPoint(20, 20)
+    card.mousePressEvent(_mouse(card, QEvent.MouseButtonPress, blank))
+    card.mouseReleaseEvent(_mouse(card, QEvent.MouseButtonRelease, blank))
+    check("点一下执行一次", store.ran, [("s1", "h1")])
+    check("成功写在副标题上", card._flash, "已执行")
+
+    store.run_ok = False
+    card.mousePressEvent(_mouse(card, QEvent.MouseButtonPress, blank))
+    card.mouseReleaseEvent(_mouse(card, QEvent.MouseButtonRelease, blank))
+    check("失败也写在副标题上", card._flash, "执行失败")
+    check("失败原因不糊在卡片上", len(store.ran), 2)
+
+    store.run_ok = True
+    card.mousePressEvent(_mouse(card, QEvent.MouseButtonPress, blank))
+    card.mouseReleaseEvent(_mouse(card, QEvent.MouseButtonRelease, QPoint(400, 400)))
+    check("按下后滑走不执行", len(store.ran), 2)
+
+    # 场景在 App 里被删：槽位留着（不替用户改），但卡片不建——别摆一颗点了必失败的按钮
+    store.scenes_by_home["h1"] = [{"scene_id": "s2", "name": "示例-离家", "enable": True}]
+    widget.rebuild()
+    check("场景没了就不建卡", 0 in widget._cards, False)
+    check("槽位没被偷偷改写", prefs.widget_slots[0], "scene:h1:s1")
+    check("设备卡照旧", isinstance(widget._cards.get(1), WidgetCard), True)
 
 
 def test_empty_and_update(tmp: Path) -> None:
@@ -774,6 +940,8 @@ def main() -> int:
         test_card_clicks,
         test_widget_behaviour,
         test_header_buttons,
+        test_lock,
+        test_scene_card,
         test_empty_and_update,
         test_zorder_logic,
         test_layer,

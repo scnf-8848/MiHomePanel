@@ -35,14 +35,16 @@ from PySide6.QtGui import QBrush, QColor, QFont, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import QApplication, QToolTip, QWidget
 
 from . import theme
+from ..core import applog
 from ..core.poll_demand import PollDemandBoard
 from ..core.prefs import (
     WIDGET_LAYER_DEFAULT,
     WIDGET_LAYERS,
+    parse_widget_scene_slot,
 )
 from ..core.store import DeviceState, Store
 from . import desktop_zorder as zorder
-from .desktop_card import CARD_H, CARD_W, WidgetCard
+from .desktop_card import CARD_H, CARD_W, SceneCard, WidgetCard
 from .menu import Menu, add_choice, submenu
 from .widgets import draw_text
 
@@ -74,19 +76,21 @@ WATCHDOG_MS = 2000
 #: 降级成普通档后的重试节拍：shell 一回来就贴回桌面，别让用户等满 2 s
 WATCHDOG_RETRY_MS = 500
 
-#: 头部按钮的名字（从右往左排）：× / 图层 / 管理 / 打开主窗口
+#: 头部按钮的名字（从右往左排）：× / 锁定 / 管理 / 图层 / 打开主窗口
 BTN_CLOSE = "close"
 BTN_MANAGE = "manage"
 BTN_LAYER = "layer"
+BTN_LOCK = "lock"
 BTN_OPEN = "open"
 
 _BUTTON_TIPS = {
     BTN_CLOSE: "收起挂件",
     BTN_LAYER: "切换层级：贴桌面 / 普通 / 置顶",
     BTN_MANAGE: "管理挂件",
+    BTN_LOCK: "锁定位置（锁住后拖不动）",
     BTN_OPEN: "打开主窗口",
 }
-_BUTTON_ORDER = (BTN_OPEN, BTN_LAYER, BTN_MANAGE, BTN_CLOSE)
+_BUTTON_ORDER = (BTN_OPEN, BTN_LAYER, BTN_MANAGE, BTN_LOCK, BTN_CLOSE)
 
 
 class DesktopWidget(QWidget):
@@ -119,7 +123,9 @@ class DesktopWidget(QWidget):
         self.poll = poll
         self._pal = palette
         self._layer = WIDGET_LAYER_DEFAULT
-        self._cards: dict[str, WidgetCard] = {}
+        #: 槽位下标 → 卡片。设备卡是 ``WidgetCard``、场景卡是 ``SceneCard``，
+        #: 两者尺寸一样、只共享"画自己 + 点自己"这一层语义，所以按 QWidget 存。
+        self._cards: dict[int, QWidget] = {}
         self._order: list[str] = []
         self._scroll = 0
         self._badge_warn = 0
@@ -173,7 +179,11 @@ class DesktopWidget(QWidget):
 
     # -- 数据 ------------------------------------------------------------
     def _slot_dids(self) -> list[str]:
-        """当前槽位表（长度 = 行×列，空串 = 空槽）。"""
+        """当前槽位表（长度 = 行×列，空串 = 空槽）。
+
+        值可能是设备 did，也可能是 ``scene:<home>:<scene_id>``——解析交给
+        ``parse_widget_scene_slot``，这里不做语义判断。
+        """
         return list(self.prefs.widget_slots)
 
     def _live_states(self) -> list[DeviceState]:
@@ -184,21 +194,89 @@ class DesktopWidget(QWidget):
                 states.append(st)
         return states
 
+    def _scene_of(self, home_id: str, scene_id: str) -> dict | None:
+        """按 (home, scene_id) 找场景。表里没有 = 场景在 App 里被删了。"""
+        table = getattr(self.store, "scenes_by_home", None) or {}
+        for scene in table.get(home_id) or []:
+            if str(scene.get("scene_id") or "") == scene_id:
+                return scene
+        return None
+
+    @staticmethod
+    def _scene_name(scene: dict | None) -> str:
+        return str((scene or {}).get("name") or "快捷场景")
+
+    def _home_label(self, home_id: str) -> str:
+        getter = getattr(self.store, "home_label", None)
+        if getter is None:
+            return ""
+        try:
+            return str(getter(home_id) or "")
+        except Exception:  # noqa: BLE001 —— 家庭表还没加载完时不该拖垮重建
+            return ""
+
+    def _run_scene(self, slot: str, card: SceneCard) -> None:
+        """点场景卡：直接走 ``Store.run_scene``。
+
+        挂件不另开一套执行逻辑——``run_scene`` 已经把失败原因、状态文字和
+        "场景改到哪几台说不准 → 触发固定时点全量读"都包好了。结果只落在卡片
+        副标题上（用户就在看着它），不发系统通知、也不去掀主窗口。
+        """
+        parsed = parse_widget_scene_slot(slot)
+        if parsed is None:
+            return
+        home_id, scene_id = parsed
+        name = self._scene_name(self._scene_of(home_id, scene_id)) or card.name
+        applog.log("widget", f"场景卡执行：{name}（scene={scene_id} home={home_id}）")
+        card.flash("执行中…", None)
+
+        def done(ok: bool, reason: str) -> None:
+            try:
+                card.flash("已执行" if ok else "执行失败", ok)
+            except RuntimeError:  # 窗口已被 explorer 带走、卡片已销毁
+                return
+            if ok:
+                applog.log("widget", f"场景卡 {name} 执行成功")
+            else:
+                applog.log("widget", f"场景卡 {name} 执行失败：{reason}")
+
+        self.store.run_scene(scene_id, home_id, on_done=done)
+
     def rebuild(self) -> None:
         """整块重建（槽位表 / 拓扑变了才调）。单台状态变化走 ``update_states``。
 
         卡片**按下标**存：槽位是固定的，中间空着的那格就该空着，不能像列表那样
-        把后面的设备挤上来。
+        把后面的设备挤上来。槽位里可能是设备 did，也可能是
+        ``scene:<home>:<scene_id>``（快捷场景卡，见 ``core/prefs`` 的前缀说明）。
+        场景被删了就先留空格——挂件没有替用户改写槽位的权力，下次管理挂件时
+        那个空位还在，用户自己决定填什么。
         """
         for card in self._cards.values():
             card.hide()
             card.deleteLater()
         self._cards.clear()
         self._order = self._slot_dids()
-        for index, did in enumerate(self._order):
-            if not did:
+        for index, slot in enumerate(self._order):
+            if not slot:
                 continue
-            st = self.store.devices.get(did)
+            parsed = parse_widget_scene_slot(slot)
+            if parsed is not None:
+                scene = self._scene_of(*parsed)
+                if scene is None:
+                    continue
+                card = SceneCard(self._scene_name(scene), self._home_label(parsed[0]),
+                                 self._pal, self)
+                card.installEventFilter(self)
+                card.run_requested.connect(
+                    lambda s=slot, c=card: self._run_scene(s, c)
+                )
+                card.menu_requested.connect(
+                    lambda pos, s=slot, c=card: self._on_scene_card_menu(s, c, pos)
+                )
+                card.show()
+                self._cards[index] = card
+                continue
+            st = self.store.devices.get(slot)
             if st is None:
                 continue
             card = WidgetCard(st, self._pal, self)
@@ -219,6 +297,8 @@ class DesktopWidget(QWidget):
         changed = False
         wanted = set(dids)
         for index, card in self._cards.items():
+            if not isinstance(card, WidgetCard):
+                continue  # 场景卡没有在线 / 读数可刷
             if self._order[index] not in wanted:
                 continue
             st = self.store.devices.get(self._order[index])
@@ -545,7 +625,11 @@ class DesktopWidget(QWidget):
 
     def _paint_button(self, p: QPainter, name: str, rect: QRect) -> None:
         pal = self._pal
-        color = QColor(pal.text_soft if name != BTN_CLOSE else pal.text_mute)
+        if name == BTN_LOCK and self.prefs.widget_locked:
+            # 锁着的时候这颗用主题色：不然"拖不动"看起来像坏了
+            color = QColor(pal.accent)
+        else:
+            color = QColor(pal.text_soft if name != BTN_CLOSE else pal.text_mute)
         p.setPen(QPen(color, 1.4))
         p.setBrush(Qt.NoBrush)
         if name == BTN_CLOSE:
@@ -559,8 +643,28 @@ class DesktopWidget(QWidget):
         elif name == BTN_OPEN:
             # 打开主窗口：一个窗口轮廓 + 右上角向外的小箭头（"弹出到桌面"）
             self._paint_open_glyph(p, rect, color)
+        elif name == BTN_LOCK:
+            self._paint_lock_glyph(p, rect, color)
         else:
             self._paint_layer_glyph(p, rect, color)
+
+    def _paint_lock_glyph(self, p: QPainter, rect: QRect, color: QColor) -> None:
+        """锁定位置：合上的锁 / 打开一条缝的锁。自绘，和头部其它按钮同一套笔触。
+
+        开锁态把锁梁右移并只画大半圈——缺口朝左上，读得出"没扣上"；合上时锁梁
+        两根立腿都落到锁体上。20 px 下再细的区别（弹子孔、钥匙孔）都是噪点。
+        """
+        cx, cy = rect.center().x() + 0.5, rect.center().y() + 0.5
+        p.setPen(QPen(color, 1.4, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+        p.setBrush(Qt.NoBrush)
+        p.drawRoundedRect(QRectF(cx - 4.2, cy - 1.0, 8.4, 6.4), 1.6, 1.6)
+        if self.prefs.widget_locked:
+            p.drawArc(QRectF(cx - 3.0, cy - 5.4, 6.0, 6.6), 0, 180 * 16)
+            p.drawLine(QPointF(cx - 3.0, cy - 2.1), QPointF(cx - 3.0, cy - 1.0))
+            p.drawLine(QPointF(cx + 3.0, cy - 2.1), QPointF(cx + 3.0, cy - 1.0))
+        else:
+            p.drawArc(QRectF(cx - 1.0, cy - 5.4, 6.0, 6.6), 20 * 16, 160 * 16)
+            p.drawLine(QPointF(cx + 5.0, cy - 1.7), QPointF(cx + 5.0, cy - 0.5))
 
     @staticmethod
     def _paint_open_glyph(p: QPainter, rect: QRect, color: QColor) -> None:
@@ -621,8 +725,15 @@ class DesktopWidget(QWidget):
     def _paint_footer(self, p: QPainter) -> None:
         pal = self._pal
         y = self.height() - BOTTOM_H - PANEL_PAD // 2
+        devices = [c for c in self._cards.values() if isinstance(c, WidgetCard)]
+        scenes = len(self._cards) - len(devices)
         offline = sum(1 for st in self._live_states() if not st.online)
-        text = f"{len(self._cards)} 台设备" if self._cards else "还没有设备"
+        parts: list[str] = []
+        if devices:
+            parts.append(f"{len(devices)} 台设备")
+        if scenes:
+            parts.append(f"{scenes} 个场景")
+        text = " · ".join(parts) or "还没有卡片"
         if offline:
             text += f" · {offline} 台离线"
         draw_text(
@@ -684,7 +795,7 @@ class DesktopWidget(QWidget):
         draw_text(
             p,
             QRect(area.left(), area.top(), area.width(), 24),
-            "点右上角齿轮，添加要显示的设备",
+            "点右上角齿轮，添加要显示的设备或场景",
             size=11,
             color=pal.text_mute,
             align=Qt.AlignCenter,
@@ -723,10 +834,37 @@ class DesktopWidget(QWidget):
             self.manage_requested.emit()
         elif name == BTN_OPEN:
             self.open_main_requested.emit()
+        elif name == BTN_LOCK:
+            self.toggle_locked()
         else:
             self._layer_menu(
                 self.mapToGlobal(QPoint(self.width() - PANEL_PAD - BTN, HEADER_H))
             )
+
+    def toggle_locked(self) -> bool:
+        """锁定 / 解锁位置。返回锁定后的状态。
+
+        只挡拖动：点卡片、切层级、管理挂件照旧。锁不写进"哪一格放什么"，
+        所以换布局、重建窗口都不受影响——它只是 ``mousePressEvent`` 里的一个闸。
+        """
+        locked = not self.prefs.widget_locked
+        self.prefs.set_widget_locked(locked)
+        if locked:
+            # 手正按着准备拖的时候锁上（右键菜单那条路可能撞上）：把拖动状态收干净
+            self._drag_origin = None
+            self._drag_start = None
+            self._dragging = False
+        self.update()
+        return locked
+
+    @property
+    def locked(self) -> bool:
+        return bool(self.prefs.widget_locked)
+
+    def _button_tip(self, name: str) -> str:
+        if name == BTN_LOCK:
+            return "解锁位置" if self.locked else _BUTTON_TIPS[BTN_LOCK]
+        return _BUTTON_TIPS.get(name, "")
 
     # -- 菜单 ------------------------------------------------------------
     def _layer_menu(self, global_pos: QPoint) -> None:
@@ -795,7 +933,22 @@ class DesktopWidget(QWidget):
         remove.triggered.connect(lambda: self.remove_device_requested.emit(did))
         menu.exec(global_pos)
 
-    # -- 鼠标 ------------------------------------------------------------
+    def _on_scene_card_menu(self, slot: str, card: SceneCard,
+                            global_pos: QPoint) -> None:
+        """场景卡右键。没有"详情"可开，所以第一项是直接执行。"""
+        menu = Menu(self, self._pal)
+        run = menu.addAction("执行场景")
+        run.triggered.connect(lambda: self._run_scene(slot, card))
+        menu.addSeparator()
+        remove = menu.addAction("从挂件移除")
+        remove.triggered.connect(lambda: self.remove_device_requested.emit(slot))
+        menu.exec(global_pos)
+
+    def _slot_of(self, card: QWidget) -> str:
+        for index, candidate in self._cards.items():
+            if candidate is card:
+                return self._order[index]
+        return ""    # -- 鼠标 ------------------------------------------------------------
     def nativeEvent(self, event_type, message):  # noqa: N802 (Qt 命名)
         """记下"点击之前"的前台窗口。
 
@@ -858,9 +1011,11 @@ class DesktopWidget(QWidget):
             event.accept()
             return
         if pos.y() < HEADER_H or self._card_at(pos) is None:
-            self._drag_origin = event.globalPosition().toPoint()
-            self._drag_start = self.pos()
-            self._dragging = False
+            # 锁定只管"拖不动"：头部按钮、卡片点击、右键菜单都照旧
+            if not self.locked:
+                self._drag_origin = event.globalPosition().toPoint()
+                self._drag_start = self.pos()
+                self._dragging = False
         event.accept()
 
     def mouseMoveEvent(self, event) -> None:  # noqa: N802
@@ -880,7 +1035,9 @@ class DesktopWidget(QWidget):
             # 头部按钮都是自绘的，没有 QWidget 可以挂 setToolTip；悬停时手动弹
             if hover:
                 QToolTip.showText(
-                    self.mapToGlobal(self._button_rect(hover).center()), _BUTTON_TIPS[hover], self
+                    self.mapToGlobal(self._button_rect(hover).center()),
+                    self._button_tip(hover),
+                    self,
                 )
             else:
                 QToolTip.hideText()
@@ -937,7 +1094,7 @@ class DesktopWidget(QWidget):
             return
         super().wheelEvent(event)
 
-    def _card_at(self, pos: QPoint) -> WidgetCard | None:
+    def _card_at(self, pos: QPoint) -> QWidget | None:
         for card in self._cards.values():
             if card.isVisible() and card.geometry().contains(pos):
                 return card
@@ -945,11 +1102,10 @@ class DesktopWidget(QWidget):
 
     def contextMenuEvent(self, event) -> None:  # noqa: N802
         self._bring_to_front()
-        pos = event.pos()
-        card = self._card_at(pos)
+        card = self._card_at(event.pos())
         if card is not None:
-            card.contextMenuEvent(event) if False else self._on_card_menu(
-                card.state.did, event.globalPos()
-            )
+            # 两类卡片各自带 ``menu_requested``，接线在 ``rebuild`` 里。这里只转交，
+            # 不按类型分支——早先那句 ``if False else`` 就是分支写歪留下的。
+            card.contextMenuEvent(event)
             return
         self._panel_menu(event.globalPos())
