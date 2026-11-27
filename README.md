@@ -250,7 +250,7 @@ docs            UI 规范与开发文档
 | [dashi45/mihome-pc](https://github.com/dashi45/mihome-pc) | MIT | `camhls.py` 的 go2rtc → HLS 播放链路 | `仅参考` |
 | [LiuLiuxc/FnDepot](https://github.com/LiuLiuxc/FnDepot)（miNVR） | 无 LICENSE、闭源 | 只看产品形态：九宫格、事件时间轴、分段录像 | `仅参考` |
 | [al-one/hass-xiaomi-miot](https://github.com/al-one/hass-xiaomi-miot) | Apache-2.0 | 云录像链路（`get/eventlist` → `m3u8` → `mp4` / `img` 与 AES 解密），以及「`stream_address` 路线不适用」的判定依据 | `仅参考` |
-| [ALittlePandaMan/mijia-desktop](https://github.com/ALittlePandaMan/mijia-desktop) | 原创代码 MIT（随包 FFmpeg 组件 LGPL-2.1-or-later；米家图形 / MiSans 不在 MIT 内） | 另一种完整实现：Rust 自研 CS2/MISS 取流 → TS 片段 → mpegts.js MSE，失败切 FFmpeg 子进程 + WebView2 shared buffer；**整套方案不采用**，只登记关键帧驱动恢复、背压/分辨率限流、切解码器不重连这三条机制参考。没有复制代码，也没有引入其素材 / 字体 | `明确排除`（整套）+ `仅参考`（机制） |
+| [ALittlePandaMan/mijia-desktop](https://github.com/ALittlePandaMan/mijia-desktop) | 原创代码 MIT（随包 FFmpeg 组件 LGPL-2.1-or-later；米家图形 / MiSans 不在 MIT 内） | 另一种完整实现：Rust 自研 CS2/MISS 取流 → TS 片段 → mpegts.js MSE，失败切 FFmpeg 子进程 + WebView2 shared buffer；**整套方案不采用**，只登记关键帧驱动恢复、背压/分辨率限流、切解码器不重连这三条机制参考。11-27 晚补充：它进页面自动起流（我们点播放才起流），其 SD 回放用同会话 `0x10d`/`0x10e` + RDT 索引（`069a01` 在支持档内，仅参考未抄码）。没有复制代码，也没有引入其素材 / 字体 | `明确排除`（整套）+ `仅参考`（机制 / 回放前提） |
 | IMILAB「IMI Camera」Windows 客户端 | 闭源商业软件 | 静态分析其日志与 PE 字符串，确认 `sid=xiaomiio` 换领、`/device/devicepass`、TUTK/MISS 打洞的完整链路 | `明确排除` |
 | [eugeneRover/micam](https://github.com/eugeneRover/micam)（MijiaDeck 的 Java 后端） | 无 LICENSE | 上游再分发许可未确认 | `明确排除` |
 
