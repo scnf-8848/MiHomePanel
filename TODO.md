@@ -130,6 +130,11 @@
   在播会话。验证 `verify_camera_preheat.py` 7 项 + `verify_prefs.py` 7 项。
   → `docs/dev/ui.md`「设置页」、`docs/dev/camera.md`「已知边界」、
   [mijia-desktop-video.md](docs/reference/mijia-desktop-video.md) §6.1
+  → **用户随即实测：开预热仍显著慢于对方，远程档牺牲观看位也追不上**。日志逐段复核见
+  [mijia-desktop-video.md](docs/reference/mijia-desktop-video.md) §6.1.1：我方预热是**进程级**
+  （只起 go2rtc，producer 惰性、无人连 RTSP 就不拨号），只省约 0.85 s；dial + 协商 + 等 IDR
+  约 3 s 仍在点播放后。对方是进页面就拨号收流的**会话级**预热 + 进程内直连。真要追平须把预热
+  升级成会话级（占观看位 + 上行，和"不自动取流"冲突）——**待用户拍板，未做，开关先留着**。
 - **挂件：锁定按钮 + 快捷场景卡（2026-11-27，用户点单）**：顶栏加第四颗按钮（× 左边），
   合上是锁、开一条缝是解锁，锁住时图标用主题色；锁只挡拖动（点卡片 / 切层级 / 管理挂件
   照旧），状态进 `prefs.widget_locked` 并跨启动保持。场景卡走同一张槽位表：值写成
