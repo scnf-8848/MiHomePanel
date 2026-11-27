@@ -142,7 +142,13 @@
   取流固定**远程优先、失败退回局域网**（`CAMERA_NETWORK_DEFAULT = remote_first`），
   底层字段保留给测量脚本覆盖。prefs v22（删 `camera_preheat`，老文件残留键不写回）。
   验证 `verify_camera_autoplay.py`（15 项）替换旧的 `verify_camera_preheat.py`（已挪到
-  `E:\Code\_MiHomePanel-archive-20261127\replaced\`）。**真机提速幅度待用户实测**。
+  `E:\Code\_MiHomePanel-archive-20261127\replaced\`）。
+  → **2026-11-28 助手真机掐表（用户反馈仍明显慢）**：自动起流确实生效，但对方首帧约
+  **0.8–1.1 s**、我方约 **2.2–3.0 s**（内部日志精确 **2667 ms**），仍差约 2 倍。
+  根因在链路层（对方进程内直连 + MSE 直喂；我方 go2rtc → RTSP → QMediaPlayer 四层），
+  不是起流时机也不是参数；第一版 stddev 判据误报 339/224 ms 已作废，可信方法见
+  [mijia-desktop-video.md](docs/reference/mijia-desktop-video.md) §6.1.2。
+  **再追平须改链路层（producer 前置拨号保关键帧 / 去掉本地 RTSP 层），未做，待拍板**。
 - **挂件：锁定按钮 + 快捷场景卡（2026-11-27，用户点单）**：顶栏加第四颗按钮（× 左边），
   合上是锁、开一条缝是解锁，锁住时图标用主题色；锁只挡拖动（点卡片 / 切层级 / 管理挂件
   照旧），状态进 `prefs.widget_locked` 并跨启动保持。场景卡走同一张槽位表：值写成
