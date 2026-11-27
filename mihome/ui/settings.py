@@ -44,7 +44,6 @@ from PySide6.QtWidgets import (
 )
 from .. import __version__
 from ..core import autostart
-from ..core.prefs import CAMERA_NETWORKS
 from ..core.store import Store
 from . import theme, tray
 from .chrome import (
@@ -357,9 +356,6 @@ class SettingsDialog(QDialog):
     #: 顶栏三块胶囊的显隐变了（参数是 ``prefs.HEADER_ITEMS`` 里的一员）。
     #: 主窗口收到后重算顶栏：少一颗就多出一截余量，温湿度可能因此重新放得下。
     header_changed = Signal(str)
-    #: 摄像头预热开关变了（参数是新的 bool）。主窗口收到后立刻补一次预热，
-    #: 不必等下次重启；关掉只影响"下次要不要启动"，不掐断已有播放。
-    camera_preheat_changed = Signal(bool)
     #: "logout" = 用户点了退出登录；"login" = 未登录状态下点了扫码登录。
     #: 真正的动作交给主窗口做（登录窗口、清空设备墙都在那边），这里只发信号。
     account_action = Signal(str)
@@ -469,7 +465,6 @@ class SettingsDialog(QDialog):
         for box in (
             getattr(self, "cb_placement", None),
             getattr(self, "cb_style", None),
-            getattr(self, "cb_camera_network", None),
         ):
             if box is not None:
                 box.set_palette(palette)
@@ -629,33 +624,15 @@ class SettingsDialog(QDialog):
             "决定程序怎么跟你的米家设备打交道，和窗口长什么样无关。改完立即生效。",
         )
 
-        self._section(col, "摄像头")
+        # 摄像头不再有可调项：详情页打开即自动起流（对齐另一种桌面端），
+        # 取流通道固定"远程优先、失败退回局域网"。两个开关（取流方式 / 预热）
+        # 2026-11-27 用户要求取消，见 docs/dev/camera.md「自动起流」。
+        # 留一张说明卡，让用户知道这是有意设计而不是设置项丢了。
         camera = SettingsCard()
-        self.cb_camera_network = Combo(self._p)
-        self.cb_camera_network.setFixedWidth(COMBO_W)
-        for value, label in (
-            ("lan_first", "局域网优先"),
-            ("remote_first", "远程优先"),
-            ("remote_only", "仅远程"),
-        ):
-            if value in CAMERA_NETWORKS:
-                self.cb_camera_network.addItem(label, value)
-        self.cb_camera_network.currentIndexChanged.connect(self._on_camera_network)
         camera.add_row(
-            "取流方式",
-            self.cb_camera_network,
-            sub="局域网优先：先直连，失败自动改远程；"
-            "远程优先：先远程，失败退回局域网；仅远程：始终走中继",
-        )
-        self.sw_camera_preheat = ToggleSwitch(
-            on=self.store.prefs.camera_preheat, palette=self._p, size="sm"
-        )
-        self.sw_camera_preheat.toggled.connect(self._on_camera_preheat_toggled)
-        camera.add_row(
-            "摄像头预热",
-            self.sw_camera_preheat,
-            sub="开启后，打开主窗口就按「取流方式」后台预热摄像头。"
-            "局域网只起 go2rtc、不占观看位；远程会提前建中继并占一个观看位",
+            "摄像头",
+            sub="打开详情页就自动起流，不用点播放；优先走远程中继，失败退回局域网。"
+            "代价是打开页面会占一个观看位并走上行带宽",
         )
         col.addWidget(camera)
         col.addStretch(1)
@@ -771,27 +748,10 @@ class SettingsDialog(QDialog):
             j = self.cb_style.findData(self.store.home_active_style)
             if j >= 0:
                 self.cb_style.setCurrentIndex(j)
-            k = self.cb_camera_network.findData(self.store.camera_network)
-            if k >= 0:
-                self.cb_camera_network.setCurrentIndex(k)
-            preheat = getattr(self, "sw_camera_preheat", None)
-            if preheat is not None and preheat.is_on() != self.store.camera_preheat:
-                preheat.set_on(self.store.camera_preheat, animate=False)
             self.preview.configure(self.store.home_placement, self.store.home_active_style)
             self._sync_preview_inset()
         finally:
             self._loading = False
-
-    def _on_camera_network(self) -> None:
-        if self._loading:
-            return
-        self.store.set_camera_network(str(self.cb_camera_network.currentData() or ""))
-
-    def _on_camera_preheat_toggled(self, on: bool) -> None:
-        if self._loading:
-            return
-        if self.store.set_camera_preheat(on):
-            self.camera_preheat_changed.emit(bool(on))
 
     def _on_header_show(self, key: str, on: bool) -> None:
         """顶栏某一块的开关。只写偏好 + 发信号：画不画是主窗口的事，

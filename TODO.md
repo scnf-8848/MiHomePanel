@@ -130,11 +130,19 @@
   在播会话。验证 `verify_camera_preheat.py` 7 项 + `verify_prefs.py` 7 项。
   → `docs/dev/ui.md`「设置页」、`docs/dev/camera.md`「已知边界」、
   [mijia-desktop-video.md](docs/reference/mijia-desktop-video.md) §6.1
-  → **用户随即实测：开预热仍显著慢于对方，远程档牺牲观看位也追不上**。日志逐段复核见
-  [mijia-desktop-video.md](docs/reference/mijia-desktop-video.md) §6.1.1：我方预热是**进程级**
-  （只起 go2rtc，producer 惰性、无人连 RTSP 就不拨号），只省约 0.85 s；dial + 协商 + 等 IDR
-  约 3 s 仍在点播放后。对方是进页面就拨号收流的**会话级**预热 + 进程内直连。真要追平须把预热
-  升级成会话级（占观看位 + 上行，和"不自动取流"冲突）——**待用户拍板，未做，开关先留着**。
+  → **用户实测开预热仍显著慢**（日志逐段复核见
+  [mijia-desktop-video.md](docs/reference/mijia-desktop-video.md) §6.1.1：进程级预热只省
+  0.85 s，dial + 协商 + 等 IDR 约 3 s 仍在点播放后），于是**同日按用户拍板整个撤回**：
+  开关 + 取流方式下拉删除、`camera_preheat` 字段从 prefs v22 移除，改成**详情页打开即
+  自动起流**（会话级，接受占观看位 + 上行，见该文档 §6.1 末段）。本次改动见下条。
+- **详情页打开即自动起流 / 移除两个开关（2026-11-27 深夜，用户拍板"按对方方式实现"）**：
+  `DetailDialog._auto_start_camera()` 构造末尾 `singleShot(0, ...)`，走 `_start_camera()`
+  建会话 + 接画面，不用点播放；`_cam_adopted`（卡片墙接续）跳过，`_cam_auto_started`
+  一次性守卫防重复 open。设置页「取流方式」「摄像头预热」删除，设备页留一张说明卡；
+  取流固定**远程优先、失败退回局域网**（`CAMERA_NETWORK_DEFAULT = remote_first`），
+  底层字段保留给测量脚本覆盖。prefs v22（删 `camera_preheat`，老文件残留键不写回）。
+  验证 `verify_camera_autoplay.py`（15 项）替换旧的 `verify_camera_preheat.py`（已挪到
+  `E:\Code\_MiHomePanel-archive-20261127\replaced\`）。**真机提速幅度待用户实测**。
 - **挂件：锁定按钮 + 快捷场景卡（2026-11-27，用户点单）**：顶栏加第四颗按钮（× 左边），
   合上是锁、开一条缝是解锁，锁住时图标用主题色；锁只挡拖动（点卡片 / 切层级 / 管理挂件
   照旧），状态进 `prefs.widget_locked` 并跨启动保持。场景卡走同一张槽位表：值写成

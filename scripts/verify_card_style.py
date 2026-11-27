@@ -474,7 +474,7 @@ def main() -> int:
     check("坏数据 / 旧结构字典只留字符串样式 id", loaded.card_styles,
           {"new": LIGHT_BRIGHT})
     check("落盘版本仍是 20（当前结构）",
-          json.loads((tmp / "p.json").read_text(encoding="utf-8"))["version"], 21)
+          json.loads((tmp / "p.json").read_text(encoding="utf-8"))["version"], 22)
 
     print("\n2) 样式解析：能力过滤 / 宽度由样式自带")
     check("灯的三个样式", [s.id for s in available_styles(light.card)],

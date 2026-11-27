@@ -252,18 +252,20 @@ def main() -> int:
           [bad_header.shows_header(k) for k in ("online", "temperature", "humidity")],
           [True, True, False])
 
-    # 摄像头预热（2026-11-27）：默认关，只认 bool，落盘能读回
-    warm_path = prefs.path.with_name("camera-preheat.json")
-    warm = Prefs(warm_path)
-    check("预热默认关", warm.camera_preheat, False)
-    check("打开预热", warm.set_camera_preheat(True), True)
-    check("重复打开不写盘", warm.set_camera_preheat(True), False)
-    check("预热读回来是开", Prefs(warm_path).camera_preheat, True)
-    check("关掉预热", warm.set_camera_preheat(False), True)
-    check("预热读回来是关", Prefs(warm_path).camera_preheat, False)
-    bad_warm_path = warm_path.with_name("camera-preheat-bad.json")
-    bad_warm_path.write_text(json.dumps({"camera_preheat": "yes"}), encoding="utf-8")
-    check("坏值退回默认", Prefs(bad_warm_path).camera_preheat, False)
+    # 摄像头预热（2026-11-27 曾加、同日删除）：字段已移除，详情页改成打开即起流。
+    # 老文件里残留的 camera_preheat 键会被 load 忽略，且不写回。
+    legacy_path = prefs.path.with_name("camera-preheat-legacy.json")
+    legacy_path.write_text(
+        json.dumps({"camera_preheat": True, "camera_network": "lan_first"}),
+        encoding="utf-8",
+    )
+    legacy = Prefs(legacy_path)
+    check("预热字段已移除", hasattr(legacy, "camera_preheat"), False)
+    check("老文件的取流值仍读得到", legacy.camera_network, "lan_first")
+    legacy.save()
+    check("预热键不写回新文件",
+          "camera_preheat" in json.loads(legacy_path.read_text(encoding="utf-8")),
+          False)
 
     # 纯函数边界
     check("排序函数容忍未知项", apply_order(["b"], ["a", "b", "c"]), ["b", "a", "c"])

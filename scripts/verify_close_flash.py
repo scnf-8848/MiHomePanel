@@ -69,7 +69,6 @@ class FakeSettings(QDialog):
     preset_selected = Signal(str)
     account_action = Signal(str)
     header_changed = Signal(str)
-    camera_preheat_changed = Signal(bool)
 
     #: 每次 exec 时要做的事（由测试用例挂上去）
     during_exec = None

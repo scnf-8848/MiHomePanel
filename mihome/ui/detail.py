@@ -478,8 +478,10 @@ class DetailDialog(QDialog):
         self._cam_ptz_ok: bool | None = None
         self._cam_popout: CameraPopoutWindow | None = None
         self._cam_live = False
-        #: 卡片墙已经把一条正在播的会话交给了本页：不再预热、不再重新 open
+        #: 卡片墙已经把一条正在播的会话交给了本页：不再重新 open
         self._cam_adopted = False
+        #: 自动起流只做一次（singleShot 理论上只触发一次，adopt 竞态下挡住重复 open）
+        self._cam_auto_started = False
         # 取流要起 go2rtc 子进程（实测 0.85s），放后台线程做，结果用队列回主线程。
         # 不用跨线程信号：窗口关掉之后线程还在跑，回调到已销毁的控件会出事。
         self._cam_url = ""
@@ -495,7 +497,6 @@ class DetailDialog(QDialog):
         self._cam_error_at = 0.0
         # 【取流计时】core/timing.py 的记录号，不参与取流逻辑
         self._cam_play_token = 0
-        self._cam_prefetch_token = 0
         self._cam_job_token = 0
         self._cam_job: threading.Thread | None = None
         self._cam_results: queue.SimpleQueue[
@@ -574,7 +575,11 @@ class DetailDialog(QDialog):
         host.addWidget(self._ptz, 0, Qt.AlignHCenter)
         self._ptz_host.hide()
         lay.addWidget(self._ptz_host, 0, Qt.AlignHCenter)
-        QTimer.singleShot(0, self._prefetch_camera)
+        # 打开详情页就自动起流（对齐另一种桌面端的行为）：一次会话级预热，
+        # 直接在后台建立连接并接画面。代价是占一个观看位 + 走上行带宽。
+        # adopt 那一路（从卡片墙搬过来的在播画面）由 adopt_playing_camera 接管，
+        # 这里跳过，别重复 open 把正在播的会话改道。
+        QTimer.singleShot(0, self._auto_start_camera)
 
     def _cam_begin(self, label: str) -> int:
         """【取流计时】开一条记录，顺带把摄像头地址和偏好交给「环境」行。"""
@@ -587,35 +592,24 @@ class DetailDialog(QDialog):
             },
         )
 
-    def _prefetch_camera(self) -> None:
-        """页面刚打开：后台把 go2rtc 和本机地址准备好，但不建立会话。
+    def _auto_start_camera(self) -> None:
+        """打开详情页就自动起流：后台建会话 + 接画面，不用用户点播放。
 
-        只是省掉子进程启动那 0.85 秒；摄像头那边没有观看位、没有上行流量，
-        和"自动加载画面"是两回事。失败也先不打扰用户，等点了播放再说。
+        这是从"点播放才取流"改成"进页面就起流"的产品决定变更（对齐另一种桌面端）。
+        会话级起流才是真省时间——go2rtc 的 producer 惰性，没人连 RTSP 就不拨号，
+        所以只起进程的旧预热省不掉那约 3 秒的 dial + 协商 + 等 IDR。
 
-        远程不预热：relay 握手会真的让摄像头加入会话、占掉一个观看位，那就违背了
-        "点播放才加载"。异地用户点播放时多花一次握手（2–4 秒），比开着页面偷偷
-        占位更合理。
+        代价：打开页面就占一个观看位 + 走上行带宽。失败按正常播放失败路径处理，
+        不静默吞掉；从卡片墙搬过来的在播画面不重复起流。
         """
-        if self._camera is None:
+        if self._cam_auto_started:
             return
-        if self._cam_adopted:
-            # 画面是从卡片墙接过来的：再预热一次会把正在用的通道改走
+        if self._camera is None or self._cam_adopted:
             return
-        self._cam_wants_play = False
-        self._cam_prefetch_token = self._cam_begin("后台预热")
-        if self._remote_wanted():
-            timing.mark_on(
-                self._cam_prefetch_token, "预热跳过", "远程模式不预热，避免占观看位"
-            )
-            timing.end_on(self._cam_prefetch_token, "跳过")
-            self._cam_prefetch_token = 0
+        if self._cam_url or self._cam_job is not None or self._cam_wants_play:
             return
-        timing.set_label("后台预热（局域网）", token=self._cam_prefetch_token)
-        # 预热只探路 + 起 go2rtc，探测不通也不擅自建远程会话（那要占观看位）
-        self._spawn_camera_open(
-            remote=False, token=self._cam_prefetch_token, allow_remote=False
-        )
+        self._cam_auto_started = True
+        self._start_camera()
 
     def _pref(self) -> str:
         """取流方式偏好：lan_first / remote_first / remote_only。"""
@@ -757,8 +751,8 @@ class DetailDialog(QDialog):
                 timing.mark("可达性探测", self._probe_text_of(probe))
                 if not probe[0]:
                     if not allow_remote:
-                        # 预热阶段探测不通：只汇报，不偷偷建远程会话（那会占观看位）
-                        timing.mark("探测不通：预热到此为止，等点播放再走远程")
+                        # 从远程切回局域网这一路：探测不通就只汇报，别再偷偷建远程会话
+                        timing.mark("探测不通：局域网这一路到此为止，不再兜回远程")
                         self._cam_results.put(
                             (did, "", "局域网不可达", False, probe)
                         )
@@ -802,9 +796,6 @@ class DetailDialog(QDialog):
                     timing.mark_on(job_token, "取流结果：地址可用")
                 else:
                     timing.mark_on(job_token, "取流结果：失败", error)
-                if job_token == self._cam_prefetch_token:
-                    timing.end_on(job_token, "预热成功" if url else "预热失败")
-                    self._cam_prefetch_token = 0
             play = self._cam_wants_play
             self._cam_wants_play = False
             if self._camera is None or did != self.state.did:
@@ -982,7 +973,7 @@ class DetailDialog(QDialog):
         """把卡片墙正在播的那一路接到本页画面上（只搬 player/sink）。
 
         由 ``MainWindow._on_card_clicked`` 在构造完本页、进入模态前调用。
-        成功后本页不预热、不重新 open，用户直接看到接续的画面。
+        成功后本页不再 open，用户直接看到接续的画面。
         """
         if self._camera is None:
             return False
@@ -1009,10 +1000,6 @@ class DetailDialog(QDialog):
         ).start()
         self._cam_started = time.monotonic()
         self._cam_watchdog.stop()
-        # 预热的计时记录不再有用（如果已经被调度起来，结果是空操作）
-        if self._cam_prefetch_token:
-            timing.end_on(self._cam_prefetch_token, "接续卡片播放，取消预热")
-            self._cam_prefetch_token = 0
         timing.mark("接续卡片播放", "搬 player/sink，不重新 open")
         return True
 
@@ -1075,9 +1062,6 @@ class DetailDialog(QDialog):
                 "交独立窗口继续播放" if hand_over else "用户停止",
             )
             self._cam_play_token = 0
-        if self._cam_prefetch_token:
-            timing.end_on(self._cam_prefetch_token, "关闭页面")
-            self._cam_prefetch_token = 0
         self._cam_live = False
         self._cam_wants_play = False
         self._cam_job_token = 0
@@ -1098,7 +1082,7 @@ class DetailDialog(QDialog):
                 # 落在这一支上——绝不能走兜底的 release(did)，那会掐掉别人的画面。
                 self._camera.stop()
                 return
-            # 有所有者登记时统一收尾；没有（例如只是预热过）就退回原路径
+            # 有所有者登记时统一收尾；没有就退回原路径
             if not owner.release(self._camera, "关闭详情页"):
                 self._camera.stop()
                 camera_service().release(self.state.did)

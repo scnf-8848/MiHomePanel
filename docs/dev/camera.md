@@ -595,11 +595,15 @@ RTSP 会话**：
   （理由见 TODO「摄像头二期」）。SD 卡回放 2026-11-08 取消，**2026-11-27 用户重新提出
   评估、未开工前仍按不做处理**；技术前提已变（可同会话做），见
   [mijia-desktop-video.md](../reference/mijia-desktop-video.md) §6.2 与 `TODO.md` B 段
-- **主窗口预热开关**（`prefs.camera_preheat`，默认关，设置 → 设备 → 摄像头）：只预热、
-  不自动播。局域网档 = `prepare()` 起 go2rtc + 登记源，**不占观看位**；远程档 =
-  `open(remote=True)` 建 relay，**会占一个观看位**（与"进页面自动起流"的同口径对比）。
-  跟随「取流方式」，一次进程内只跑一次；设置里再开可强制补跑。见 `docs/dev/ui.md`
-  「设置页」与 `scripts/verify_camera_preheat.py`
+- **详情页打开即自动起流**（2026-11-27 产品决定变更，对齐另一种桌面端）：
+  `DetailDialog._auto_start_camera()` 在构造末尾 `QTimer.singleShot(0, ...)` 触发，
+  走正常 `_start_camera()` 建会话 + 接画面，**不用点播放**。代价是打开页面就占一个
+  观看位 + 走上行带宽。从卡片墙搬过来的在播画面（`_cam_adopted`）跳过，不重复 open
+  把在播会话改道。原来的 `prefs.camera_preheat` 主窗口预热开关与设置页「取流方式」
+  下拉同轮**删除**（前者是进程级预热、拨号那 3 秒省不掉，实测开了仍慢）；取流通道
+  固定**远程优先、失败退回局域网**（`CAMERA_NETWORK_DEFAULT = remote_first`），底层
+  字段保留给测量脚本 `measure_app_play.py` 覆盖。见 `docs/dev/ui.md`「设置页」、
+  `docs/reference/mijia-desktop-video.md` §6.1.1 与 `scripts/verify_camera_autoplay.py`
 - 本程序对一台摄像头只开**一条** P2P 会话（多路观看复用 go2rtc 的 producer）；设备侧
   最多允许 **3 路并发**——实测第 4 路被设备直接掐断（go2rtc 日志 `miss: read media:
   cs2: EOF`），前三路不受影响。所以和米家 App 同看是可以的，占满 3 个观看位时后连的
@@ -608,8 +612,8 @@ RTSP 会话**：
   控件只冻结在 1 帧：详情页开着（就绪 / 暂停 / 播放）就一直占着 3 个观看位之一，
   也一直走摄像头的上行带宽。离开详情页才会真正断开
 - 所以**闲置 3 分钟会自动释放连接**（就绪和暂停都算闲置，播放不算）：画面变成
-  「闲置 3 分钟，连接已释放」，点播放重新取流（局域网冷启本机实测 3.68–4.58 秒，
-  预热命中 1.72–2.18 秒；远程另加 2–4 秒握手，异地未实测）。阈值见
+  「闲置 3 分钟，连接已释放」，点播放重新取流（局域网冷启本机实测 3.68–4.58 秒；
+  旧版"进程级预热命中"1.72–2.18 秒；远程另加 2–4 秒握手，异地未实测）。阈值见
   `camera_view.IDLE_RELEASE_SECONDS`，测试可用 `MIHOME_CAMERA_IDLE_SECONDS` 调小
 - **崩了不会一直占着位**。实测强杀程序后，设备侧的观看位在停止推流后立刻可用
   （新会话 0 秒内就能连上）；但 Windows 不会跟着结束子进程，会留一个 go2rtc 占住
