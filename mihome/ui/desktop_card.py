@@ -25,6 +25,10 @@ CARD_H = 56
 PAD = 10
 #: 电源键直径（比主界面的 32 小一号，否则 56 高塞不下两行字）
 POWER_D = 26
+#: 场景卡右箭头（›）的半宽 / 半高，按圆直径的比例给——换图标尺寸时字形跟着缩放。
+#: 两个数只影响"笔画的张开程度"，位置由圆心上镜像对称保证，见 ``_paint_arrow``。
+CHEVRON_HW = 0.138
+CHEVRON_HH = 0.20
 RADIUS = 10
 #: 场景卡执行结果在副标题上停留多久（之后换回家庭名）
 FLASH_MS = 2600
@@ -320,6 +324,12 @@ class SceneCard(QWidget):
 
         圆底只在悬停 / 按下时上主题色——常驻主色会让整排卡片都在喊"点我"，
         和设备卡的关态保持同一档安静。
+
+        字形**以圆心为镜像点对称**（尾端在 ``±CHEVRON_HW``、尖端在 ``+CHEVRON_HW``）。
+        早先那版是「尖端 +0.7dx、尾端 -dx」（dx 是按圆宽算的），画出来更像一支箭，
+        但墨迹包围盒和墨量重心都落在圆心左边约 0.6 px —— 26 px 的圆里看得出来，
+        用户 2026-11-27 报"右箭头在圆里有点偏左"。对称之后两者都正好在圆心上，
+        不需要再加光学补偿；要微调只改下面两个常量。
         """
         pal = self._pal
         hot = self._hover or self._pressed
@@ -334,9 +344,11 @@ class SceneCard(QWidget):
         ink = QColor("#FFFFFF" if hot else pal.text_soft)
         p.setPen(QPen(ink, 1.7, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
         p.setBrush(Qt.NoBrush)
-        dx, dy = rect.width() * 0.16, rect.width() * 0.21
-        p.drawLine(QPointF(c.x() - dx, c.y() - dy), QPointF(c.x() + dx * 0.7, c.y()))
-        p.drawLine(QPointF(c.x() + dx * 0.7, c.y()), QPointF(c.x() - dx, c.y() + dy))
+        hw = rect.width() * CHEVRON_HW
+        hh = rect.width() * CHEVRON_HH
+        apex = QPointF(c.x() + hw, c.y())
+        p.drawLine(QPointF(c.x() - hw, c.y() - hh), apex)
+        p.drawLine(QPointF(c.x() - hw, c.y() + hh), apex)
 
     # -- 交互 ------------------------------------------------------------
     def enterEvent(self, event) -> None:  # noqa: N802

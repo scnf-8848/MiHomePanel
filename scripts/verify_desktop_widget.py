@@ -16,7 +16,7 @@ from types import SimpleNamespace
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QEvent, QPoint, QPointF, Qt  # noqa: E402
-from PySide6.QtGui import QMouseEvent  # noqa: E402
+from PySide6.QtGui import QColor, QImage, QMouseEvent, QPainter  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -34,7 +34,10 @@ from mihome.core.prefs import (  # noqa: E402
 )
 from mihome.ui import theme  # noqa: E402
 from mihome.ui.desktop_card import (  # noqa: E402
+    CARD_H,
     CARD_W,
+    PAD,
+    POWER_D,
     SceneCard,
     WidgetCard,
     card_subtitle,
@@ -698,6 +701,41 @@ def test_lock(tmp: Path) -> None:
     widget.hide()
 
 
+def arrow_ink_center(card: SceneCard, scale: int = 4) -> float:
+    """右箭头墨迹的**包围盒中心**相对圆心的横向偏移（逻辑像素，左负右正）。
+
+    为什么要量像素：2026-11-27 用户报"右箭头在圆里有点偏左"。当时那版是
+    「尖端 +0.7dx、尾端 -dx」，圆本身居中但字形墨迹的包围盒中心落在圆心左边
+    0.5 px —— 26 px 的圆里看得出来。这里按 4 倍离屏渲染后统计暗像素范围，
+    不依赖屏幕缩放，也不会像目测那样放过 0.5 px 的偏心。
+    """
+    img = QImage(CARD_W * scale, CARD_H * scale, QImage.Format_ARGB32)
+    img.fill(QColor("#FFFFFF"))
+    p = QPainter(img)
+    p.scale(scale, scale)
+    card.render(p, QPoint(0, 0))
+    p.end()
+
+    fill = QColor(theme.blend(card._pal.card, card._pal.text, 0.08))
+    base = 0.299 * fill.red() + 0.587 * fill.green() + 0.114 * fill.blue()
+    left = max(int((CARD_W - PAD - POWER_D) * scale) - 2, 0)
+    right = min(int((CARD_W - PAD) * scale) + 2, img.width())
+    xs = [
+        x
+        for y in range(img.height())
+        for x in range(left, right)
+        if base - (
+            0.299 * img.pixelColor(x, y).red()
+            + 0.587 * img.pixelColor(x, y).green()
+            + 0.114 * img.pixelColor(x, y).blue()
+        ) > 4
+    ]
+    if not xs:
+        return float("nan")
+    circle_cx = (CARD_W - PAD - POWER_D + POWER_D / 2) * scale
+    return ((min(xs) + max(xs) + 1) / 2 - circle_cx) / scale
+
+
 def test_scene_card(tmp: Path) -> None:
     """快捷场景卡：槽位识别、点击执行、结果就地显示、场景被删不建卡。"""
     print("快捷场景卡")
@@ -720,6 +758,8 @@ def test_scene_card(tmp: Path) -> None:
     card = widget._cards[0]
     check("副标题用家庭名", card.home_label, "示例-家")
     check_true("场景卡画得出来", not card.grab().isNull())
+    offset = arrow_ink_center(card)
+    check("右箭头在圆里居中（实测偏心 ≤0.35 px）", abs(offset) <= 0.35, True)
     widget.update_states({"d0"})
     check_true("增量刷新跳过场景卡不炸", True)
 
