@@ -862,6 +862,17 @@
 
 ## 已作废 / 已取消（结论 + 理由，不要再翻出来）
 
+- **换成 mijia-desktop 的摄像头取流 / 播放方式**（2026-11-27 调研后**明确排除整套替换**）：
+  对方用 Rust 自研 CS2/MISS 栈（不跑 go2rtc）+ TS 片段经 mpegts.js MSE 播放 +
+  FFmpeg 子进程 / WebView2 shared buffer 兜底。不采用的三条理由：① 取流与播放两层都要换，
+  等于重写 `core/camera.py` / `ui/camera_view.py` / `ui/monitor_page.py` 与打包链；
+  ② 引入 Rust 工具链 + WebView2 Runtime（Win32 专属）+ 随包 FFmpeg，丢掉目前"可选
+  go2rtc 外部进程、跨平台、只多 7.7 MB"的轻量性；③ 我们已落地的开播补丁（首帧约 2 s）、
+  MISS `0x112` 云台、按 did 多路 relay、换承载面不重连，都不是对方能直接替代的增量。
+  **只参考**：关键帧驱动恢复（队列满/画质变/切解码器后从 IDR 重来并递增 revision）、
+  有界帧队列 + ack + 压力降分辨率、切解码器不重开设备会话（最后这条我们已经做了）。
+  依据：[mijia-desktop-video.md](docs/reference/mijia-desktop-video.md)；未真机对比，
+  对方的 16 路 / 15 fps 等数字不采信为实测。
 - **插件文案 / 故障码运行时拉取**（2026-11-23 用户拍板**否决**）：本来是想按 `model` 拉
   插件包、解 `value-list` 与 `fault` 表替代人工短名；调研后确认做通用流水线不划算——
   ① **文案侧不需要**：`zh` 只是云端会话 Cookie 里的 `locale=zh_CN`，只影响设备列表展示名；
