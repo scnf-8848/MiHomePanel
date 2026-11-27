@@ -384,7 +384,7 @@ def _no_persist() -> None:
           sorted(payload) == sorted([
               "version", "card_styles", "home_order", "room_order", "device_order",
               "scene_order", "hidden", "hidden_scenes", "hidden_collapsed",
-              "camera_network", "speaker_command_did", "speaker_silent",
+              "camera_network", "camera_preheat", "speaker_command_did", "speaker_silent",
               "close_to_tray", "start_in_tray", "last_page",
               "last_home", "last_room", "restore_last_page", "layout",
               # 耗材页（2026-11-18）：监控项清单 + 排序方式 + 整页的卡片样式

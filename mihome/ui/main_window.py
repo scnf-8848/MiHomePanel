@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import threading
 import time
 from typing import Any
 
@@ -44,6 +45,7 @@ from ..core import applog, climate as climate_mod, scene_shortcut, speaker
 from ..core.alerts import ERROR, TOAST_COOLDOWN, Alert, AlertPolicy
 from ..core.api import Client, explain
 from ..core.automation import FAILED
+from ..core.camera import CameraError, is_camera, shared as camera_service
 from ..core.automation.service import AutomationService
 from ..core.icons import IconCache
 from ..core.jobs import SerialWorker
@@ -524,6 +526,9 @@ class MainWindow(QMainWindow):
 
         self._known_dids: set[str] = set()
         self._pending_maximize = False
+        #: 主窗口级摄像头预热只做一次（每次进程内）；设置里再打开时可以强制重跑。
+        #: 局域网档只起 go2rtc + 登记源，不占观看位；远程档会建 relay，占一位。
+        self._camera_preheat_done = False
         #: 启动落点的"房间"要等拓扑加载完才能算，只在第一次 ``_on_loaded`` 消费一次
         self._start_placement_pending = True
         #: 待滚到的 (home, room)；从托盘启动时窗口还没显示，等首次显示后再滚一次
@@ -659,10 +664,65 @@ class MainWindow(QMainWindow):
             self._pending_maximize = False
             self._frame.set_maximized(True)
         self._apply_poll_mode()
+        self._maybe_preheat_cameras()
 
     def hideEvent(self, event) -> None:  # noqa: N802
         super().hideEvent(event)
         self._apply_poll_mode()
+
+    def _maybe_preheat_cameras(self, force: bool = False) -> None:
+        """主窗口打开后台准备摄像头，省掉用户点播放时的冷启动。
+
+        只做一次；要跟着「取流方式」走，方便和别的桌面端做同口径对比：
+
+        * ``lan_first`` —— 只调 ``prepare()`` 起 go2rtc + 登记局域网源。
+          不拨号、不占观看位（和详情页原来的预热一致）。
+        * ``remote_first`` / ``remote_only`` —— 逐个 ``open(remote=True)``
+          建 relay。这**会真的占一个观看位**，因为远程握手就是设备加入会话；
+          但这也正是"打开就起流"的对方程序的行为，比较首帧才公平。
+          ``remote_first`` 失败时退回局域网登记。
+
+        整个动作在后台线程，失败只写日志、不打扰用户；点播放时再按正常路径重试。
+        """
+        if not self.store.camera_preheat or not self.isVisible() or not self.store.devices:
+            return
+        if self._camera_preheat_done and not force:
+            return
+        nodes = [
+            st.node
+            for st in self.store.devices.values()
+            if is_camera(str(getattr(st.node, "model", "") or ""))
+            and bool(getattr(st.node, "online", True))
+        ]
+        if not nodes:
+            return
+        self._camera_preheat_done = True
+        network = self.store.camera_network
+
+        def work() -> None:
+            try:
+                if network == "lan_first":
+                    camera_service().prepare(self.client, nodes)
+                else:
+                    for node in nodes:
+                        did = str(getattr(node, "did", "") or "")
+                        try:
+                            camera_service().open(self.client, node, remote=True)
+                        except CameraError as exc:
+                            camera_service().release(did)
+                            if network == "remote_first":
+                                camera_service().prepare(self.client, [node])
+                            applog.log("camera", f"主窗口预热远程失败：{did} {exc}")
+                applog.log("camera", f"主窗口预热完成：{len(nodes)} 台 / {network}")
+            except Exception as exc:  # noqa: BLE001 - 外部进程 + 网络，别让 UI 线程背锅
+                applog.log("camera", f"主窗口预热异常：{exc!r}")
+
+        threading.Thread(target=work, name="mihome-camera-preheat", daemon=True).start()
+
+    def _on_camera_preheat_setting(self, on: bool) -> None:
+        """设置里刚打开开关就补跑一次，不必等下次重启主窗口。"""
+        if on:
+            self._maybe_preheat_cameras(force=True)
 
     def _save_settings(self) -> None:
         s = self._settings()
@@ -1374,6 +1434,7 @@ class MainWindow(QMainWindow):
         self._refresh_speakers()
         self.widget_panel.rebuild()
         self.store.poll()
+        self._maybe_preheat_cameras()
         # 设备表齐了，"本程序启动时"的规则才真的发得出设备动作（服务内部幂等，
         # 重登 / 重新加载不会再触发一次）。未登录时走不到这里，规则等下次启动。
         fire_start = getattr(self.automation, "fire_start_rules", None)
@@ -1725,6 +1786,7 @@ class MainWindow(QMainWindow):
         # 顶栏三块胶囊的开关：设置页只写偏好，画不画由这里重算一遍——
         # 顶栏是流式布局，少一颗要多出来的宽度得重新量（_fit_climate）
         dlg.header_changed.connect(lambda _key: self._update_header())
+        dlg.camera_preheat_changed.connect(self._on_camera_preheat_setting)
         # 账号动作（退出登录 / 扫码登录）不能在设置窗口还开着的时候做：
         # 登录窗口是另一个模态窗口，套在设置里面会把模态栈搞乱。
         action = {"kind": ""}

@@ -252,6 +252,19 @@ def main() -> int:
           [bad_header.shows_header(k) for k in ("online", "temperature", "humidity")],
           [True, True, False])
 
+    # 摄像头预热（2026-11-27）：默认关，只认 bool，落盘能读回
+    warm_path = prefs.path.with_name("camera-preheat.json")
+    warm = Prefs(warm_path)
+    check("预热默认关", warm.camera_preheat, False)
+    check("打开预热", warm.set_camera_preheat(True), True)
+    check("重复打开不写盘", warm.set_camera_preheat(True), False)
+    check("预热读回来是开", Prefs(warm_path).camera_preheat, True)
+    check("关掉预热", warm.set_camera_preheat(False), True)
+    check("预热读回来是关", Prefs(warm_path).camera_preheat, False)
+    bad_warm_path = warm_path.with_name("camera-preheat-bad.json")
+    bad_warm_path.write_text(json.dumps({"camera_preheat": "yes"}), encoding="utf-8")
+    check("坏值退回默认", Prefs(bad_warm_path).camera_preheat, False)
+
     # 纯函数边界
     check("排序函数容忍未知项", apply_order(["b"], ["a", "b", "c"]), ["b", "a", "c"])
     check("排序函数容忍空顺序", apply_order([], ["a", "b"]), ["a", "b"])

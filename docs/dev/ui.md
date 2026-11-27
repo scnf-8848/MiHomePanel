@@ -2198,6 +2198,19 @@ head。容器高度取自身 `sizeHint`（26），贴住 8px 顶边，三页标�
 打交道，和窗口长什么样无关"。**以后的设备级偏好（轮询节奏之类）都进这一页**，别再
 塞回外观；「常规」页的自述是"程序自己的行为，和你的米家设备无关"，也别往里放设备项。
 
+**摄像头预热（2026-11-27，`prefs.camera_preheat`，默认关）**也在这一页，紧跟「取流方式」：
+开启后主窗口一显示（或设备表加载完）就后台跑一次 `MainWindow._maybe_preheat_cameras()`，
+省掉点播放时的 go2rtc 冷启动。**它跟随「取流方式」，不是写死局域网**：
+
+- `lan_first` → `camera_service().prepare()`：只起 go2rtc + 登记局域网源，
+  不拨号、不占观看位；
+- `remote_first` / `remote_only` → `camera_service().open(remote=True)`：
+  **真的建 relay 会话、占一个观看位**。这不是副作用漏了，而是为了和"进页面自动起流"
+  的桌面端做同口径首帧对比；`remote_first` 失败会退回归局域网登记。
+
+设置里刚打开开关会发 `camera_preheat_changed(bool)`，主窗口立刻补跑一次，不必重启；
+关掉只影响"下次要不要启动"，不掐断已经在播的会话。验证 `scripts/verify_camera_preheat.py`
+（7 项路由）+ `scripts/verify_prefs.py`（落盘 / 坏值）。
 
 ## 排序与隐藏设备
 

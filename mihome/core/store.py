@@ -622,6 +622,13 @@ class Store:
     def set_camera_network(self, value: str) -> bool:
         return self.prefs.set_camera_network(value)
 
+    @property
+    def camera_preheat(self) -> bool:
+        return self.prefs.camera_preheat
+
+    def set_camera_preheat(self, on: bool) -> bool:
+        return self.prefs.set_camera_preheat(on)
+
     def set_home_layout(self, placement: str = "", style: str = "") -> None:
         """改的是"怎么显示"，不是"什么顺序"——设定顺序始终留在 ``prefs.home_order``。"""
         changed = False

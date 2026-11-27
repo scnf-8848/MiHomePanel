@@ -595,6 +595,11 @@ RTSP 会话**：
   （理由见 TODO「摄像头二期」）。SD 卡回放 2026-11-08 取消，**2026-11-27 用户重新提出
   评估、未开工前仍按不做处理**；技术前提已变（可同会话做），见
   [mijia-desktop-video.md](../reference/mijia-desktop-video.md) §6.2 与 `TODO.md` B 段
+- **主窗口预热开关**（`prefs.camera_preheat`，默认关，设置 → 设备 → 摄像头）：只预热、
+  不自动播。局域网档 = `prepare()` 起 go2rtc + 登记源，**不占观看位**；远程档 =
+  `open(remote=True)` 建 relay，**会占一个观看位**（与"进页面自动起流"的同口径对比）。
+  跟随「取流方式」，一次进程内只跑一次；设置里再开可强制补跑。见 `docs/dev/ui.md`
+  「设置页」与 `scripts/verify_camera_preheat.py`
 - 本程序对一台摄像头只开**一条** P2P 会话（多路观看复用 go2rtc 的 producer）；设备侧
   最多允许 **3 路并发**——实测第 4 路被设备直接掐断（go2rtc 日志 `miss: read media:
   cs2: EOF`），前三路不受影响。所以和米家 App 同看是可以的，占满 3 个观看位时后连的

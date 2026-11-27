@@ -121,6 +121,15 @@
 
 ## 最近完成（2026-11-15 ~ 11-27）
 
+- **主窗口摄像头预热开关（2026-11-27，用户点单，为对比首帧速度）**：设置 → 设备 →
+  摄像头新增「摄像头预热」，`prefs.camera_preheat` v21、默认关。开启后主窗口一显示 /
+  设备表加载完就后台跑一次 `MainWindow._maybe_preheat_cameras()`，**跟随「取流方式」**：
+  `lan_first` 只 `prepare()`（不拨号、不占观看位）；`remote_first` / `remote_only`
+  走 `open(remote=True)` 提前建 relay（**占一个观看位**，和对方"进页面自动起流"同口径，
+  用户明确要求对比不走局域网）。一次进程内只跑一次，设置里再开强制补跑；关掉不掐断
+  在播会话。验证 `verify_camera_preheat.py` 7 项 + `verify_prefs.py` 7 项。
+  → `docs/dev/ui.md`「设置页」、`docs/dev/camera.md`「已知边界」、
+  [mijia-desktop-video.md](docs/reference/mijia-desktop-video.md) §6.1
 - **挂件：锁定按钮 + 快捷场景卡（2026-11-27，用户点单）**：顶栏加第四颗按钮（× 左边），
   合上是锁、开一条缝是解锁，锁住时图标用主题色；锁只挡拖动（点卡片 / 切层级 / 管理挂件
   照旧），状态进 `prefs.widget_locked` 并跨启动保持。场景卡走同一张槽位表：值写成

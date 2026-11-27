@@ -71,7 +71,9 @@ HIDDEN_ROOM_ID = "__hidden__"
 #: ``widget_slots``（按下标存，空串 = 空槽）。老文件在 ``load()`` 里按行优先
 #: 灌进新槽位。v20（2026-11-22）新增顶栏三块胶囊的显示开关 ``header_show``
 #: （``HEADER_ITEMS``），默认三块全开 —— 老文件缺这个键时就是默认值，不用迁移。
-PREFS_VERSION = 20
+#: v21（2026-11-27）新增 ``camera_preheat``（打开主窗口就后台准备 go2rtc），
+#: 默认**关**；老文件缺键即默认值，不迁移。
+PREFS_VERSION = 21
 
 
 def describe_oserror(exc: OSError, target: Path | None = None) -> str:
@@ -316,6 +318,9 @@ class Prefs:
         self.home_active_style = HOME_STYLE_DEFAULT
         #: 摄像头取流方式，见 ``CAMERA_NETWORKS``
         self.camera_network = CAMERA_NETWORK_DEFAULT
+        #: 打开主窗口就后台预热局域网摄像头（只起 go2rtc + 登记源，不拨号、
+        #: 不占观看位）。默认关，用户对比首帧速度时自己开；老文件缺键即关。
+        self.camera_preheat = False
         #: 顶栏三块胶囊各自显不显示，见 ``HEADER_ITEMS``。每次读都走
         #: ``shows_header``，别直接下标取——老文件 / 手工改坏时不该出 KeyError
         self.header_show: dict[str, bool] = dict.fromkeys(HEADER_ITEMS, HEADER_ITEM_DEFAULT)
@@ -544,6 +549,9 @@ class Prefs:
         network = str(data.get("camera_network") or "")
         if network in CAMERA_NETWORKS:
             self.camera_network = network
+        preheat = data.get("camera_preheat")
+        if isinstance(preheat, bool):
+            self.camera_preheat = preheat
         self.speaker_command_did = str(data.get("speaker_command_did") or "")
         # 只认真正的 bool：坏数据时"出声回答"是更安全的方向——把静默读成 True 会
         # 让用户以为指令根本没发出去（音箱一声不出），比"多响一次"难查得多
@@ -616,6 +624,7 @@ class Prefs:
             "hidden_scenes": self.hidden_scenes,
             "hidden_collapsed": self.hidden_collapsed,
             "camera_network": self.camera_network,
+            "camera_preheat": self.camera_preheat,
             "header_show": dict(self.header_show),
             "speaker_command_did": self.speaker_command_did,
             "speaker_silent": self.speaker_silent,
@@ -788,6 +797,15 @@ class Prefs:
         if value not in CAMERA_NETWORKS or value == self.camera_network:
             return False
         self.camera_network = value
+        self.save()
+        return True
+
+    def set_camera_preheat(self, on: bool) -> bool:
+        """改"打开主窗口就预热"开关。返回是否真的变了（没变就不写盘）。"""
+        on = bool(on)
+        if self.camera_preheat == on:
+            return False
+        self.camera_preheat = on
         self.save()
         return True
 

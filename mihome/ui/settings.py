@@ -357,6 +357,9 @@ class SettingsDialog(QDialog):
     #: 顶栏三块胶囊的显隐变了（参数是 ``prefs.HEADER_ITEMS`` 里的一员）。
     #: 主窗口收到后重算顶栏：少一颗就多出一截余量，温湿度可能因此重新放得下。
     header_changed = Signal(str)
+    #: 摄像头预热开关变了（参数是新的 bool）。主窗口收到后立刻补一次预热，
+    #: 不必等下次重启；关掉只影响"下次要不要启动"，不掐断已有播放。
+    camera_preheat_changed = Signal(bool)
     #: "logout" = 用户点了退出登录；"login" = 未登录状态下点了扫码登录。
     #: 真正的动作交给主窗口做（登录窗口、清空设备墙都在那边），这里只发信号。
     account_action = Signal(str)
@@ -644,6 +647,16 @@ class SettingsDialog(QDialog):
             sub="局域网优先：先直连，失败自动改远程；"
             "远程优先：先远程，失败退回局域网；仅远程：始终走中继",
         )
+        self.sw_camera_preheat = ToggleSwitch(
+            on=self.store.prefs.camera_preheat, palette=self._p, size="sm"
+        )
+        self.sw_camera_preheat.toggled.connect(self._on_camera_preheat_toggled)
+        camera.add_row(
+            "摄像头预热",
+            self.sw_camera_preheat,
+            sub="开启后，打开主窗口就按「取流方式」后台预热摄像头。"
+            "局域网只起 go2rtc、不占观看位；远程会提前建中继并占一个观看位",
+        )
         col.addWidget(camera)
         col.addStretch(1)
         return self._scroll_page(page)
@@ -761,6 +774,9 @@ class SettingsDialog(QDialog):
             k = self.cb_camera_network.findData(self.store.camera_network)
             if k >= 0:
                 self.cb_camera_network.setCurrentIndex(k)
+            preheat = getattr(self, "sw_camera_preheat", None)
+            if preheat is not None and preheat.is_on() != self.store.camera_preheat:
+                preheat.set_on(self.store.camera_preheat, animate=False)
             self.preview.configure(self.store.home_placement, self.store.home_active_style)
             self._sync_preview_inset()
         finally:
@@ -770,6 +786,12 @@ class SettingsDialog(QDialog):
         if self._loading:
             return
         self.store.set_camera_network(str(self.cb_camera_network.currentData() or ""))
+
+    def _on_camera_preheat_toggled(self, on: bool) -> None:
+        if self._loading:
+            return
+        if self.store.set_camera_preheat(on):
+            self.camera_preheat_changed.emit(bool(on))
 
     def _on_header_show(self, key: str, on: bool) -> None:
         """顶栏某一块的开关。只写偏好 + 发信号：画不画是主窗口的事，
