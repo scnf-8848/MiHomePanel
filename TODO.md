@@ -149,6 +149,13 @@
   不是起流时机也不是参数；第一版 stddev 判据误报 339/224 ms 已作废，可信方法见
   [mijia-desktop-video.md](docs/reference/mijia-desktop-video.md) §6.1.2。
   **再追平须改链路层（producer 前置拨号保关键帧 / 去掉本地 RTSP 层），未做，待拍板**。
+  → **2026-11-28 两条"不改播放栈"的提速路实测均否掉**：① go2rtc 原生 `/api/preload`
+  前置拨号：冷流 2.44 s vs 预热 2.35 s，只快 0.09 s（Receiver 不给新消费者缓存关键帧）；
+  ② 改 keyframe 补丁回放 probe 读走的旧 IDR：新补丁 5.20 s vs 现有 1.70 s，**更慢**
+  （旧 IDR 的 RTP 时间戳与新流不连续）。两条均已还原、文件无残留，详见
+  [mijia-desktop-video.md](docs/reference/mijia-desktop-video.md) §6.1.3。**在保留
+  Qt QMediaPlayer + 本地 RTSP 的前提下，首帧 2 s 无低成本解法**，别再试第三条同类方案；
+  要压只能上 TS 直喂播放器（整套替换级工程，无产品新理由不启动）。
 - **挂件：锁定按钮 + 快捷场景卡（2026-11-27，用户点单）**：顶栏加第四颗按钮（× 左边），
   合上是锁、开一条缝是解锁，锁住时图标用主题色；锁只挡拖动（点卡片 / 切层级 / 管理挂件
   照旧），状态进 `prefs.widget_locked` 并跨启动保持。场景卡走同一张槽位表：值写成

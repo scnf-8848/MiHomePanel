@@ -207,6 +207,33 @@
   producer、保持关键帧缓冲），或去掉本地 RTSP 一层直接把 TS 喂播放器。两者都是
   协议/播放栈改造，**不是参数能补的**，本轮不做，留待用户拍板。
 
+#### 6.1.3 两条"不改播放栈"的提速路：实测都否掉（2026-11-28 凌晨）
+
+用户拍板"尝试改动"后，按不引入 Rust/WebView2 的前提试了两条，都**有实测数据**、都否掉：
+
+1. **go2rtc 原生 `/api/preload` 前置拨号**（隐藏消费者让 producer 提前起来）。
+   源码证据：`internal/streams/preload.go` + `AddConsumer` 会触发 `prod.Dial()`，
+   且 preload 消费者和真实播放器共享同一条 producer，**不额外占观看位**。
+   A/B 实测（同一台 069a01、同样冷流、各 3 轮）：
+   冷流 **2.44 s**（2.20–2.81）vs preload 预热 **2.35 s**（2.35–2.36），只快 0.09 s。
+   根因：`pkg/core/track.go` 的 `Receiver`/`Sender` **不缓存关键帧**给新加入的
+   消费者——producer 热着也没用，播放器连上仍要等下一个 GOP。实验脚本已随
+   失败方案挪走，结论留此。
+2. **改 keyframe 补丁：probe 读走 IDR 时缓存下来，`Producer.Start()` 先回放**。
+   下载 Go 1.27.3 工具链、改 `pkg/xiaomi/miss/producer.go`（probe 多返一个首包、
+   `writePacket` 抽出共用、Start 先回放）、编出测试版跑同样冷启动 A/B：
+   新补丁 **5.20 s**（4.50–6.42）vs 现有正式版 **1.70 s**（1.00–2.88）——**更慢**。
+   原因：回放的 IDR 带 probe 时的旧 RTP 时间戳，与后续实时包时序不连续，
+   QMediaPlayer/FFmpeg 反而要多等一次重新同步。原补丁"StopMedia → 150 ms →
+   StartMedia 让摄像头重发一个时间戳正确的新 IDR"是对的做法，别改成回放。
+   测试版二进制与改动源码已删除，补丁文件与 `build_go2rtc.py` 均**还原原样**
+   （`git status` 干净）。
+
+**结论**：在不换播放栈（Qt `QMediaPlayer` + 本地 RTSP）的前提下，首帧 2 s 这段
+**没有低成本解法**——已排除改起流时机、preload 预热、回放旧 IDR 三条。要再压只能
+上"TS 直喂播放器（MSE/自定义解码）"，那是 §4.2 已经判定的整套替换级工程，
+没有产品层面的新理由（SD 回放 / 对讲 / 双镜头）就不启动。
+
 ### 6.2 microSD 回放：能拿到，但不是"换个播放器"
 
 - 截图是 **microSD 卡**的时间轴（今天 / 黄色录像段 / 全部回看视频），不是云录像。云录像需要 VIP，账号 `vipStatusEnum: NONE_VIP`、7/30/180 天全 0 条的历史结论不变，**仍不排期**。
